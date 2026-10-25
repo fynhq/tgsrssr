@@ -1733,6 +1733,14 @@ async fn send_doc_group(
                     .await
                     .map_err(|e| (all_msgs.clone(), e))?;
                 let mut im = InputMediaDocument::new(inp);
+                // Image documents opt out of content-type detection: a WebP
+                // document is otherwise detected as a sticker, and stickers
+                // cannot carry a caption. With detection disabled the message
+                // stays a document and keeps its caption (verified on both
+                // the official and local Bot API).
+                if d.kind == MediaKind::Image {
+                    im.disable_content_type_detection = Some(true);
+                }
                 if j == 0 && !group_caption.is_empty() {
                     im = im.caption(group_caption.to_string()).parse_mode(ParseMode::Html);
                 }
@@ -1829,6 +1837,14 @@ async fn send_doc_msg(
     let m = loop {
         let inp = resolve_input(db, d, transport, "doc", use_cache).await?;
         let mut req = bot.send_document(ChatId(chat_id), inp);
+        // Image documents opt out of content-type detection: a WebP document
+        // is otherwise detected as a sticker, and stickers cannot carry a
+        // caption (the title/summary text would be silently lost). Verified on
+        // both the official and local Bot API: with detection disabled the
+        // message stays a document and keeps its caption.
+        if d.kind == MediaKind::Image {
+            req = req.disable_content_type_detection(true);
+        }
         // Converted-to-document long/large images carry a thumbnail so the
         // message list shows a preview; a thumbnail-related 400 drops it and
         // retries so the document itself is still delivered.

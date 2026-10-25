@@ -1369,15 +1369,19 @@ fn logical_extension(path: &Path) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
-/// Whether the local image is encoded in a format Telegram reliably accepts
-/// via sendPhoto (JPEG/PNG). Other formats (WebP/AVIF/SVG/BMP/HEIC/TIFF, and
-/// unknown extensions) are routed to sendDocument instead: sendPhoto rejects
-/// them with a deterministic 400, which would otherwise degrade the entry to
-/// text. GIFs are excluded by the caller because they use sendAnimation.
+/// Whether the local image is encoded in a format Telegram accepts via
+/// sendPhoto. JPEG/PNG/WebP/BMP are accepted by both the official Bot API and
+/// the local Bot API; WebP/BMP also work in sendMediaGroup. AVIF/SVG/HEIC/TIFF
+/// return IMAGE_PROCESS_FAILED from sendPhoto and are routed to sendDocument
+/// instead (the document path keeps the caption). GIFs are excluded by the
+/// caller because they use sendAnimation.
 /// Local paths may carry the `.tgsr` storage suffix; classification always
 /// uses the original extension.
 pub fn photo_format_compatible(path: &std::path::Path) -> bool {
-    matches!(logical_extension(path).as_deref(), Some("jpg") | Some("jpeg") | Some("png"))
+    matches!(
+        logical_extension(path).as_deref(),
+        Some("jpg") | Some("jpeg") | Some("png") | Some("webp") | Some("bmp")
+    )
 }
 
 /// Determine whether an image will be sent as a document (>10MB / long image
@@ -1625,24 +1629,34 @@ mod tests {
     }
 
     #[test]
-    fn photo_format_compatibility_is_conservative() {
+    fn photo_format_compatibility_matches_telegram() {
+        // WebP/BMP are accepted by sendPhoto on both the official and local
+        // Bot API (verified 2026-10-26); AVIF/SVG/HEIC/TIFF return
+        // IMAGE_PROCESS_FAILED and stay documents. GIFs use sendAnimation and
+        // are excluded by the caller.
         assert!(photo_format_compatible(std::path::Path::new("a.jpg")));
         assert!(photo_format_compatible(std::path::Path::new("a.JPEG")));
         assert!(photo_format_compatible(std::path::Path::new("a.png")));
-        // GIFs use sendAnimation and are excluded by the caller; other
-        // formats are handled as documents.
+        assert!(photo_format_compatible(std::path::Path::new("a.webp")));
+        assert!(photo_format_compatible(std::path::Path::new("a.WEBP")));
+        assert!(photo_format_compatible(std::path::Path::new("a.bmp")));
+        assert!(photo_format_compatible(std::path::Path::new("a.BMP")));
         assert!(!photo_format_compatible(std::path::Path::new("a.gif")));
-        assert!(!photo_format_compatible(std::path::Path::new("a.webp")));
         assert!(!photo_format_compatible(std::path::Path::new("a.avif")));
         assert!(!photo_format_compatible(std::path::Path::new("a.svg")));
-        assert!(!photo_format_compatible(std::path::Path::new("a.bmp")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.heic")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.tiff")));
         assert!(!photo_format_compatible(std::path::Path::new("a")));
         // Storage-suffixed files are classified by their original extension.
         assert!(photo_format_compatible(std::path::Path::new("a.jpg.tgsr")));
         assert!(photo_format_compatible(std::path::Path::new("a.JPEG.tgsr")));
         assert!(photo_format_compatible(std::path::Path::new("a.png.tgsr")));
+        assert!(photo_format_compatible(std::path::Path::new("a.webp.tgsr")));
+        assert!(photo_format_compatible(std::path::Path::new("a.bmp.tgsr")));
         assert!(!photo_format_compatible(std::path::Path::new("a.gif.tgsr")));
-        assert!(!photo_format_compatible(std::path::Path::new("a.webp.tgsr")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.avif.tgsr")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.heic.tgsr")));
+        assert!(!photo_format_compatible(std::path::Path::new("a.tiff.tgsr")));
     }
 
     #[test]
