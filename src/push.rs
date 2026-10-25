@@ -428,28 +428,100 @@ fn should_try_rich_media(text_len: usize, album_media_count: usize) -> bool {
 
 /// Compose rich HTML from the already-rendered Telegram HTML.
 ///
+fn rich_tag_name(tag: &str) -> String {
+    tag.trim()
+        .trim_start_matches('<')
+        .trim_start_matches('/')
+        .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn is_rich_block_tag_name(name: &str) -> bool {
+    matches!(
+        name,
+        "blockquote"
+            | "pre"
+            | "p"
+            | "div"
+            | "hr"
+            | "figure"
+            | "figcaption"
+            | "img"
+            | "video"
+            | "audio"
+            | "tg-collage"
+            | "tg-slideshow"
+            | "tg-document"
+            | "tg-map"
+            | "tg-button-row"
+            | "footer"
+            | "aside"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "ul"
+            | "ol"
+            | "li"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "tr"
+            | "td"
+            | "th"
+            | "details"
+            | "summary"
+    )
+}
+
+fn is_rich_block_tag(tag: &str) -> bool {
+    is_rich_block_tag_name(&rich_tag_name(tag))
+}
+
+fn next_tag_is_rich_block(html: &str, mut pos: usize) -> bool {
+    while pos < html.len() {
+        let b = html.as_bytes()[pos];
+        if b == b' ' || b == b'\t' {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    if pos >= html.len() || html.as_bytes()[pos] != b'<' {
+        return false;
+    }
+    let Some(end) = html[pos..].find('>') else {
+        return false;
+    };
+    is_rich_block_tag(&html[pos..pos + end + 1])
+}
+
 /// Rich HTML is parsed as an HTML document, so raw newlines are whitespace and
 /// collapse (most visibly inside `<blockquote>`). Convert text newlines to
 /// `<br>`; keep `<pre>` contents verbatim because pre preserves whitespace.
+///
+/// Block-level elements already start/end on their own line, so a newline run
+/// adjacent to one contributes one fewer `<br>`; this keeps the visual newline
+/// count identical to the standard parse_mode path.
 fn preserve_rich_linebreaks(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut pre_depth = 0usize;
+    let mut prev_block = false;
     let mut i = 0usize;
     while i < html.len() {
         let rest = &html[i..];
         if let Some(tag_len) = rest.strip_prefix('<').and_then(|r| r.find('>')).map(|p| p + 2) {
             let tag = &html[i..i + tag_len];
-            out.push_str(tag);
             let trimmed = tag.trim();
             let closing = trimmed.starts_with("</");
             let self_closing = trimmed.ends_with("/>");
-            let name = trimmed
-                .trim_start_matches('<')
-                .trim_start_matches('/')
-                .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let name = rich_tag_name(tag);
+            let is_block = is_rich_block_tag_name(&name);
+            out.push_str(tag);
             if name == "pre" && !self_closing {
                 if closing {
                     pre_depth = pre_depth.saturating_sub(1);
@@ -457,36 +529,54 @@ fn preserve_rich_linebreaks(html: &str) -> String {
                     pre_depth += 1;
                 }
             }
+            prev_block = is_block;
             i += tag_len;
             continue;
         }
 
-        let c = rest.chars().next().expect("non-empty rest");
-        if c == '\r' && rest[1..].starts_with('\n') {
-            if pre_depth == 0 {
-                out.push_str("<br>");
-            } else {
+        if pre_depth > 0 {
+            let c = rest.chars().next().expect("non-empty rest");
+            if c == '\r' && rest[1..].starts_with('\n') {
                 out.push_str("\r\n");
-            }
-            i += 2;
-        } else if c == '\n' {
-            if pre_depth == 0 {
-                out.push_str("<br>");
+                i += 2;
             } else {
-                out.push('\n');
+                out.push(c);
+                i += c.len_utf8();
             }
-            i += 1;
-        } else if c == '\r' {
-            if pre_depth == 0 {
-                out.push_str("<br>");
-            } else {
-                out.push('\r');
-            }
-            i += 1;
-        } else {
-            out.push(c);
-            i += c.len_utf8();
+            continue;
         }
+
+        let mut count = 0usize;
+        let mut j = i;
+        while j < html.len() {
+            let tail = &html[j..];
+            if tail.starts_with("\r\n") {
+                count += 1;
+                j += 2;
+            } else if tail.starts_with('\n') || tail.starts_with('\r') {
+                count += 1;
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if count > 0 {
+            let next_block = next_tag_is_rich_block(html, j);
+            let subtract = usize::from(prev_block || next_block);
+            for _ in 0..count.saturating_sub(subtract) {
+                out.push_str("<br>");
+            }
+            prev_block = false;
+            i = j;
+            continue;
+        }
+
+        let c = rest.chars().next().expect("non-empty rest");
+        out.push(c);
+        if !c.is_whitespace() {
+            prev_block = false;
+        }
+        i += c.len_utf8();
     }
     out
 }
@@ -2654,7 +2744,19 @@ mod tests {
         let body = "<blockquote>line1\nline2</blockquote>\n\n<pre>code1\ncode2</pre>";
         assert_eq!(
             rich_html(body, "", "", true),
-            "<blockquote>line1<br>line2</blockquote><br><br><pre>code1\ncode2</pre>"
+            "<blockquote>line1<br>line2</blockquote><br><pre>code1\ncode2</pre>"
+        );
+    }
+
+    #[test]
+    fn rich_html_matches_standard_line_counts_around_blockquote() {
+        // Main text -> retweet blockquote is one newline in the standard path;
+        // blockquote -> footer is two. The block boundary supplies one line
+        // break, so only the second transition needs one extra <br>.
+        let body = "main\n<blockquote>rt1\nrt2</blockquote>";
+        assert_eq!(
+            rich_html(body, "via source", "", true),
+            "main<blockquote>rt1<br>rt2</blockquote><br>via source"
         );
     }
 
