@@ -55,6 +55,123 @@ static RE_BLOCKQUOTE_CLOSE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)</blockquote\s*>").unwrap());
 static RE_ANCHOR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"(?is)<a\b[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>"#).unwrap());
+/// Bare URLs that Telegram would otherwise auto-linkify. The character class
+/// is deliberately ASCII-only so it stops before CJK text/punctuation even
+/// when the source text has no space after the URL.
+const BARE_URL_CHARS: &str = r"A-Za-z0-9\-._~:/?#\[\]@!$&()*+,;=%";
+/// Bare URLs that Telegram would otherwise auto-linkify. Domain-only strings
+/// such as `example.com` are intentionally not matched (they are also common
+/// in file/module names); `www.` and `http(s)://` forms remain supported.
+static RE_BARE_URL: LazyLock<regex::Regex> = LazyLock::new(|| {
+    let pattern = format!(
+        r"(?i)(?:https?://[{c}]+|www\.[{c}]+|t\.cn/[{c}]+|(?:[a-z0-9-]+\.)+(?:[a-z]{{2,}})(?::[0-9]{{1,5}})?/[{c}]*)",
+        c = BARE_URL_CHARS
+    );
+    regex::Regex::new(&pattern).unwrap()
+});
+/// Host suffixes that are much more likely to be file names than domains.
+/// Bare `foo.txt/bar` must not become a link; explicit `https://foo.txt/bar`
+/// is still respected because the scheme is an unambiguous URL intent.
+const BARE_URL_FILE_EXT: &[&str] = &[
+    "txt", "md", "markdown", "rs", "js", "mjs", "cjs", "ts", "tsx", "jsx", "css", "html",
+    "htm", "xml", "json", "toml", "yaml", "yml", "png", "jpg", "jpeg", "gif", "webp", "svg",
+    "bmp", "ico", "mp4", "mov", "webm", "mkv", "mp3", "wav", "flac", "ogg", "pdf", "zip",
+    "tar", "gz", "tgz", "bz2", "xz", "exe", "dll", "so", "dylib", "apk", "ipa", "csv",
+    "tsv", "log", "lock", "db", "sqlite",
+];
+
+/// Return the prefix of a regex candidate that should become the link, trimming
+/// prose punctuation that commonly sticks to the URL. CJK punctuation never
+/// reaches this point because it is excluded from BARE_URL_CHARS.
+fn trim_bare_url_tail(raw: &str) -> &str {
+    fn count(s: &str, needle: char) -> usize {
+        s.chars().filter(|c| *c == needle).count()
+    }
+    let mut end = raw.len();
+    loop {
+        let s = &raw[..end];
+        let Some(last) = s.chars().next_back() else {
+            break;
+        };
+        let trim = match last {
+            '.' | ',' | ';' | ':' | '!' | '&' => true,
+            ')' => count(s, ')') > count(s, '('),
+            ']' => count(s, ']') > count(s, '['),
+            '}' => count(s, '}') > count(s, '{'),
+            _ => false,
+        };
+        if !trim {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    &raw[..end]
+}
+
+/// Avoid linkifying a suffix of an email, another URL, or a word: for example
+/// the `example.com/path` part after `@` in `user@example.com/path`.
+fn bare_url_can_start(text: &str, start: usize) -> bool {
+    match text[..start].chars().next_back() {
+        Some(c) => !(c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '.' | '/' | '-')),
+        None => true,
+    }
+}
+
+/// Normalize a bare URL candidate: prefix `https://` when the source omits the
+/// scheme, validate it, and reject common file-looking host suffixes.
+fn normalize_bare_url(raw: &str) -> Option<(String, String)> {
+    let lower = raw.to_ascii_lowercase();
+    let explicit = lower.starts_with("http://") || lower.starts_with("https://");
+    let candidate = if explicit {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    let parsed = Url::parse(&candidate).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if host.is_empty() {
+        return None;
+    }
+    if !explicit {
+        let last = host.rsplit('.').next()?.to_ascii_lowercase();
+        if BARE_URL_FILE_EXT.iter().any(|ext| *ext == last) {
+            return None;
+        }
+    }
+    Some((candidate, raw.to_string()))
+}
+
+/// Replace bare URLs with internal link tokens (indices into `links`), so the
+/// existing anchor restore pass turns them into explicit Telegram `<a>` tags.
+/// Operating before escaping also keeps `&` in query strings correct.
+fn linkify_bare_urls(text: &str, links: &mut Vec<(String, String)>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    for m in RE_BARE_URL.find_iter(text) {
+        if !bare_url_can_start(text, m.start()) {
+            continue;
+        }
+        let raw = m.as_str();
+        let trimmed = trim_bare_url_tail(raw);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((href, display)) = normalize_bare_url(trimmed) else {
+            continue;
+        };
+        out.push_str(&text[last..m.start()]);
+        let idx = links.len();
+        links.push((href, display));
+        out.push_str(&format!("\u{FFFC}{idx}\u{FFFC}"));
+        // Leave trailing prose punctuation outside the anchor.
+        last = m.start() + trimmed.len();
+    }
+    out.push_str(&text[last..]);
+    out
+}
 
 /// Result of fetching a single feed.
 pub struct FetchResult {
@@ -625,6 +742,10 @@ pub fn html_to_telegram_html(html: &str) -> String {
     //    `escape_html` would then re-escape the `&` into a visible
     //    `&amp;nbsp;` leak.
     let plain = crate::htmltext::decode_entities(&strip_tags(&buf));
+    // Explicitly linkify bare URLs before escaping. This bounds Telegram's
+    // auto-detection to the actual URL (important for CJK text glued to the
+    // end of a URL without whitespace).
+    let plain = linkify_bare_urls(&plain, &mut links);
     let mut out = crate::htmltext::escape_html(&collapse_blank_lines(&plain));
 
     // 5) Restore anchors as Telegram hyperlinks (skip empty-text links).
@@ -711,6 +832,86 @@ mod tests {
         assert_eq!(title, "Head Body");
         let cells = html_to_plain("<table><tr><td>A</td><td>B</td></tr></table>");
         assert_eq!(cells, "A B");
+    }
+
+    #[test]
+    fn bare_url_stops_before_cjk_punctuation_and_text() {
+        // Exact shape from Weibo: a bare GitHub URL glued to `。` and the
+        // following Chinese sentence. Telegram auto-detection would otherwise
+        // absorb the trailing text into the link.
+        let out = html_to_telegram_html("解锁：github.com/example/repo。这个项目同样使用漏洞。");
+        assert!(
+            out.contains(r#"<a href="https://github.com/example/repo">github.com/example/repo</a>。这个项目"#),
+            "out: {out}"
+        );
+
+        // Also stop at CJK text without punctuation.
+        let out = html_to_telegram_html("见 github.com/example/repo这个项目");
+        assert!(
+            out.contains(r#"<a href="https://github.com/example/repo">github.com/example/repo</a>这个项目"#),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn bare_url_trims_ascii_prose_punctuation_and_keeps_balanced_parens() {
+        let out = html_to_telegram_html("(https://example.com/a)");
+        assert_eq!(
+            out,
+            r#"(<a href="https://example.com/a">https://example.com/a</a>)"#
+        );
+        let out = html_to_telegram_html("https://example.com/a_(b)");
+        assert_eq!(
+            out,
+            r#"<a href="https://example.com/a_(b)">https://example.com/a_(b)</a>"#
+        );
+        let out = html_to_telegram_html("https://example.com/a.");
+        assert_eq!(
+            out,
+            r#"<a href="https://example.com/a">https://example.com/a</a>."#
+        );
+    }
+
+    #[test]
+    fn bare_url_supports_scheme_www_tcn_and_domain_path() {
+        let out = html_to_telegram_html("http://example.com/a www.example.com/b t.cn/AX123 example.com/c");
+        assert!(out.contains(r#"<a href="http://example.com/a">http://example.com/a</a>"#), "out: {out}");
+        assert!(
+            out.contains(r#"<a href="https://www.example.com/b">www.example.com/b</a>"#),
+            "out: {out}"
+        );
+        assert!(out.contains(r#"<a href="https://t.cn/AX123">t.cn/AX123</a>"#), "out: {out}");
+        assert!(
+            out.contains(r#"<a href="https://example.com/c">example.com/c</a>"#),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn bare_url_query_ampersand_is_escaped_once() {
+        let out = html_to_telegram_html("https://example.com/a?b=1&c=2，下一句");
+        assert_eq!(
+            out,
+            r#"<a href="https://example.com/a?b=1&amp;c=2">https://example.com/a?b=1&amp;c=2</a>，下一句"#
+        );
+    }
+
+    #[test]
+    fn existing_anchor_is_not_double_linkified() {
+        let out = html_to_telegram_html(
+            r#"<a href="https://example.com/x">https://example.com/x</a>"#,
+        );
+        assert_eq!(out.matches("<a ").count(), 1, "out: {out}");
+        assert!(out.contains(r#"<a href="https://example.com/x">https://example.com/x</a>"#));
+    }
+
+    #[test]
+    fn file_like_tokens_are_not_linkified() {
+        let out = html_to_telegram_html("foo.txt/bar v1.2.3 user@example.com");
+        assert!(!out.contains("<a "), "out: {out}");
+        assert!(out.contains("foo.txt/bar"));
+        assert!(out.contains("v1.2.3"));
+        assert!(out.contains("user@example.com"));
     }
 
     #[test]
