@@ -641,12 +641,14 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
             source: push::SourceDisplay::from_str(&e.source_display),
             link_preview: e.link_preview,
             lang,
+            allow_rich: true,
         },
         None => push::RenderOpts {
             mode: ContentMode::TitleLink,
             source: push::SourceDisplay::Source,
             link_preview: true,
             lang,
+            allow_rich: true,
         },
     };
 

@@ -21,6 +21,7 @@
 - **原生平台抓取**：微博（长文全文、多图补全、视频 HD、投票转 Poll、话题卡封面）、X（GraphQL 原图与最高码率视频）、Telegram 公开频道。
 - **不丢消息**：发送失败先降级纯文本，仍失败进入 outbox 持久化重试（1 分钟→2 小时退避，72 小时放弃）。
 - **富媒体管线**：图片/视频混排相册、GIF/文档处理、超限转文档、file_id 去重、流式下载。
+- **长文/多图自动增强**：无媒体文本超出标准单条上限（约 4094 可见字符，预留分隔符）、带媒体文本超过 1024 字符、或相册媒体超过 10 张时，自动改用 Telegram 富消息单条发送；失败回退原有分段/相册路径。富消息需 2026-06 及之后的官方客户端，旧客户端会提示不支持。
 - **多用户与权限分级**：单一管理员 + 白名单/开放注册；频道归属按邀请者判定，平台 cookie 全局共享。
 - **轻量部署**：Rust 单二进制 + SQLite，Docker 一键启动；界面支持中文/English。
 
@@ -258,6 +259,7 @@ The following channels are powered by tgsrssr:
 - **Native platform fetching**: Weibo (full long-form text, multi-image completion, HD video, polls → TG Poll, topic-card covers), X (GraphQL original images and highest-bitrate video), public Telegram channels.
 - **No message loss**: failed sends fall back to plain text, then enter a persistent outbox (1 min → 2 h backoff, abandoned after 72 h).
 - **Rich media pipeline**: mixed photo/video albums, GIF/document handling, oversized media → documents, file_id dedup, streaming downloads.
+- **Automatic long-post/multi-media enhancement**: text-only posts exceeding the standard single-message limit (about 4,094 visible chars after the separator reserve), media posts with over 1,024 characters, or albums with over 10 photos/videos are sent as a single Telegram rich message; failures fall back to the existing split/album path. Rich messages require official clients from June 2026 or later; older clients show an unsupported message.
 - **Multi-user + admin tiers**: one admin + whitelist/open registration; channel ownership by inviter; shared platform cookies.
 - **Lightweight deployment**: single Rust binary + SQLite, one-command Docker startup; Chinese/English UI.
 

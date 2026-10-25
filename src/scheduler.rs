@@ -594,6 +594,7 @@ async fn process_feed(
                 source: push::SourceDisplay::from_str(&cfg.source_display),
                 link_preview: cfg.link_preview,
                 lang,
+                allow_rich: true,
             };
             let chat_id: i64 = match cfg.chat_id.parse() {
                 Ok(id) => id,
@@ -1766,6 +1767,9 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             source: push::SourceDisplay::from_str(&row.source_display),
             link_preview: row.link_preview,
             lang,
+            // Persistent retries stay on the proven standard path. A rich
+            // failure must never be repeated on every outbox backoff.
+            allow_rich: false,
         };
 
         // MediaOnly mode with no sendable media left (files cleaned up, or a

@@ -13,6 +13,7 @@ mod logging;
 mod media;
 mod platforms;
 mod push;
+mod richmsg;
 mod scheduler;
 mod sendpolicy;
 mod ssrf;

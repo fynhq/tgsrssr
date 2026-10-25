@@ -12,6 +12,7 @@ use crate::htmltext::{
     merge_adjacent_blockquotes, split_html, strip_html_tags, truncate_html_keep_links,
 };
 use crate::media::{MediaItem, MediaKind};
+use crate::richmsg::{self, RichMedia, RichMediaKind, RichMediaSource};
 use crate::sendpolicy::{
     flood_backoff, flood_retry_secs, is_retryable_error, pace, SEND_BACKOFF_SECS,
 };
@@ -40,6 +41,16 @@ pub use crate::htmltext::{
 const SAFE_LIMIT: usize = 4096;
 /// Telegram caption limit for media messages.
 const CAPTION_LIMIT: usize = 1024;
+/// Bot API rich message hard limits (10.x): rich text and media attachments.
+const RICH_TEXT_MAX: usize = 32768;
+const RICH_MEDIA_MAX: usize = 50;
+/// Safety cap for the in-memory (official API) rich upload. Local Bot API
+/// uses `file://` and is not affected. A one-shot rich request holds every
+/// attachment until the response arrives, so very large video sets fall back
+/// to the album path instead of risking the bot process.
+const RICH_MEMORY_MEDIA_MAX: u64 = 128 * 1024 * 1024;
+/// The existing album chunk size; > this triggers the rich-media enhancement.
+const ALBUM_LIMIT: usize = 10;
 
 /// Shared constructor that disables link preview (used by command responses,
 /// notifications, and text messages).
@@ -242,7 +253,8 @@ pub async fn try_send_poll(
 /// (v1.9.3/v1.9.6); converged into a single function to prevent further
 /// drift).
 /// Returns Ok(SendOutcome) or Err (the caller decides between outbox and
-/// fallback).
+/// fallback). Text longer than the standard 4096 limit gets one rich-message
+/// attempt first; any failure falls through to the existing split path.
 pub async fn send_text_only(
     bot: &Bot,
     chat_id: i64,
@@ -255,7 +267,37 @@ pub async fn send_text_only(
     let Some((body, footer)) = format_entry_parts(entry, feed_title, author, opts, meta) else {
         return Ok(SendOutcome::default());
     };
-    let m = send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await?;
+    // Includes the 2-char footer/separator reserve used by send_entry_msg,
+    // so a 4095-char body with no footer correctly triggers the rich path
+    // instead of being split by the standard one.
+    let text_len = standard_text_len(&body, &footer);
+    let mut rich_msg: Option<Message> = None;
+    if opts.allow_rich && should_try_rich_text(text_len) {
+        match try_send_rich_text(bot, chat_id, &body, &footer).await {
+            Ok(m) => {
+                tracing::info!(
+                    chat_id = chat_id,
+                    entry_id = %fetcher::entry_id(entry),
+                    text_len = text_len,
+                    "rich text enhancement sent"
+                );
+                rich_msg = Some(m);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    chat_id = chat_id,
+                    entry_id = %fetcher::entry_id(entry),
+                    text_len = text_len,
+                    error = %e,
+                    "rich text send failed, falling back to standard path"
+                );
+            }
+        }
+    }
+    let m = match rich_msg {
+        Some(m) => m,
+        None => send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await?,
+    };
     let poll_failed = try_send_poll(bot, chat_id, Some(m.id), meta).await;
     Ok(SendOutcome {
         media_failed: poll_failed,
@@ -348,6 +390,226 @@ pub struct RenderOpts {
     pub link_preview: bool,
     /// Owner language for user-visible fallbacks (missing title, etc.).
     pub lang: Lang,
+    /// Allow the automatic rich-message enhancement. Scheduler and /test pass
+    /// true; outbox retries pass false so a rich failure never repeats.
+    pub allow_rich: bool,
+}
+
+/// Visible-length budget used by the standard text path.
+///
+/// `send_entry_msg` always reserves `footer + 2` chars for the footer and its
+/// `\n\n` separator, even when the footer is empty. The effective single-
+/// message body limit is therefore 4094, not 4096; a 4095-char text-only body
+/// is already split by the standard path. Keep this helper aligned with that
+/// reservation so the rich trigger never under-fires at the boundary.
+fn standard_text_len(body: &str, footer: &str) -> usize {
+    visible_len(body) + visible_len(footer) + 2
+}
+
+/// Automatic rich-message enhancement, text-only path.
+///
+/// Only entries that would need more than one standard message are eligible;
+/// normal entries keep the existing renderer unchanged.
+fn should_try_rich_text(text_len: usize) -> bool {
+    text_len > SAFE_LIMIT && text_len <= RICH_TEXT_MAX
+}
+
+/// Automatic rich-message enhancement, media path.
+///
+/// `album_media_count` only counts photos/videos that would enter a
+/// `sendMediaGroup` album. GIFs, documents and retweet images are deliberately
+/// excluded: they are sent separately and are not part of the 10-item cap.
+fn should_try_rich_media(text_len: usize, album_media_count: usize) -> bool {
+    album_media_count > 0
+        && album_media_count <= RICH_MEDIA_MAX
+        && text_len <= RICH_TEXT_MAX
+        && (album_media_count > ALBUM_LIMIT || text_len > CAPTION_LIMIT)
+}
+
+/// Compose rich HTML from the already-rendered Telegram HTML.
+///
+/// `caption_above_media` (the existing channel/source switch) decides whether
+/// the text block precedes or follows the media block.
+fn rich_html(body: &str, footer: &str, media_html: &str, caption_above_media: bool) -> String {
+    let mut text = body.to_string();
+    if !footer.is_empty() {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(footer);
+    }
+
+    if media_html.is_empty() {
+        return text;
+    }
+    if text.is_empty() {
+        return media_html.to_string();
+    }
+    if caption_above_media {
+        format!("{text}\n\n{media_html}")
+    } else {
+        format!("{media_html}\n\n{text}")
+    }
+}
+
+/// Build the rich HTML media block. One attachment uses a figure block,
+/// 2–10 use a collage, and >10 use a slideshow. `media` must be in the same
+/// order as the corresponding `InputRichMessage.media` entries.
+fn rich_media_html(media: &[&MediaItem]) -> String {
+    if media.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = media
+        .iter()
+        .enumerate()
+        .map(|(i, m)| match m.kind {
+            MediaKind::Video => format!("<video src=\"tg://video?id=m{i}\"></video>"),
+            _ => format!("<img src=\"tg://photo?id=m{i}\"/>"),
+        })
+        .collect();
+    if items.len() == 1 {
+        // Media is already a block on its own; no figure wrapper is needed
+        // without a caption.
+        items[0].clone()
+    } else if items.len() <= ALBUM_LIMIT {
+        format!("<tg-collage>{}</tg-collage>", items.concat())
+    } else {
+        format!("<tg-slideshow>{}</tg-slideshow>", items.concat())
+    }
+}
+
+/// Prepare one local file for rich-media upload. Local Bot API gets a
+/// `file://` path in its own namespace; otherwise bytes go through multipart.
+async fn rich_source_for_path(
+    path: &std::path::Path,
+    transport: &crate::media::MediaTransport,
+) -> anyhow::Result<RichMediaSource> {
+    if let Some(bp) = transport.bot_path(path) {
+        return Ok(RichMediaSource::FilePath(bp));
+    }
+    let data = tokio::fs::read(path).await?;
+    Ok(RichMediaSource::Bytes {
+        data,
+        filename: crate::media::logical_file_name(path),
+    })
+}
+
+/// Reuse the standard media file_id cache when possible, then fall back to the
+/// same transport rules as the normal media path.
+async fn rich_source_for_item(
+    db: &Db,
+    item: &MediaItem,
+    transport: &crate::media::MediaTransport,
+    mode: &str,
+) -> anyhow::Result<RichMediaSource> {
+    let key = format!("{}:{}", item.content_hash, mode);
+    if let Ok(Some(fid)) = db::get_cached_file_id(db, &key).await {
+        return Ok(RichMediaSource::FileId(fid));
+    }
+    rich_source_for_path(&item.path, transport).await
+}
+
+async fn build_rich_media_specs(
+    db: &Db,
+    media: &[&MediaItem],
+    transport: &crate::media::MediaTransport,
+) -> anyhow::Result<Vec<RichMedia>> {
+    let mut out = Vec::with_capacity(media.len());
+    for (i, item) in media.iter().enumerate() {
+        let id = format!("m{i}");
+        let (kind, mode) = match item.kind {
+            MediaKind::Video => (RichMediaKind::Video, "video"),
+            _ => (RichMediaKind::Photo, "photo"),
+        };
+        let source = rich_source_for_item(db, item, transport, mode).await?;
+        let thumbnail = if kind == RichMediaKind::Video {
+            match &item.thumb_path {
+                Some(path) => match rich_source_for_path(path, transport).await {
+                    Ok(source) => Some(source),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "rich video thumbnail preparation failed, sending without thumbnail");
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        out.push(RichMedia {
+            id,
+            kind,
+            source,
+            thumbnail,
+            width: item.width,
+            height: item.height,
+            duration: item.duration_secs,
+        });
+    }
+    Ok(out)
+}
+
+/// Single rich-message attempt. The rich path is an enhancement: any failure
+/// (including 429) falls back to the standard path, which owns the full
+/// flood/backoff/resume policy. Keeping this one-shot also avoids cloning
+/// large in-memory media just to retry.
+async fn send_rich_once(
+    bot: &Bot,
+    chat_id: i64,
+    html: String,
+    media: Vec<RichMedia>,
+) -> anyhow::Result<Message> {
+    pace(chat_id).await;
+    richmsg::send_rich_message(bot, chat_id, html, media, None).await
+}
+
+async fn try_send_rich_text(
+    bot: &Bot,
+    chat_id: i64,
+    body: &str,
+    footer: &str,
+) -> anyhow::Result<Message> {
+    // Rich HTML supports the same expandable blockquote tag, so keep the
+    // existing >200 visible-char folding rule from the standard path.
+    let html = normalize_blockquote_fold(&rich_html(body, footer, "", true));
+    send_rich_once(bot, chat_id, html, Vec::new()).await
+}
+
+async fn try_send_rich_media(
+    bot: &Bot,
+    db: &Db,
+    chat_id: i64,
+    text: &str,
+    caption_above_media: bool,
+    album_media: &[&MediaItem],
+    transport: &crate::media::MediaTransport,
+) -> anyhow::Result<Message> {
+    if album_media.is_empty() {
+        anyhow::bail!("rich media enhancement called without album media");
+    }
+    if album_media.len() > RICH_MEDIA_MAX {
+        anyhow::bail!("too many rich media attachments: {}", album_media.len());
+    }
+    if visible_len(text) > RICH_TEXT_MAX {
+        anyhow::bail!("rich message text too long: {}", visible_len(text));
+    }
+    let memory_bytes: u64 = album_media
+        .iter()
+        .filter(|m| transport.bot_path(&m.path).is_none())
+        .map(|m| m.size)
+        .sum();
+    if memory_bytes > RICH_MEMORY_MEDIA_MAX {
+        anyhow::bail!(
+            "rich media in-memory upload too large: {} bytes (cap {})",
+            memory_bytes,
+            RICH_MEMORY_MEDIA_MAX
+        );
+    }
+
+    let media_html = rich_media_html(album_media);
+    let html = normalize_blockquote_fold(&rich_html(text, "", &media_html, caption_above_media));
+    let media = build_rich_media_specs(db, album_media, transport).await?;
+    send_rich_once(bot, chat_id, html, media).await
 }
 
 /// Source footer line, or empty string.
@@ -654,6 +916,8 @@ pub struct PushCtx<'a> {
 /// - videos → sendVideo (single) or mixed into media group when with images
 /// - caption position follows the channel setting for all platforms
 /// - transport: local Bot API uses file:// zero-copy; official API uploads bytes
+/// - automatic enhancement: text >1024 or album media >10 may go through one
+///   rich message first; any rich failure falls back to the normal path below
 /// - any send failure → fall back to text-only so the entry is never lost, and
 ///   set `media_failed` (reported privately to the chat owner, not the channel).
 pub async fn send_entry_with_media(
@@ -789,8 +1053,86 @@ pub async fn send_entry_with_media(
     // partial media failure as "caption undelivered" and trigger an outbox
     // replay that duplicates it.
     let mut caption_delivered = false;
+    let mut media_failed = false;
+    let mut rich_delivered = false;
 
-    if !rich_ops.is_empty() {
+    // Automatic enhancement: only posts that would overflow the existing
+    // caption/album limits take the rich path. The count intentionally
+    // excludes GIFs, documents and retweet images; they keep their existing
+    // follow-up messages.
+    let album_media: Vec<&MediaItem> = videos
+        .iter()
+        .copied()
+        .chain(photos.iter().copied())
+        .collect();
+    let full_text_len = visible_len(&full_caption);
+    if opts.allow_rich && should_try_rich_media(full_text_len, album_media.len()) {
+        match try_send_rich_media(
+            bot,
+            db,
+            chat_id,
+            &full_caption,
+            caption_above,
+            &album_media,
+            transport,
+        )
+        .await
+        {
+            Ok(m) => {
+                anchor = Some(m);
+                caption_delivered = true;
+                rich_delivered = true;
+                tracing::info!(
+                    chat_id = chat_id,
+                    entry_id = %fetcher::entry_id(entry),
+                    text_len = full_text_len,
+                    media_count = album_media.len(),
+                    "rich media enhancement sent"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    chat_id = chat_id,
+                    entry_id = %fetcher::entry_id(entry),
+                    text_len = full_text_len,
+                    media_count = album_media.len(),
+                    error = %e,
+                    "rich media send failed, falling back to standard path"
+                );
+            }
+        }
+    }
+
+    // GIFs are deliberately outside the rich payload (and its trigger count).
+    // When the rich main message was sent, keep the historical standalone
+    // animation follow-ups, quoting it.
+    if rich_delivered && !gifs.is_empty() {
+        let gif_ops = build_rich_ops(&[], &gifs, &[]);
+        let reply_to = anchor.as_ref().map(|m| m.id);
+        if let Err((_, _, e)) = send_rich_ops_with_retry(
+            bot,
+            db,
+            chat_id,
+            "",
+            false,
+            &gif_ops,
+            transport,
+            reply_to,
+            "rich_gifs",
+        )
+        .await
+        {
+            tracing::warn!(
+                chat_id = chat_id,
+                entry_id = %fetcher::entry_id(entry),
+                error = %e,
+                "gif follow-up after rich message failed"
+            );
+            media_failed = true;
+        }
+    }
+
+    if !rich_delivered && !rich_ops.is_empty() {
         let rich = send_rich_ops_with_retry(bot, db, chat_id, &caption, caption_above, &rich_ops, transport, None, "main").await;
         match rich {
             Ok((_, first_msg)) => {
@@ -918,7 +1260,6 @@ pub async fn send_entry_with_media(
     // A document send failure does not fall back to plain text (the body was
     // already delivered with the main message); it only sets media_failed
     // and relies on the admin notification as the safety net.
-    let mut media_failed = false;
     let mut first_doc_msg: Option<Message> = None;
     if !docs.is_empty() {
         let reply_to = anchor.as_ref().map(|m| m.id);
@@ -1037,16 +1378,20 @@ pub async fn send_entry_with_media(
     // object is unavailable: an overflow failure must not trigger a whole
     // entry replay and duplicate the caption.
     let already_delivered = caption_delivered || anchor.is_some() || first_doc_msg.is_some();
-    for chunk in &overflow_chunks {
-        if let Err(e) = send_chunk_with_retry(bot, chat_id, chunk, false, overflow_reply_to).await {
-            if already_delivered {
-                tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %e, "overflow text failed after delivery, not retrying");
-                media_failed = true;
-                break;
+    // The rich message carries the entire text, so the standard caption
+    // overflow must not be sent again.
+    if !rich_delivered {
+        for chunk in &overflow_chunks {
+            if let Err(e) = send_chunk_with_retry(bot, chat_id, chunk, false, overflow_reply_to).await {
+                if already_delivered {
+                    tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %e, "overflow text failed after delivery, not retrying");
+                    media_failed = true;
+                    break;
+                }
+                return Err(e);
             }
-            return Err(e);
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     }
 
     // Weibo poll: after the body is delivered, convert the poll data into a
@@ -2172,6 +2517,93 @@ mod tests {
         assert!(is_thumbnail_error("Bad Request: wrong file dimensions"));
         assert!(is_thumbnail_error("Bad Request: THUMBNAIL_DIMENSIONS_INVALID"));
         assert!(!is_thumbnail_error("Bad Request: message is too long"));
+    }
+
+    #[test]
+    fn rich_text_trigger_uses_strict_standard_limit() {
+        assert!(!should_try_rich_text(SAFE_LIMIT));
+        assert!(should_try_rich_text(SAFE_LIMIT + 1));
+        assert!(should_try_rich_text(RICH_TEXT_MAX));
+        assert!(!should_try_rich_text(RICH_TEXT_MAX + 1));
+    }
+
+    #[test]
+    fn text_only_boundary_reserves_the_two_char_separator() {
+        // send_entry_msg reserves footer+2 even with no footer, so its
+        // effective body budget is 4094. A 4095-char body is split by the
+        // standard path and must trigger the rich enhancement; 4094 is the
+        // last single-message body.
+        let body_4094 = "x".repeat(SAFE_LIMIT - 2);
+        let body_4095 = "x".repeat(SAFE_LIMIT - 1);
+        assert_eq!(standard_text_len(&body_4094, ""), SAFE_LIMIT);
+        assert!(!should_try_rich_text(standard_text_len(&body_4094, "")));
+        assert_eq!(standard_text_len(&body_4095, ""), SAFE_LIMIT + 1);
+        assert!(should_try_rich_text(standard_text_len(&body_4095, "")));
+
+        // With a footer, the same reservation applies to the combined text.
+        // "via x" is 5 visible chars; 4096 - 5 - 2 = 4089 fits exactly.
+        assert_eq!(
+            standard_text_len(&"x".repeat(SAFE_LIMIT - 7), "via x"),
+            SAFE_LIMIT
+        );
+        assert!(!should_try_rich_text(standard_text_len(
+            &"x".repeat(SAFE_LIMIT - 7),
+            "via x"
+        )));
+        assert!(should_try_rich_text(standard_text_len(
+            &"x".repeat(SAFE_LIMIT - 6),
+            "via x"
+        )));
+    }
+
+    #[test]
+    fn rich_media_trigger_requires_album_overflow_or_caption_overflow() {
+        // Album media only: normal caption and ≤10 items stay standard.
+        assert!(!should_try_rich_media(CAPTION_LIMIT, 10));
+        assert!(should_try_rich_media(CAPTION_LIMIT + 1, 10));
+        assert!(should_try_rich_media(0, 11));
+        // No album media (only GIF/document/retweet): do not trigger.
+        assert!(!should_try_rich_media(CAPTION_LIMIT + 1, 0));
+        // Rich hard limits.
+        assert!(!should_try_rich_media(CAPTION_LIMIT + 1, RICH_MEDIA_MAX + 1));
+        assert!(!should_try_rich_media(RICH_TEXT_MAX + 1, 11));
+    }
+
+    #[test]
+    fn rich_html_respects_caption_above_media() {
+        let media = "<tg-collage><img src=\"tg://photo?id=m0\"/></tg-collage>";
+        assert_eq!(
+            rich_html("body", "footer", media, true),
+            format!("body\n\nfooter\n\n{media}")
+        );
+        assert_eq!(
+            rich_html("body", "footer", media, false),
+            format!("{media}\n\nbody\n\nfooter")
+        );
+        assert_eq!(rich_html("body", "", "", true), "body");
+    }
+
+    #[test]
+    fn rich_media_html_uses_single_collage_and_slideshow() {
+        let one = mk_item("p0", MediaKind::Image, false);
+        assert_eq!(
+            rich_media_html(&[&one]),
+            "<img src=\"tg://photo?id=m0\"/>"
+        );
+
+        let two = mk_item("p1", MediaKind::Image, false);
+        assert_eq!(
+            rich_media_html(&[&one, &two]),
+            "<tg-collage><img src=\"tg://photo?id=m0\"/><img src=\"tg://photo?id=m1\"/></tg-collage>"
+        );
+
+        let items: Vec<MediaItem> = (0..11)
+            .map(|i| mk_item(&format!("p{i}"), MediaKind::Image, false))
+            .collect();
+        let refs: Vec<&MediaItem> = items.iter().collect();
+        let html = rich_media_html(&refs);
+        assert!(html.starts_with("<tg-slideshow>"));
+        assert!(html.ends_with("</tg-slideshow>"));
     }
 
     #[test]
