@@ -428,6 +428,69 @@ fn should_try_rich_media(text_len: usize, album_media_count: usize) -> bool {
 
 /// Compose rich HTML from the already-rendered Telegram HTML.
 ///
+/// Rich HTML is parsed as an HTML document, so raw newlines are whitespace and
+/// collapse (most visibly inside `<blockquote>`). Convert text newlines to
+/// `<br>`; keep `<pre>` contents verbatim because pre preserves whitespace.
+fn preserve_rich_linebreaks(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut pre_depth = 0usize;
+    let mut i = 0usize;
+    while i < html.len() {
+        let rest = &html[i..];
+        if let Some(tag_len) = rest.strip_prefix('<').and_then(|r| r.find('>')).map(|p| p + 2) {
+            let tag = &html[i..i + tag_len];
+            out.push_str(tag);
+            let trimmed = tag.trim();
+            let closing = trimmed.starts_with("</");
+            let self_closing = trimmed.ends_with("/>");
+            let name = trimmed
+                .trim_start_matches('<')
+                .trim_start_matches('/')
+                .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if name == "pre" && !self_closing {
+                if closing {
+                    pre_depth = pre_depth.saturating_sub(1);
+                } else {
+                    pre_depth += 1;
+                }
+            }
+            i += tag_len;
+            continue;
+        }
+
+        let c = rest.chars().next().expect("non-empty rest");
+        if c == '\r' && rest[1..].starts_with('\n') {
+            if pre_depth == 0 {
+                out.push_str("<br>");
+            } else {
+                out.push_str("\r\n");
+            }
+            i += 2;
+        } else if c == '\n' {
+            if pre_depth == 0 {
+                out.push_str("<br>");
+            } else {
+                out.push('\n');
+            }
+            i += 1;
+        } else if c == '\r' {
+            if pre_depth == 0 {
+                out.push_str("<br>");
+            } else {
+                out.push('\r');
+            }
+            i += 1;
+        } else {
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
 /// `caption_above_media` (the existing channel/source switch) decides whether
 /// the text block precedes or follows the media block.
 fn rich_html(body: &str, footer: &str, media_html: &str, caption_above_media: bool) -> String {
@@ -438,6 +501,7 @@ fn rich_html(body: &str, footer: &str, media_html: &str, caption_above_media: bo
         }
         text.push_str(footer);
     }
+    let text = preserve_rich_linebreaks(&text);
 
     if media_html.is_empty() {
         return text;
@@ -445,10 +509,12 @@ fn rich_html(body: &str, footer: &str, media_html: &str, caption_above_media: bo
     if text.is_empty() {
         return media_html.to_string();
     }
+    // Media blocks are block-level (img / tg-collage / tg-slideshow), so no
+    // raw newline separator is needed; a raw newline would be collapsed.
     if caption_above_media {
-        format!("{text}\n\n{media_html}")
+        format!("{text}{media_html}")
     } else {
-        format!("{media_html}\n\n{text}")
+        format!("{media_html}{text}")
     }
 }
 
@@ -2574,13 +2640,31 @@ mod tests {
         let media = "<tg-collage><img src=\"tg://photo?id=m0\"/></tg-collage>";
         assert_eq!(
             rich_html("body", "footer", media, true),
-            format!("body\n\nfooter\n\n{media}")
+            format!("body<br><br>footer{media}")
         );
         assert_eq!(
             rich_html("body", "footer", media, false),
-            format!("{media}\n\nbody\n\nfooter")
+            format!("{media}body<br><br>footer")
         );
         assert_eq!(rich_html("body", "", "", true), "body");
+    }
+
+    #[test]
+    fn rich_html_preserves_blockquote_linebreaks_and_pre_verbatim() {
+        let body = "<blockquote>line1\nline2</blockquote>\n\n<pre>code1\ncode2</pre>";
+        assert_eq!(
+            rich_html(body, "", "", true),
+            "<blockquote>line1<br>line2</blockquote><br><br><pre>code1\ncode2</pre>"
+        );
+    }
+
+    #[test]
+    fn rich_html_converts_crlf_outside_pre() {
+        let body = "a\r\nb<pre>c\r\nd</pre>";
+        assert_eq!(
+            rich_html(body, "", "", true),
+            "a<br>b<pre>c\r\nd</pre>"
+        );
     }
 
     #[test]
