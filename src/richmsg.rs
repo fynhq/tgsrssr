@@ -149,9 +149,11 @@ pub async fn send_rich_message(
             parts.push((id.clone(), part));
         }
 
-        let mut object = Map::new();
-        object.insert("id".to_string(), Value::String(id.clone()));
-        object.insert(
+        // InputRichMessageMedia = { id, media: InputMediaPhoto|InputMediaVideo }.
+        // The media type and its properties belong to the nested `media`
+        // object, not to the outer item.
+        let mut media_object = Map::new();
+        media_object.insert(
             "type".to_string(),
             Value::String(
                 match kind {
@@ -161,19 +163,19 @@ pub async fn send_rich_message(
                 .to_string(),
             ),
         );
-        object.insert("media".to_string(), Value::String(media_value));
+        media_object.insert("media".to_string(), Value::String(media_value));
 
         if kind == RichMediaKind::Video {
             if width > 0 {
-                object.insert("width".to_string(), json!(width));
+                media_object.insert("width".to_string(), json!(width));
             }
             if height > 0 {
-                object.insert("height".to_string(), json!(height));
+                media_object.insert("height".to_string(), json!(height));
             }
             if let Some(duration) = duration {
-                object.insert("duration".to_string(), json!(duration));
+                media_object.insert("duration".to_string(), json!(duration));
             }
-            object.insert("supports_streaming".to_string(), json!(true));
+            media_object.insert("supports_streaming".to_string(), json!(true));
 
             if let Some(thumb) = thumbnail {
                 let thumb_name = format!("thumb_{id}");
@@ -181,11 +183,14 @@ pub async fn send_rich_message(
                 if let Some(part) = thumb_part {
                     parts.push((thumb_name, part));
                 }
-                object.insert("thumbnail".to_string(), Value::String(thumb_value));
+                media_object.insert("thumbnail".to_string(), Value::String(thumb_value));
             }
         }
 
-        media_json.push(Value::Object(object));
+        let mut item_object = Map::new();
+        item_object.insert("id".to_string(), Value::String(id));
+        item_object.insert("media".to_string(), Value::Object(media_object));
+        media_json.push(Value::Object(item_object));
     }
 
     let mut rich = Map::new();
@@ -308,8 +313,8 @@ mod tests {
             assert!(request.contains("\"chat_id\":42"));
             assert!(request.contains("\"html\":\"hello\""));
             assert!(request.contains("\"id\":\"m0\""));
-            assert!(request.contains("\"type\":\"photo\""));
-            assert!(request.contains("\"media\":\"file-id\""));
+            // InputRichMessageMedia.media is an InputMediaPhoto object.
+            assert!(request.contains("\"media\":{\"media\":\"file-id\",\"type\":\"photo\"}"));
             assert!(request.contains("\"reply_parameters\""));
             assert!(request.contains("\"message_id\":9"));
 
