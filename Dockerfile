@@ -1,23 +1,22 @@
 # ===== Build stage =====
-FROM rust:1.98-slim AS builder
+FROM rust:1.98-alpine3.24 AS builder
 
 WORKDIR /app
 
-# Mirror acceleration (optional). Defaults to official sources.
+# Mirror acceleration (optional). Defaults to official Alpine sources.
 # China users can override at build time:
-#   docker build --build-arg APT_MIRROR=mirrors.aliyun.com \
-#                --build-arg CARGO_REGISTRY=rsproxy .
-ARG APT_MIRROR=""
+#   docker build --build-arg APK_MIRROR=mirrors.aliyun.com \
+#                --build-arg CARGO_REGISTRY=rsproxy.cn .
+ARG APK_MIRROR=""
 ARG CARGO_REGISTRY=""
 
-RUN if [ -n "$APT_MIRROR" ]; then \
-      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+RUN if [ -n "$APK_MIRROR" ]; then \
+      sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories; \
     fi \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apk add --no-cache \
     ca-certificates \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+    gcc \
+    musl-dev
 
 # Optional cargo registry override (e.g. rsproxy sparse index)
 RUN if [ -n "$CARGO_REGISTRY" ]; then \
@@ -55,21 +54,20 @@ ENV CARGO_INCREMENTAL=0
 RUN cargo build --release --locked
 
 # ===== Runtime stage =====
-# Must match the builder stage Debian version (rust:1.98-slim is trixie-based, glibc 2.39)
-FROM debian:trixie-slim
+# Alpine/musl runtime; the builder emits a static musl binary.
+FROM alpine:3.24
 
 # Version label (passed by CI: --build-arg VERSION=x.y.z)
 ARG VERSION=""
 LABEL org.opencontainers.image.version="${VERSION}"
 
-ARG APT_MIRROR=""
-RUN if [ -n "$APT_MIRROR" ]; then \
-      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+ARG APK_MIRROR=""
+RUN if [ -n "$APK_MIRROR" ]; then \
+      sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories; \
     fi \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apk add --no-cache \
     ca-certificates \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    ffmpeg
 
 # Runs as root (bind-mounted data/media/logs dirs are created by docker as root;
 # a non-root user would lack write permission and panic; for a personal bot,
