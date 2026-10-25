@@ -48,6 +48,12 @@ COPY migrations ./migrations
 COPY build.rs ./
 RUN touch src/main.rs
 
+# Optional short git hash for local prebuilt builds; CI passes nothing and
+# stays on plain semver. Declared after the dependency cache layer so the
+# value only invalidates the application build.
+ARG GIT_HASH=""
+ENV TGSRSSR_GIT_HASH=$GIT_HASH
+
 ENV SQLX_OFFLINE=true
 # Disable incremental compilation: container builds once triggered a rustc ICE
 ENV CARGO_INCREMENTAL=0
