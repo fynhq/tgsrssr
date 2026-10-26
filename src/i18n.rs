@@ -142,6 +142,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "test_fetching") => "Fetching {} …",
         (Lang::Zh, "test_fetch_failed") => "抓取失败：{:#}",
         (Lang::En, "test_fetch_failed") => "Fetch failed: {:#}",
+        (Lang::Zh, "test_config_read_failed") => "读取测试配置失败，本次按默认配置测试：{:#}",
+        (Lang::En, "test_config_read_failed") => "Failed to read test configuration; using defaults for this test: {:#}",
         (Lang::Zh, "test_index_oob") => "该源只有 {} 条内容，无法取第 {} 条。",
         (Lang::En, "test_index_oob") => "This feed only has {} entries, cannot get #{}.",
         (Lang::Zh, "test_bad_chat") => "频道 ID 无效：{}",

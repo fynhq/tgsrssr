@@ -628,14 +628,41 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     // If this feed is subscribed in the channel, use its title + effective
     // config; otherwise fall back to the feed's own title and chat defaults.
     // /test does NOT require a subscription — any valid feed URL works.
-    // Transient DB errors don't abort /test: degrade to no subscription (use the feed's own title).
-    let subs = db::get_subscriptions(&state.db, &chat_id).await.unwrap_or_default();
+    // Transient DB errors don't abort /test, but they must be visible: a
+    // silent fallback made the test result disagree with the real push (the
+    // same class of bug as the v1.11.3 /test URL-normalization fix).
+    let mut config_warnings: Vec<String> = Vec::new();
+    let subs = match db::get_subscriptions(&state.db, &chat_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            config_warnings.push(
+                i18n::t(lang, "test_config_read_failed")
+                    .replace("{:#}", &format!("{:#}", e)),
+            );
+            Vec::new()
+        }
+    };
     let sub = subs.iter().find(|s| s.feed_url == feed_url);
     let feed_title = sub
         .and_then(|s| s.feed_title.clone())
         .or_else(|| fr.feed_title.clone())
         .unwrap_or_default();
-    let eff = db::get_effective_config(&state.db, &chat_id, &feed_url).await.ok();
+    let eff = match db::get_effective_config(&state.db, &chat_id, &feed_url).await {
+        Ok(e) => Some(e),
+        Err(e) => {
+            config_warnings.push(
+                i18n::t(lang, "test_config_read_failed")
+                    .replace("{:#}", &format!("{:#}", e)),
+            );
+            None
+        }
+    };
+    if !config_warnings.is_empty() {
+        bot.send_message(msg.chat.id, config_warnings.join("\n"))
+            .link_preview_options(no_preview())
+            .await
+            .ok();
+    }
     let caption_above_media = eff.as_ref().map(|e| e.caption_above_media).unwrap_or(false);
     let opts = match &eff {
         Some(e) => push::RenderOpts {
