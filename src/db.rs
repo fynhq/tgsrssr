@@ -1465,8 +1465,12 @@ impl FilterConfig {
 
     /// Parsed keyword list (trimmed, lowercased, empty items dropped).
     pub fn keyword_list(&self) -> Vec<String> {
+        // Accept the full-width Chinese comma/semicolon too: the UI prompt is
+        // localized and Chinese users naturally type `，`. Treating the whole
+        // string as one keyword made whitelist filtering mark every entry as
+        // sent (total silence) and blacklist filtering a no-op.
         self.keywords
-            .split(',')
+            .split([',', '，', ';', '；'])
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .collect()
@@ -1598,8 +1602,13 @@ mod tests {
         let blacklist = FilterConfig {
             enabled: true,
             mode: "blacklist".into(),
-            keywords: "foo, Bar".into(),
+            keywords: "foo, Bar，中文；third".into(),
         };
+        assert_eq!(
+            blacklist.keyword_list(),
+            vec!["foo", "bar", "中文", "third"],
+            "full-width comma/semicolon separators must be accepted"
+        );
         let kws = blacklist.keyword_list();
         assert!(!blacklist.allows_title_with_keywords("a FOO b", &kws));
         assert!(blacklist.allows_title_with_keywords("baz", &kws));
