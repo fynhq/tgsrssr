@@ -1683,6 +1683,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vacuum_into_creates_a_sqlite_snapshot() {
+        // The daily backup relies on VACUUM INTO producing a standalone DB
+        // file (SQLite >= 3.27). Guard against a downgraded SQLite where the
+        // statement is unavailable.
+        // Use a real file-backed DB: VACUUM INTO on sqlx's shared in-memory
+        // connection does not materialise the target file.
+        let db_path = std::env::temp_dir().join(format!(
+            "tgsrssr_vacuum_src_{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let path = std::env::temp_dir().join(format!(
+            "tgsrssr_vacuum_{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&path);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let literal = path.to_string_lossy().replace('\'', "''");
+        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{}'", literal)))
+            .execute(&pool)
+            .await
+            .expect("VACUUM INTO should be supported");
+        let head = std::fs::read(&path).expect("snapshot file should exist");
+        assert!(head.starts_with(b"SQLite format 3\0"), "not a SQLite database");
+        pool.close().await;
+        std::fs::remove_file(&db_path).ok();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
     async fn entry_dedup_state_reports_sent_and_queued() {
         let pool = test_pool().await;
 

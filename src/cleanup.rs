@@ -307,28 +307,40 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
     let today = chrono::Utc::now().format("%Y%m%d").to_string();
     let target = backups.join(format!("rss_bot_{}.db", today));
     if !target.exists() {
-        // Checkpoint first: flush the entire WAL back into the main database
-        // file and truncate the WAL; afterwards, copying the main database
-        // file directly yields a consistent snapshot (equivalent to VACUUM
-        // INTO, and without dynamic SQL).
-        // Note: when concurrent read connections exist, the checkpoint
-        // completes only partially with busy=1 but does NOT return an error;
-        // you must read the busy column of the result row to check it
-        // explicitly. Relying solely on execute()'s Err cannot catch this
-        // case and would produce a stale backup missing the latest WAL data.
-        let row = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        // Best-effort WAL truncate for disk hygiene. It is NOT the consistency
+        // mechanism anymore: a checkpoint can complete with busy=0 and a
+        // concurrent writer can then trigger another checkpoint while we copy
+        // the main file, producing a torn backup. `VACUUM INTO` below reads a
+        // consistent snapshot (including the WAL) regardless of concurrent
+        // activity, so a busy checkpoint must not skip the backup.
+        match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .fetch_one(db_pool)
-            .await?;
-        let busy: i64 = row.try_get("busy").unwrap_or(1);
-        if busy != 0 {
-            anyhow::bail!("wal_checkpoint reported busy (concurrent readers), backup skipped");
+            .await
+        {
+            Ok(row) => {
+                let busy: i64 = row.try_get("busy").unwrap_or(1);
+                if busy != 0 {
+                    warn!("wal_checkpoint reported busy; continuing with VACUUM INTO snapshot");
+                }
+            }
+            Err(e) => warn!(error = %e, "wal_checkpoint failed; continuing with VACUUM INTO snapshot"),
         }
-        // Copy to a temp file first, then rename (atomic replacement): a
-        // mid-copy failure won't leave a half-written file behind; otherwise
-        // target.exists() would make all later retries for the day skip
-        // permanently.
+
+        // Write to a temp path first, then rename (atomic replacement): a
+        // failure won't leave a half-written target behind, otherwise
+        // target.exists() would make all retries for the day skip.
         let tmp = backups.join(format!("rss_bot_{}.db.tmp", today));
-        fs::copy(&config.db_path, &tmp).await?;
+        if tmp.exists() {
+            fs::remove_file(&tmp).await.ok();
+        }
+        // VACUUM INTO takes a string literal (not a bind parameter); the path
+        // is local config data, and single quotes are escaped.
+        let tmp_literal = tmp.to_string_lossy().replace('\'', "''");
+        let vacuum = format!("VACUUM INTO '{}'", tmp_literal);
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(vacuum)).execute(db_pool).await {
+            fs::remove_file(&tmp).await.ok();
+            return Err(e.into());
+        }
         fs::rename(&tmp, &target).await?;
         info!(backup = %target.display(), "database backed up");
     }
