@@ -736,6 +736,11 @@ fn append_weibo_media(body: &mut String, mblog: &Value, owner_mid: &str) {
                     owner_attr
                 ));
             }
+        } else if !has_pics && !page_pic_url.is_empty() {
+            // Video stream unavailable (expired/paywalled/API drift) but the
+            // cover exists: send the cover as an image instead of dropping
+            // the only visual element silently.
+            body.push_str(&img_tag(page_pic_url));
         }
     } else if page_info["type"].as_str() == Some("live") {
         // Live posts: no video stream to push; extract the cover image
@@ -1856,6 +1861,26 @@ mod tests {
         // domain containing "sinaimg.cn" as substring but not actually sinaimg.cn,
         // and no image extension → rejected
         assert!(!is_image_url("https://notsinaimg.cn/abc"));
+    }
+
+    #[test]
+    fn append_weibo_media_video_without_stream_falls_back_to_cover() {
+        // Stream expired/paywalled/API drift: no <video> URL, no pics. The
+        // cover image must still be pushed instead of losing every visual.
+        let mblog = serde_json::json!({
+            "pics": [],
+            "pic_num": 1,
+            "page_info": {
+                "type": "video",
+                "media_info": {},
+                "urls": {},
+                "page_pic": {"url": "https://wx1.sinaimg.cn/large/cover.jpg"}
+            }
+        });
+        let mut body = String::new();
+        append_weibo_media(&mut body, &mblog, "123");
+        assert!(body.contains("<img src=\"https://wx1.sinaimg.cn/large/cover.jpg\""), "body: {body}");
+        assert!(!body.contains("<video"), "must not emit an empty video tag: {body}");
     }
 
     #[test]
