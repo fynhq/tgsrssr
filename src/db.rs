@@ -326,6 +326,110 @@ pub async fn purge_chat(db: &Db, chat_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Migrate every record keyed by a chat id when Telegram upgrades a group to a
+/// supergroup. The old group keeps its id in the notification payload; the new
+/// supergroup has a different id and the bot is moved automatically. Without
+/// this, subscriptions remain bound to the dead old id and every push fails.
+///
+/// Idempotent: rows already under the new id are kept; duplicates created by an
+/// out-of-order `my_chat_member` update are ignored. The old chat row wins over
+/// a provisional new row (owner/title), while child rows are merged with the
+/// new id winning on unique-key conflicts.
+pub async fn migrate_chat_id(db: &Db, old_chat_id: &str, new_chat_id: &str) -> anyhow::Result<()> {
+    if old_chat_id == new_chat_id {
+        return Ok(());
+    }
+    let mut tx = db.begin().await?;
+
+    // Chat row: preserve the existing registration (added_by/title) and drop a
+    // provisional row for the new id if one already exists. If the old row is
+    // missing (legacy data), leave the new row untouched.
+    let old_exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM chats WHERE chat_id = ?")
+        .bind(old_chat_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if old_exists.is_some() {
+        sqlx::query("DELETE FROM chats WHERE chat_id = ?")
+            .bind(new_chat_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE chats SET chat_id = ? WHERE chat_id = ?")
+            .bind(new_chat_id)
+            .bind(old_chat_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Chat-level config: the old row carries the user's settings; a
+    // provisional new row (if any) only has defaults. Guard on the old row
+    // existing: an idempotent repeat of this migration (the same service
+    // message delivered twice) must not delete the already-migrated config.
+    let old_config_exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM chat_configs WHERE chat_id = ?")
+            .bind(old_chat_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if old_config_exists.is_some() {
+        sqlx::query("DELETE FROM chat_configs WHERE chat_id = ?")
+            .bind(new_chat_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE chat_configs SET chat_id = ? WHERE chat_id = ?")
+            .bind(new_chat_id)
+            .bind(old_chat_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Tables keyed by (chat_id, ...): move and drop duplicates already under
+    // the new id. The new rows win on conflict; deleting the old copy is safe
+    // (it is the same logical subscription/message).
+    for table in [
+        "subscriptions",
+        "feed_configs",
+        "sent_entries",
+        "outbox",
+        "sent_messages",
+    ] {
+        let update = format!("UPDATE OR IGNORE {table} SET chat_id = ? WHERE chat_id = ?");
+        sqlx::query(sqlx::AssertSqlSafe(update))
+            .bind(new_chat_id)
+            .bind(old_chat_id)
+            .execute(&mut *tx)
+            .await?;
+        let delete = format!("DELETE FROM {table} WHERE chat_id = ?");
+        sqlx::query(sqlx::AssertSqlSafe(delete))
+            .bind(old_chat_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Settings keys embed the chat id for per-feed retry/dedup counters.
+    for prefix in ["auto_disable_notified:", "stale_zero:", "media_dl_fail:"] {
+        let old_prefix = format!("{}{}:", prefix, old_chat_id);
+        let new_prefix = format!("{}{}:", prefix, new_chat_id);
+        sqlx::query(
+            "UPDATE OR IGNORE settings
+             SET key = ? || substr(key, length(?) + 1)
+             WHERE instr(key, ?) = 1",
+        )
+        .bind(&new_prefix)
+        .bind(&old_prefix)
+        .bind(&old_prefix)
+        .execute(&mut *tx)
+        .await?;
+        // Conflicts (the new key already exists) keep the new value; remove
+        // the old key so it cannot linger as an orphan.
+        sqlx::query("DELETE FROM settings WHERE instr(key, ?) = 1")
+            .bind(&old_prefix)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn get_chat(db: &Db, chat_id: &str) -> anyhow::Result<Option<ChatRow>> {
     let row = sqlx::query_as::<_, ChatRow>(
         "SELECT chat_id, chat_type, title, username, added_by, enabled FROM chats WHERE chat_id = ?",
@@ -1763,6 +1867,134 @@ mod tests {
         assert_eq!(due[0].attempts, 1);
         assert_eq!(due[0].last_attempt_at, Some(123));
         assert_eq!(due[0].last_error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn migrate_chat_id_moves_all_chat_scoped_data() {
+        let pool = test_pool().await;
+        let old = "-1001";
+        let new = "-1002";
+        let feed = "https://example.com/feed";
+
+        sqlx::query("INSERT INTO chats (chat_id, chat_type, title, added_by) VALUES (?, 'group', 'old', '42')")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Provisional row from an out-of-order my_chat_member update.
+        sqlx::query("INSERT INTO chats (chat_id, chat_type, title, added_by) VALUES (?, 'supergroup', 'new', '99')")
+            .bind(new)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subscriptions (chat_id, feed_url, feed_title) VALUES (?, ?, 'feed')")
+            .bind(old)
+            .bind(feed)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO chat_configs (chat_id, interval_minutes) VALUES (?, 5)")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO chat_configs (chat_id, interval_minutes) VALUES (?, 99)")
+            .bind(new)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO feed_configs (chat_id, feed_url, content_mode) VALUES (?, ?, 'content_only')")
+            .bind(old)
+            .bind(feed)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sent_entries (chat_id, feed_url, entry_id) VALUES (?, ?, 'e1')")
+            .bind(old)
+            .bind(feed)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO outbox (chat_id, feed_url, entry_id, feed_title, entry_json, next_retry_at, created_at)
+             VALUES (?, ?, 'e2', 'feed', '{}', 0, 0)",
+        )
+        .bind(old)
+        .bind(feed)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sent_messages (chat_id, message_id, feed_url, entry_id) VALUES (?, 77, ?, 'e3')")
+            .bind(old)
+            .bind(feed)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for key in [
+            format!("auto_disable_notified:{}:{}", old, feed),
+            format!("stale_zero:{}:{}", old, feed),
+            format!("media_dl_fail:{}:{}:e4", old, feed),
+        ] {
+            set_setting(&pool, &key, "1").await.unwrap();
+        }
+
+        migrate_chat_id(&pool, old, new).await.unwrap();
+        // Idempotent second call (e.g. duplicate service message).
+        migrate_chat_id(&pool, old, new).await.unwrap();
+
+        let chats: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT chat_id, added_by FROM chats ORDER BY chat_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(chats, vec![(new.to_string(), Some("42".to_string()))]);
+
+        for (table, condition) in [
+            ("subscriptions", "chat_id = ?"),
+            ("feed_configs", "chat_id = ?"),
+            ("sent_entries", "chat_id = ?"),
+            ("outbox", "chat_id = ?"),
+            ("sent_messages", "chat_id = ?"),
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE {condition}");
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .bind(new)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 1, "{table} row not moved");
+            let old_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+                format!("SELECT COUNT(*) FROM {table} WHERE {condition}"),
+            ))
+            .bind(old)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(old_count, 0, "{table} old row left behind");
+        }
+
+        let interval: i64 = sqlx::query_scalar("SELECT interval_minutes FROM chat_configs WHERE chat_id = ?")
+            .bind(new)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(interval, 5, "old chat config must win over provisional defaults");
+
+        let settings: Vec<String> = sqlx::query_scalar(
+            "SELECT key FROM settings WHERE instr(key, 'auto_disable_notified:') = 1
+                OR instr(key, 'stale_zero:') = 1 OR instr(key, 'media_dl_fail:') = 1 ORDER BY key",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            settings,
+            vec![
+                format!("auto_disable_notified:{}:{}", new, feed),
+                format!("media_dl_fail:{}:{}:e4", new, feed),
+                format!("stale_zero:{}:{}", new, feed),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -234,6 +234,20 @@ async fn main() -> anyhow::Result<()> {
 
 /// Message handler: pending multi-step ops first, then commands; ignore the rest.
 async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResult<()> {
+    // Group -> supergroup upgrade: Telegram posts a service message carrying
+    // the new chat id in the old group. Move subscriptions/configs/sent
+    // records before any command handling; otherwise the old chat id remains
+    // bound and every push fails after the upgrade.
+    if let Some(new_chat_id) = msg.migrate_to_chat_id() {
+        let old_id = msg.chat.id.0.to_string();
+        let new_id = new_chat_id.0.to_string();
+        match db::migrate_chat_id(&state.db, &old_id, &new_id).await {
+            Ok(()) => info!(old_chat_id = %old_id, new_chat_id = %new_id, "chat id migrated after group upgrade"),
+            Err(e) => error!(old_chat_id = %old_id, new_chat_id = %new_id, error = %e, "chat id migration failed"),
+        }
+        return Ok(());
+    }
+
     let text = msg.text().unwrap_or_default();
 
     // Pending op (e.g. rename reply) consumes plain-text messages.
