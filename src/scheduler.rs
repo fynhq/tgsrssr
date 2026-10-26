@@ -1975,6 +1975,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     row.id,
                     attempts,
                     next_retry,
+                    now,
                     &format!("{:#}", e),
                 )
                 .await
