@@ -1177,8 +1177,13 @@ pub async fn prepare_entry_media(
             item.duration_secs = dur;
         } else if item.kind == MediaKind::Image
             && !item.is_gif
-            && image_goes_to_doc(item.size, item.width, item.height, state.config.long_image_aspect_ratio)
+            && (image_goes_to_doc(item.size, item.width, item.height, state.config.long_image_aspect_ratio)
+                || !photo_format_compatible(&item.path))
         {
+            // Long/oversized images and formats that must go through
+            // sendDocument (AVIF/SVG/HEIC/TIFF) both need a preview thumbnail.
+            // The old condition only looked at dimensions, leaving
+            // format-converted documents without one.
             item.thumb_path = make_image_thumb(&item.path).await;
         }
     }
