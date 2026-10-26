@@ -1459,13 +1459,24 @@ fn tweet_text_to_html(text: &str) -> String {
         let m = caps.get(0).unwrap();
         // Escape and append the text before this URL.
         out.push_str(&crate::push::escape_html(&text[last..m.start()]));
+        // `[^\s<>"]+` also swallows CJK/full-width text glued to the end of a
+        // URL (`https://x.com/a，然后`). Stop the URL at the first non-ASCII
+        // character so the trailing prose stays outside the anchor; the
+        // v1.17.0 bare-URL trimming only covers html_to_telegram_html, not
+        // this X-specific renderer.
+        let raw = m.as_str();
+        let ascii_len = raw
+            .char_indices()
+            .find(|(_, c)| !c.is_ascii())
+            .map(|(i, _)| i)
+            .unwrap_or(raw.len());
         // Strip trailing sentence punctuation and unbalanced closing brackets
         // that aren't part of the URL. The URL regex `[^\s<>"]+` happily swallows
         // a `)`/`]`/`}` that actually belongs to surrounding prose (e.g.
         // "(see https://x.com/a)"), producing a broken link. Brackets are only
         // stripped while they are unbalanced (closers exceed openers), so URLs
         // with legitimately balanced parens (e.g. Wikipedia links) are kept.
-        let mut url = m.as_str();
+        let mut url = &raw[..ascii_len];
         loop {
             let before = url;
             while url.ends_with(['.', ',', ';', '!', '?']) {
@@ -1487,9 +1498,9 @@ fn tweet_text_to_html(text: &str) -> String {
             crate::push::escape_attr(url),
             crate::push::escape_html(url)
         ));
-        // Emit the stripped trailing punctuation after the link (otherwise the
-        // body would lose periods etc.).
-        let stripped = &m.as_str()[url.len()..];
+        // Emit the stripped trailing punctuation/CJK prose after the link
+        // (otherwise the body would lose periods or glue them to the href).
+        let stripped = &raw[url.len()..];
         out.push_str(&crate::push::escape_html(stripped));
         last = m.end();
     }
@@ -1894,6 +1905,19 @@ mod tests {
             "got: {}",
             out
         );
+    }
+
+    #[test]
+    fn tweet_text_to_html_stops_url_before_cjk_text() {
+        // `[^\s<>"]+` would otherwise swallow `，然后` into the href and the
+        // anchor text. The URL must end at the first non-ASCII character.
+        let out = tweet_text_to_html("见 https://x.com/a，然后继续");
+        assert!(
+            out.contains("<a href=\"https://x.com/a\">https://x.com/a</a>，然后继续"),
+            "got: {}",
+            out
+        );
+        assert!(!out.contains("x.com/a，"), "CJK punctuation leaked into href: {out}");
     }
 
     #[test]
