@@ -1068,6 +1068,15 @@ pub async fn prepare_entry_media(
         // verbatim and the cover-fallback call was copied in 4 places —
         // high risk of fixing one and missing another).
         let (result, relay_err) = match download_one(state, &url, &kind, &mime, &outbound, transport).await {
+            // A relay 200 with an empty body is a relay failure, not evidence
+            // that the origin has no media. The direct URL may still work;
+            // previously only Err triggered the fallback and the media was
+            // dropped with a misleading "empty response" warning.
+            Ok(DownloadOutcome::Empty) if via_relay => {
+                warn!(relay_url = %url, direct_url = %direct_url, "relay returned an empty response, retrying direct");
+                let r = download_one(state, &direct_url, &kind, &mime, &outbound, transport).await;
+                (r, Some("relay returned an empty response".to_string()))
+            }
             Err(e) if via_relay => {
                 // Promoted from debug to warn: this fires only when an
                 // img-relay was configured AND it failed. Even when the direct
