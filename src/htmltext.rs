@@ -318,11 +318,22 @@ pub fn decode_entities(s: &str) -> String {
         out.push_str(&rest[..amp]);
         let after = &rest[amp..];
         let candidate = &after[1..];
-        let Some(semi) = candidate.find(';') else {
-            // No terminator: copy the rest verbatim (no further entity can
-            // start in it without an ampersand we would have found).
-            out.push_str(after);
-            return out;
+        // Search for the terminator only within the maximum entity body
+        // length. Scanning the whole remaining string made this function
+        // O(n^2) for inputs with many ampersands and a distant semicolon
+        // (e.g. "&a" repeated thousands of times): every ampersand scanned
+        // to the end before the length check below could reject it.
+        // Keep the slice on a char boundary (feeds are UTF-8).
+        let mut window_end = candidate.len().min(MAX_ENTITY_BODY + 1);
+        while !candidate.is_char_boundary(window_end) {
+            window_end -= 1;
+        }
+        let Some(semi) = candidate[..window_end].find(';') else {
+            // No terminator within the maximum entity length: keep this "&"
+            // literal and continue scanning after it.
+            out.push('&');
+            rest = candidate;
+            continue;
         };
         if semi == 0 || semi > MAX_ENTITY_BODY {
             // Bare "&" or an implausibly long name: keep it literal and let
@@ -1266,6 +1277,18 @@ mod tests {
         assert_eq!(decode_entities("a&#0;b&#7;c"), "abc");
         // Invalid references stay literal.
         assert_eq!(decode_entities("&unknown; &#x110000;"), "&unknown; &#x110000;");
+    }
+
+    #[test]
+    fn decode_entities_bounds_terminator_scan() {
+        // Regression: the `;` lookup used to scan to the end of the remaining
+        // string before enforcing MAX_ENTITY_BODY, making a body of many
+        // unescaped ampersands quadratic. The output must stay identical and
+        // the scan must stay bounded (this input is deliberately large enough
+        // to expose accidental O(n^2) behaviour in a debug test run).
+        let input = format!("{};", "&a".repeat(50_000));
+        let out = decode_entities(&input);
+        assert_eq!(out, input, "unknown references must stay literal");
     }
 
     // ===== visible_len =====
