@@ -410,11 +410,21 @@ async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
     match fetch_query_ids(state).await {
         Ok(ids) => {
             let mut cache = query_id_cache().lock().await;
-            let resolved = ids.get(op).cloned();
+            let resolved = ids.get(op).cloned().or_else(|| {
+                // The document can be parsed successfully yet omit one of our
+                // operations (upstream rename/drop). Cache the fallback under
+                // this op so the fresh-cache fast path finds it instead of
+                // re-downloading the whole document on every GraphQL call.
+                let fallback = fallback_query_id(op);
+                (!fallback.is_empty()).then(|| fallback.to_string())
+            });
             cache.ids = ids;
+            if let Some(id) = &resolved {
+                cache.ids.insert(op.to_string(), id.clone());
+            }
             cache.fetched_at = Some(Instant::now());
             cache.last_failure = None;
-            resolved.unwrap_or_else(|| fallback_query_id(op).to_string())
+            resolved.unwrap_or_default()
         }
         Err(e) => {
             // `{:#}` renders the full anyhow source chain (reqwest root cause
