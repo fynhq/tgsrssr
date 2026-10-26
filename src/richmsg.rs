@@ -7,8 +7,8 @@
 //! instead of forking or upgrading the whole framework.
 //!
 //! Only the subset needed by feed pushes is modelled here: rich HTML plus
-//! photo/video attachments. Rich media is an enhancement; callers must fall
-//! back to the normal send path when this module returns an error.
+//! photo/video/document attachments. Rich media is an enhancement; callers
+//! must fall back to the normal send path when this module returns an error.
 
 use reqwest_bot::multipart::{Form, Part};
 use serde::Deserialize;
@@ -90,21 +90,26 @@ pub enum RichMediaSource {
 pub enum RichMediaKind {
     Photo,
     Video,
+    Document,
 }
 
 /// One media entry inside `InputRichMessage.media`.
 #[derive(Debug, Clone)]
 pub struct RichMedia {
-    /// Referenced from rich HTML as `tg://photo?id=<id>` / `tg://video?id=<id>`.
+    /// Referenced from rich HTML as `tg://photo?id=<id>` /
+    /// `tg://video?id=<id>` / `tg://document?id=<id>`.
     pub id: String,
     pub kind: RichMediaKind,
     pub source: RichMediaSource,
-    /// Optional video thumbnail. Uploaded/prepared with the same transport
-    /// rules as the media itself.
+    /// Optional video/document thumbnail. Uploaded/prepared with the same
+    /// transport rules as the media itself.
     pub thumbnail: Option<RichMediaSource>,
     pub width: u32,
     pub height: u32,
     pub duration: Option<u32>,
+    /// Documents only: keep image documents (notably WebP) from being
+    /// re-detected as stickers, which cannot carry a caption.
+    pub disable_content_type_detection: bool,
 }
 
 fn value_and_part(source: RichMediaSource, part_name: &str) -> (String, Option<Part>) {
@@ -118,8 +123,67 @@ fn value_and_part(source: RichMediaSource, part_name: &str) -> (String, Option<P
     }
 }
 
+/// Build the nested `InputMedia*` object for one `InputRichMessageMedia`.
+/// Width/height/duration and streaming belong to videos; thumbnails are
+/// accepted by videos and documents; the content-type detection flag only
+/// applies to documents.
+fn rich_media_object(
+    kind: RichMediaKind,
+    media_value: &str,
+    width: u32,
+    height: u32,
+    duration: Option<u32>,
+    thumbnail_value: Option<&str>,
+    disable_content_type_detection: bool,
+) -> Value {
+    let media_type = match kind {
+        RichMediaKind::Photo => "photo",
+        RichMediaKind::Video => "video",
+        RichMediaKind::Document => "document",
+    };
+    let mut object = Map::new();
+    object.insert("type".to_string(), Value::String(media_type.to_string()));
+    object.insert(
+        "media".to_string(),
+        Value::String(media_value.to_string()),
+    );
+
+    match kind {
+        RichMediaKind::Video => {
+            if width > 0 {
+                object.insert("width".to_string(), json!(width));
+            }
+            if height > 0 {
+                object.insert("height".to_string(), json!(height));
+            }
+            if let Some(duration) = duration {
+                object.insert("duration".to_string(), json!(duration));
+            }
+            object.insert("supports_streaming".to_string(), json!(true));
+            if let Some(thumb) = thumbnail_value {
+                object.insert("thumbnail".to_string(), Value::String(thumb.to_string()));
+            }
+        }
+        RichMediaKind::Document => {
+            if let Some(thumb) = thumbnail_value {
+                object.insert("thumbnail".to_string(), Value::String(thumb.to_string()));
+            }
+            if disable_content_type_detection {
+                object.insert(
+                    "disable_content_type_detection".to_string(),
+                    json!(true),
+                );
+            }
+        }
+        RichMediaKind::Photo => {}
+    }
+
+    Value::Object(object)
+}
+
 /// Send one rich message. `html` must already be valid rich HTML; `media`
-/// contains photo/video attachments referenced by `tg://...?id=` links.
+/// contains photo/video/document attachments referenced by `tg://...?id=`
+/// links.
 pub async fn send_rich_message(
     bot: &Bot,
     chat_id: i64,
@@ -142,6 +206,7 @@ pub async fn send_rich_message(
             width,
             height,
             duration,
+            disable_content_type_detection,
         } = item;
 
         let (media_value, media_part) = value_and_part(source, &id);
@@ -149,47 +214,36 @@ pub async fn send_rich_message(
             parts.push((id.clone(), part));
         }
 
-        // InputRichMessageMedia = { id, media: InputMediaPhoto|InputMediaVideo }.
-        // The media type and its properties belong to the nested `media`
-        // object, not to the outer item.
-        let mut media_object = Map::new();
-        media_object.insert(
-            "type".to_string(),
-            Value::String(
-                match kind {
-                    RichMediaKind::Photo => "photo",
-                    RichMediaKind::Video => "video",
-                }
-                .to_string(),
-            ),
-        );
-        media_object.insert("media".to_string(), Value::String(media_value));
-
-        if kind == RichMediaKind::Video {
-            if width > 0 {
-                media_object.insert("width".to_string(), json!(width));
-            }
-            if height > 0 {
-                media_object.insert("height".to_string(), json!(height));
-            }
-            if let Some(duration) = duration {
-                media_object.insert("duration".to_string(), json!(duration));
-            }
-            media_object.insert("supports_streaming".to_string(), json!(true));
-
-            if let Some(thumb) = thumbnail {
+        // Thumbnails are supported by video and document media (photos have
+        // no thumbnail field in InputMediaPhoto).
+        let thumbnail_value = match (kind, thumbnail) {
+            (RichMediaKind::Video | RichMediaKind::Document, Some(thumb)) => {
                 let thumb_name = format!("thumb_{id}");
                 let (thumb_value, thumb_part) = value_and_part(thumb, &thumb_name);
                 if let Some(part) = thumb_part {
                     parts.push((thumb_name, part));
                 }
-                media_object.insert("thumbnail".to_string(), Value::String(thumb_value));
+                Some(thumb_value)
             }
-        }
+            _ => None,
+        };
+
+        // InputRichMessageMedia = { id, media: InputMedia* }. The media type
+        // and its properties belong to the nested `media` object, not to the
+        // outer item.
+        let media_object = rich_media_object(
+            kind,
+            &media_value,
+            width,
+            height,
+            duration,
+            thumbnail_value.as_deref(),
+            disable_content_type_detection,
+        );
 
         let mut item_object = Map::new();
         item_object.insert("id".to_string(), Value::String(id));
-        item_object.insert("media".to_string(), Value::Object(media_object));
+        item_object.insert("media".to_string(), media_object);
         media_json.push(Value::Object(item_object));
     }
 
@@ -273,6 +327,63 @@ mod tests {
         assert!(part.is_some());
     }
 
+    #[test]
+    fn document_media_object_keeps_detection_flag_and_thumbnail() {
+        let value = rich_media_object(
+            RichMediaKind::Document,
+            "attach://m0",
+            0,
+            0,
+            None,
+            Some("attach://thumb_m0"),
+            true,
+        );
+        assert_eq!(value["type"], "document");
+        assert_eq!(value["media"], "attach://m0");
+        assert_eq!(value["thumbnail"], "attach://thumb_m0");
+        assert_eq!(value["disable_content_type_detection"], true);
+        assert!(value.get("width").is_none());
+        assert!(value.get("supports_streaming").is_none());
+    }
+
+    #[test]
+    fn video_media_object_keeps_dimensions_and_thumbnail() {
+        let value = rich_media_object(
+            RichMediaKind::Video,
+            "file-id",
+            1920,
+            1080,
+            Some(42),
+            Some("thumb-id"),
+            true,
+        );
+        assert_eq!(value["type"], "video");
+        assert_eq!(value["width"], 1920);
+        assert_eq!(value["height"], 1080);
+        assert_eq!(value["duration"], 42);
+        assert_eq!(value["supports_streaming"], true);
+        assert_eq!(value["thumbnail"], "thumb-id");
+        // The document-only flag must not leak into video media.
+        assert!(value.get("disable_content_type_detection").is_none());
+    }
+
+    #[test]
+    fn photo_media_object_omits_document_and_video_fields() {
+        let value = rich_media_object(
+            RichMediaKind::Photo,
+            "file-id",
+            10,
+            20,
+            None,
+            Some("unused"),
+            true,
+        );
+        assert_eq!(value["type"], "photo");
+        assert!(value.get("width").is_none());
+        assert!(value.get("thumbnail").is_none());
+        assert!(value.get("disable_content_type_detection").is_none());
+    }
+
     #[tokio::test]
     async fn sends_json_payload_to_the_expected_method_url() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -344,6 +455,7 @@ mod tests {
                     width: 0,
                     height: 0,
                     duration: None,
+                    disable_content_type_detection: false,
                 }],
                 Some(MessageId(9)),
             ),

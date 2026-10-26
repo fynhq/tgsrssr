@@ -44,10 +44,11 @@ const CAPTION_LIMIT: usize = 1024;
 /// Bot API rich message hard limits (10.x): rich text and media attachments.
 const RICH_TEXT_MAX: usize = 32768;
 const RICH_MEDIA_MAX: usize = 50;
-/// Safety cap for the in-memory (official API) rich upload. Local Bot API
-/// uses `file://` and is not affected. A one-shot rich request holds every
-/// attachment until the response arrives, so very large video sets fall back
-/// to the album path instead of risking the bot process.
+/// Safety cap for rich attachments held in memory until the response
+/// arrives. Photos/videos use `file://` on the local Bot API and do not count;
+/// documents always use multipart bytes (to keep their logical file name) and
+/// therefore always count. Very large sets fall back to the album path
+/// instead of risking the bot process.
 const RICH_MEMORY_MEDIA_MAX: u64 = 128 * 1024 * 1024;
 /// The existing album chunk size; > this triggers the rich-media enhancement.
 const ALBUM_LIMIT: usize = 10;
@@ -416,14 +417,16 @@ fn should_try_rich_text(text_len: usize) -> bool {
 
 /// Automatic rich-message enhancement, media path.
 ///
-/// `album_media_count` only counts photos/videos that would enter a
-/// `sendMediaGroup` album. GIFs, documents and retweet images are deliberately
-/// excluded: they are sent separately and are not part of the 10-item cap.
-fn should_try_rich_media(text_len: usize, album_media_count: usize) -> bool {
-    album_media_count > 0
-        && album_media_count <= RICH_MEDIA_MAX
+/// `media_count` covers every attachment that enters the rich message:
+/// photos, videos and documents (including oversized/long images converted to
+/// documents and audio/file items). GIFs and retweet-only images are
+/// deliberately excluded: they are still sent separately and are not part of
+/// the 10-item cap.
+fn should_try_rich_media(text_len: usize, media_count: usize) -> bool {
+    media_count > 0
+        && media_count <= RICH_MEDIA_MAX
         && text_len <= RICH_TEXT_MAX
-        && (album_media_count > ALBUM_LIMIT || text_len > CAPTION_LIMIT)
+        && (media_count > ALBUM_LIMIT || text_len > CAPTION_LIMIT)
 }
 
 /// Compose rich HTML from the already-rendered Telegram HTML.
@@ -608,30 +611,42 @@ fn rich_html(body: &str, footer: &str, media_html: &str, caption_above_media: bo
     }
 }
 
-/// Build the rich HTML media block. One attachment uses a figure block,
-/// 2–10 use a collage, and >10 use a slideshow. `media` must be in the same
-/// order as the corresponding `InputRichMessage.media` entries.
-fn rich_media_html(media: &[&MediaItem]) -> String {
-    if media.is_empty() {
-        return String::new();
+/// Build the rich HTML media blocks. Photos/videos use one attachment, a
+/// 2–10 collage, or a >10 slideshow; documents follow as individual
+/// `<tg-document>` blocks because collages/slideshows only accept photos and
+/// videos. `album` and `docs` must stay in the same order as the
+/// corresponding `InputRichMessage.media` entries (album ids first).
+fn rich_media_html(album: &[&MediaItem], docs: &[&MediaItem]) -> String {
+    let mut html = String::new();
+
+    if !album.is_empty() {
+        let items: Vec<String> = album
+            .iter()
+            .enumerate()
+            .map(|(i, m)| match m.kind {
+                MediaKind::Video => format!("<video src=\"tg://video?id=m{i}\"></video>"),
+                _ => format!("<img src=\"tg://photo?id=m{i}\"/>"),
+            })
+            .collect();
+        if items.len() == 1 {
+            // Media is already a block on its own; no figure wrapper is
+            // needed without a caption.
+            html.push_str(&items[0]);
+        } else if items.len() <= ALBUM_LIMIT {
+            html.push_str(&format!("<tg-collage>{}</tg-collage>", items.concat()));
+        } else {
+            html.push_str(&format!("<tg-slideshow>{}</tg-slideshow>", items.concat()));
+        }
     }
-    let items: Vec<String> = media
-        .iter()
-        .enumerate()
-        .map(|(i, m)| match m.kind {
-            MediaKind::Video => format!("<video src=\"tg://video?id=m{i}\"></video>"),
-            _ => format!("<img src=\"tg://photo?id=m{i}\"/>"),
-        })
-        .collect();
-    if items.len() == 1 {
-        // Media is already a block on its own; no figure wrapper is needed
-        // without a caption.
-        items[0].clone()
-    } else if items.len() <= ALBUM_LIMIT {
-        format!("<tg-collage>{}</tg-collage>", items.concat())
-    } else {
-        format!("<tg-slideshow>{}</tg-slideshow>", items.concat())
+
+    for (i, _) in docs.iter().enumerate() {
+        html.push_str(&format!(
+            "<tg-document src=\"tg://document?id=m{}\"></tg-document>",
+            album.len() + i
+        ));
     }
+
+    html
 }
 
 /// Prepare one local file for rich-media upload. Local Bot API gets a
@@ -665,13 +680,48 @@ async fn rich_source_for_item(
     rich_source_for_path(&item.path, transport).await
 }
 
+/// Document attachments must keep the logical file name in Telegram. A local
+/// Bot API `file://` upload takes the name from the on-disk path, which still
+/// carries the `.tgsr` storage suffix, so documents always go through
+/// multipart bytes with the stripped name. The file_id cache avoids the read
+/// after the first upload.
+async fn rich_source_for_doc(db: &Db, item: &MediaItem) -> anyhow::Result<RichMediaSource> {
+    let key = format!("{}:doc", item.content_hash);
+    if let Ok(Some(fid)) = db::get_cached_file_id(db, &key).await {
+        return Ok(RichMediaSource::FileId(fid));
+    }
+    let data = tokio::fs::read(&item.path).await?;
+    Ok(RichMediaSource::Bytes {
+        data,
+        filename: crate::media::logical_file_name(&item.path),
+    })
+}
+
+async fn rich_thumbnail_source(
+    item: &MediaItem,
+    transport: &crate::media::MediaTransport,
+) -> Option<RichMediaSource> {
+    let path = item.thumb_path.as_ref()?;
+    match rich_source_for_path(path, transport).await {
+        Ok(source) => Some(source),
+        Err(e) => {
+            tracing::warn!(error = %e, "rich media thumbnail preparation failed, sending without thumbnail");
+            None
+        }
+    }
+}
+
+/// Build the `InputRichMessage.media` array. Order must match
+/// `rich_media_html`: album photos/videos first, then documents.
 async fn build_rich_media_specs(
     db: &Db,
-    media: &[&MediaItem],
+    album: &[&MediaItem],
+    docs: &[&MediaItem],
     transport: &crate::media::MediaTransport,
 ) -> anyhow::Result<Vec<RichMedia>> {
-    let mut out = Vec::with_capacity(media.len());
-    for (i, item) in media.iter().enumerate() {
+    let mut out = Vec::with_capacity(album.len() + docs.len());
+
+    for (i, item) in album.iter().enumerate() {
         let id = format!("m{i}");
         let (kind, mode) = match item.kind {
             MediaKind::Video => (RichMediaKind::Video, "video"),
@@ -679,16 +729,7 @@ async fn build_rich_media_specs(
         };
         let source = rich_source_for_item(db, item, transport, mode).await?;
         let thumbnail = if kind == RichMediaKind::Video {
-            match &item.thumb_path {
-                Some(path) => match rich_source_for_path(path, transport).await {
-                    Ok(source) => Some(source),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "rich video thumbnail preparation failed, sending without thumbnail");
-                        None
-                    }
-                },
-                None => None,
-            }
+            rich_thumbnail_source(item, transport).await
         } else {
             None
         };
@@ -700,8 +741,28 @@ async fn build_rich_media_specs(
             width: item.width,
             height: item.height,
             duration: item.duration_secs,
+            disable_content_type_detection: false,
         });
     }
+
+    for (i, item) in docs.iter().enumerate() {
+        let id = format!("m{}", album.len() + i);
+        let source = rich_source_for_doc(db, item).await?;
+        let thumbnail = rich_thumbnail_source(item, transport).await;
+        out.push(RichMedia {
+            id,
+            kind: RichMediaKind::Document,
+            source,
+            thumbnail,
+            width: 0,
+            height: 0,
+            duration: None,
+            // Image documents (WebP in particular) must stay documents so
+            // they are not re-detected as stickers.
+            disable_content_type_detection: item.kind == MediaKind::Image,
+        });
+    }
+
     Ok(out)
 }
 
@@ -731,6 +792,9 @@ async fn try_send_rich_text(
     send_rich_once(bot, chat_id, html, Vec::new()).await
 }
 
+// The parameters all share the push context; a one-off struct would only move
+// the list, matching the send_rich_ops allowance below.
+#[allow(clippy::too_many_arguments)]
 async fn try_send_rich_media(
     bot: &Bot,
     db: &Db,
@@ -738,22 +802,27 @@ async fn try_send_rich_media(
     text: &str,
     caption_above_media: bool,
     album_media: &[&MediaItem],
+    docs: &[&MediaItem],
     transport: &crate::media::MediaTransport,
 ) -> anyhow::Result<Message> {
-    if album_media.is_empty() {
-        anyhow::bail!("rich media enhancement called without album media");
+    let media_count = album_media.len() + docs.len();
+    if media_count == 0 {
+        anyhow::bail!("rich media enhancement called without media");
     }
-    if album_media.len() > RICH_MEDIA_MAX {
-        anyhow::bail!("too many rich media attachments: {}", album_media.len());
+    if media_count > RICH_MEDIA_MAX {
+        anyhow::bail!("too many rich media attachments: {media_count}");
     }
     if visible_len(text) > RICH_TEXT_MAX {
         anyhow::bail!("rich message text too long: {}", visible_len(text));
     }
+    // Documents always upload as bytes (their file name must not carry the
+    // `.tgsr` suffix), so their size counts even with a local Bot API.
     let memory_bytes: u64 = album_media
         .iter()
         .filter(|m| transport.bot_path(&m.path).is_none())
         .map(|m| m.size)
-        .sum();
+        .sum::<u64>()
+        + docs.iter().map(|m| m.size).sum::<u64>();
     if memory_bytes > RICH_MEMORY_MEDIA_MAX {
         anyhow::bail!(
             "rich media in-memory upload too large: {} bytes (cap {})",
@@ -762,9 +831,9 @@ async fn try_send_rich_media(
         );
     }
 
-    let media_html = rich_media_html(album_media);
+    let media_html = rich_media_html(album_media, docs);
     let html = normalize_blockquote_fold(&rich_html(text, "", &media_html, caption_above_media));
-    let media = build_rich_media_specs(db, album_media, transport).await?;
+    let media = build_rich_media_specs(db, album_media, docs, transport).await?;
     send_rich_once(bot, chat_id, html, media).await
 }
 
@@ -1213,16 +1282,17 @@ pub async fn send_entry_with_media(
     let mut rich_delivered = false;
 
     // Automatic enhancement: only posts that would overflow the existing
-    // caption/album limits take the rich path. The count intentionally
-    // excludes GIFs, documents and retweet images; they keep their existing
-    // follow-up messages.
+    // caption/album limits take the rich path. The count includes documents
+    // (converted images, audio/files) but still excludes GIFs and retweet
+    // images; those keep their existing follow-up messages.
     let album_media: Vec<&MediaItem> = videos
         .iter()
         .copied()
         .chain(photos.iter().copied())
         .collect();
+    let rich_media_count = album_media.len() + docs.len();
     let full_text_len = visible_len(&full_caption);
-    if opts.allow_rich && should_try_rich_media(full_text_len, album_media.len()) {
+    if opts.allow_rich && should_try_rich_media(full_text_len, rich_media_count) {
         match try_send_rich_media(
             bot,
             db,
@@ -1230,6 +1300,7 @@ pub async fn send_entry_with_media(
             &full_caption,
             caption_above,
             &album_media,
+            &docs,
             transport,
         )
         .await
@@ -1242,7 +1313,8 @@ pub async fn send_entry_with_media(
                     chat_id = chat_id,
                     entry_id = %fetcher::entry_id(entry),
                     text_len = full_text_len,
-                    media_count = album_media.len(),
+                    media_count = rich_media_count,
+                    document_count = docs.len(),
                     "rich media enhancement sent"
                 );
             }
@@ -1251,7 +1323,8 @@ pub async fn send_entry_with_media(
                     chat_id = chat_id,
                     entry_id = %fetcher::entry_id(entry),
                     text_len = full_text_len,
-                    media_count = album_media.len(),
+                    media_count = rich_media_count,
+                    document_count = docs.len(),
                     error = %e,
                     "rich media send failed, falling back to standard path"
                 );
@@ -1417,7 +1490,10 @@ pub async fn send_entry_with_media(
     // already delivered with the main message); it only sets media_failed
     // and relies on the admin notification as the safety net.
     let mut first_doc_msg: Option<Message> = None;
-    if !docs.is_empty() {
+    // Documents already traveled inside the rich message; do not send them
+    // again. A rich failure leaves rich_delivered=false and keeps the normal
+    // document-group path below.
+    if !rich_delivered && !docs.is_empty() {
         let reply_to = anchor.as_ref().map(|m| m.id);
         let cap = if anchor.is_none() { caption.as_str() } else { "" };
         match send_doc_group(bot, db, chat_id, &docs, cap, reply_to, transport).await {
@@ -2729,12 +2805,16 @@ mod tests {
     }
 
     #[test]
-    fn rich_media_trigger_requires_album_overflow_or_caption_overflow() {
-        // Album media only: normal caption and ≤10 items stay standard.
+    fn rich_media_trigger_counts_album_and_document_attachments() {
+        // ≤10 attachments with a normal caption stay standard.
         assert!(!should_try_rich_media(CAPTION_LIMIT, 10));
         assert!(should_try_rich_media(CAPTION_LIMIT + 1, 10));
+        // >10 total attachments trigger, regardless of type (documents are
+        // counted the same as photos/videos).
         assert!(should_try_rich_media(0, 11));
-        // No album media (only GIF/document/retweet): do not trigger.
+        // A single document + overflowing text triggers the rich path.
+        assert!(should_try_rich_media(CAPTION_LIMIT + 1, 1));
+        // No media (GIF/document excluded upstream or empty): do not trigger.
         assert!(!should_try_rich_media(CAPTION_LIMIT + 1, 0));
         // Rich hard limits.
         assert!(!should_try_rich_media(CAPTION_LIMIT + 1, RICH_MEDIA_MAX + 1));
@@ -2789,13 +2869,13 @@ mod tests {
     fn rich_media_html_uses_single_collage_and_slideshow() {
         let one = mk_item("p0", MediaKind::Image, false);
         assert_eq!(
-            rich_media_html(&[&one]),
+            rich_media_html(&[&one], &[]),
             "<img src=\"tg://photo?id=m0\"/>"
         );
 
         let two = mk_item("p1", MediaKind::Image, false);
         assert_eq!(
-            rich_media_html(&[&one, &two]),
+            rich_media_html(&[&one, &two], &[]),
             "<tg-collage><img src=\"tg://photo?id=m0\"/><img src=\"tg://photo?id=m1\"/></tg-collage>"
         );
 
@@ -2803,9 +2883,44 @@ mod tests {
             .map(|i| mk_item(&format!("p{i}"), MediaKind::Image, false))
             .collect();
         let refs: Vec<&MediaItem> = items.iter().collect();
-        let html = rich_media_html(&refs);
+        let html = rich_media_html(&refs, &[]);
         assert!(html.starts_with("<tg-slideshow>"));
         assert!(html.ends_with("</tg-slideshow>"));
+    }
+
+    #[test]
+    fn rich_media_html_appends_document_blocks_after_album() {
+        let photo = mk_item("p0", MediaKind::Image, false);
+        let doc_image = mk_item("d0", MediaKind::Image, false);
+        let doc_file = mk_item("d1", MediaKind::Other, false);
+
+        assert_eq!(
+            rich_media_html(&[&photo], &[&doc_image, &doc_file]),
+            "<img src=\"tg://photo?id=m0\"/>\
+             <tg-document src=\"tg://document?id=m1\"></tg-document>\
+             <tg-document src=\"tg://document?id=m2\"></tg-document>"
+        );
+
+        // Documents-only entries start their ids at m0.
+        assert_eq!(
+            rich_media_html(&[], &[&doc_image, &doc_file]),
+            "<tg-document src=\"tg://document?id=m0\"></tg-document>\
+             <tg-document src=\"tg://document?id=m1\"></tg-document>"
+        );
+    }
+
+    #[test]
+    fn rich_media_html_never_groups_documents_into_slideshow() {
+        // Collages/slideshows only accept photos and videos; >10 documents
+        // must stay individual blocks.
+        let docs: Vec<MediaItem> = (0..11)
+            .map(|i| mk_item(&format!("d{i}"), MediaKind::Image, false))
+            .collect();
+        let refs: Vec<&MediaItem> = docs.iter().collect();
+        let html = rich_media_html(&[], &refs);
+        assert_eq!(html.matches("<tg-document").count(), 11);
+        assert!(!html.contains("<tg-slideshow>"));
+        assert!(!html.contains("<tg-collage>"));
     }
 
     #[test]
