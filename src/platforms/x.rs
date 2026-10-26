@@ -177,7 +177,8 @@ async fn fetch_x_user_with_ct0(
     let (rest_id, display_name) = resolve_user(state, auth_token, ct0, screen_name).await?;
 
     // Step 3: fetch user timeline.
-    let tweets = fetch_user_tweets(state, auth_token, ct0, &rest_id, screen_name, known_sent).await?;
+    let _ = known_sent;
+    let tweets = fetch_user_tweets(state, auth_token, ct0, &rest_id, screen_name).await?;
 
     // Step 4: convert to entries (dedup by entry id within the batch, matching
     // the Weibo behavior; fix for #8).
@@ -644,7 +645,6 @@ async fn fetch_user_tweets(
     ct0: &str,
     rest_id: &str,
     screen_name: &str,
-    known_sent: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<Vec<Value>> {
     let mut tweets: Vec<Value> = Vec::new();
     // Accumulated across pages: distinguishes a "truly empty timeline" from
@@ -712,31 +712,20 @@ async fn fetch_user_tweets(
         let page = extract_timeline_page(instructions);
         total_non_cursor_entries += page.non_cursor_entries;
         let page_tweet_count = page.tweets.len();
-        // If every tweet on this page is already sent, older pages cannot
-        // contain unseen newer tweets; stop paginating to save requests
-        // (2 extra pages × 1.1s per X feed per round in the steady state).
-        // Pinned tweets are included in the check, so a pinned old tweet with
-        // unseen newer tweets on the same page still continues.
-        let page_all_known = known_sent.is_some_and(|known| {
-            !page.tweets.is_empty()
-                && page.tweets.iter().all(|t| {
-                    tweet_id_of(t).is_some_and(|id| known.contains(id))
-                })
-        });
         tweets.extend(page.tweets);
 
         // Stop conditions (none can loop forever): no bottom cursor, a cursor
         // identical to the one just used (X sometimes repeats it on an
         // exhausted timeline), or a page that yielded no tweets at all
         // (further pages cannot recover from an empty/redesigned page).
-        // Pages with older already-sent tweets are still safe: the scheduler
-        // filters them via the sent-entry table (widening the window never
-        // re-pushes).
+        //
+        // Do NOT stop just because every tweet on this page is already in
+        // sent_entries: a failed/deferred entry on an older page (MediaOnly
+        // download failure, deadline deferral) is intentionally left unsent
+        // for the next round. Stopping here would make that page unreachable
+        // until the account posts again, silently dropping the pending entry.
         let Some(next) = page.bottom_cursor else { break };
         if page_tweet_count == 0 || Some(&next) == cursor.as_ref() {
-            break;
-        }
-        if page_all_known {
             break;
         }
         cursor = Some(next);
@@ -1367,14 +1356,6 @@ fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str, lang: La
     ConvertOutcome::Ok(Box::new(crate::platforms::make_entry(
         id, title, display_name.to_string(), body, "text/html", link, published,
     )))
-}
-
-/// Stable tweet id of a timeline item (legacy id_str, then rest_id).
-fn tweet_id_of(value: &Value) -> Option<&str> {
-    let tr = unwrap_tweet_result(value);
-    tr["legacy"]["id_str"]
-        .as_str()
-        .or_else(|| tr["rest_id"].as_str())
 }
 
 /// Whether a quoted/retweeted payload is a real tweet (not a tombstone or
