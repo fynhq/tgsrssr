@@ -1172,6 +1172,18 @@ async fn download_one(
                 // actually being requested (per hop), so a direct no-proxy URL
                 // cannot 302 to a private literal IP with the check skipped.
                 let (client, via_proxy) = state.media_route_for_url(&cur_url);
+                // Literal private IPs/localhost are never exempted, even on
+                // proxy routes: no local DNS is involved, and the proxy can
+                // reach the host's loopback/LAN.
+                match crate::ssrf::ssrf_check_literal(&cur_url) {
+                    crate::ssrf::SsrfOutcome::Private => {
+                        anyhow::bail!("blocked: private/loopback address: {}", cur_url);
+                    }
+                    crate::ssrf::SsrfOutcome::InvalidUrl => {
+                        anyhow::bail!("invalid media URL: {}", cur_url);
+                    }
+                    _ => {}
+                }
                 if !via_proxy {
                     match crate::ssrf::ssrf_check(&cur_url).await {
                         crate::ssrf::SsrfOutcome::Private => {

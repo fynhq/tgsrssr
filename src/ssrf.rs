@@ -98,6 +98,39 @@ pub async fn ssrf_check(url: &str) -> SsrfOutcome {
     lookup_classify(host, port).await.0
 }
 
+/// SSRF check for requests that will be connected on the proxy side and thus
+/// cannot use a local DNS verdict. It still blocks targets that need no DNS:
+/// private/loopback/link-local literal IPs (including bracketed IPv6) and
+/// `localhost` names. Domain names are allowed because their resolution
+/// happens on the proxy side; a local lookup would produce false positives
+/// for CDN hostnames (the documented proxy exemption).
+///
+/// Without this, a proxy-routed feed could target `http://127.0.0.1:8081`
+/// or `http://192.168.x.x` directly, which the pre-existing blanket proxy
+/// exemption let through.
+pub fn ssrf_check_literal(url: &str) -> SsrfOutcome {
+    let Ok(u) = url::Url::parse(url) else { return SsrfOutcome::InvalidUrl };
+    if u.scheme() != "http" && u.scheme() != "https" {
+        return SsrfOutcome::Private;
+    }
+    let Some(raw_host) = u.host_str() else { return SsrfOutcome::InvalidUrl };
+    // url::Url::host_str() includes brackets for IPv6 literals.
+    let host = raw_host.trim_start_matches('[').trim_end_matches(']');
+    let host_no_dot = host.trim_end_matches('.');
+    if let Ok(ip) = host_no_dot.parse::<IpAddr>() {
+        return if is_private_ip(&ip) {
+            SsrfOutcome::Private
+        } else {
+            SsrfOutcome::Allowed
+        };
+    }
+    let lower = host_no_dot.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return SsrfOutcome::Private;
+    }
+    SsrfOutcome::Allowed
+}
+
 /// Connection-layer DNS guard closing the rebinding window of the pre-check.
 ///
 /// The pre-check resolves the hostname and vetoes private answers, but reqwest
@@ -185,6 +218,7 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
                 || (seg[0] & 0xfe00) == 0xfc00   // fc00::/7 ULA
                 || v6.is_unspecified()
                 || (seg[0] & 0xffc0) == 0xfe80   // fe80::/10 link-local
+                || (seg[0] & 0xffc0) == 0xfec0   // fec0::/10 deprecated site-local
                 || (seg[0] & 0xff00) == 0xff00   // ff00::/8 multicast
                 || seg[0] == 0x2002              // 2002::/16 6to4 (embeds arbitrary IPv4)
                 || seg[0] == 0x2001 && seg[1] == 0 // 2001::/32 Teredo (embeds arbitrary IPv4)
@@ -256,6 +290,32 @@ mod tests {
             Err(err) => assert!(err.to_string().contains("dns resolve failed")),
             Ok(mut addrs) => assert!(addrs.all(|a| !is_private_ip(&a.ip()))),
         }
+    }
+
+    #[test]
+    fn literal_proxy_check_blocks_private_ips_and_localhost() {
+        // Proxy routes cannot use local DNS, but literal targets need no DNS
+        // and must still be rejected.
+        assert_eq!(ssrf_check_literal("http://127.0.0.1:8081/"), SsrfOutcome::Private);
+        assert_eq!(ssrf_check_literal("http://10.0.0.5/"), SsrfOutcome::Private);
+        assert_eq!(ssrf_check_literal("http://169.254.169.254/latest"), SsrfOutcome::Private);
+        // WHATWG URL parsing normalizes short/hex IPv4 forms to dotted decimal.
+        assert_eq!(ssrf_check_literal("http://127.1/"), SsrfOutcome::Private);
+        assert_eq!(ssrf_check_literal("http://2130706433/"), SsrfOutcome::Private);
+        assert_eq!(ssrf_check_literal("http://[::1]/"), SsrfOutcome::Private);
+        assert_eq!(ssrf_check_literal("http://[fe80::1]/"), SsrfOutcome::Private);
+        assert_eq!(ssrf_check_literal("http://localhost/"), SsrfOutcome::Private);
+        assert_eq!(ssrf_check_literal("http://foo.localhost./"), SsrfOutcome::Private);
+        assert_eq!(ssrf_check_literal("https://example.com/feed"), SsrfOutcome::Allowed);
+        // Public IPv6 literal passes (DNS guard is not involved).
+        assert_eq!(ssrf_check_literal("https://[2606:4700::1111]/"), SsrfOutcome::Allowed);
+        assert_eq!(ssrf_check_literal("file:///etc/passwd"), SsrfOutcome::Private);
+    }
+
+    #[test]
+    fn site_local_ipv6_is_private() {
+        assert!(is_private_ip(&"fec0::1".parse().unwrap()));
+        assert!(!is_private_ip(&"2001:4860:4860::8888".parse().unwrap()));
     }
 
     #[test]

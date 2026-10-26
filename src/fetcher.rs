@@ -305,6 +305,20 @@ pub async fn fetch_feed(
     // proxy side, so the local DNS resolution result does not affect the
     // actual connection target — skip the check (v1.10.14: fixed false
     // blocking caused by local DNS resolving a domain to a private address).
+    // Literal private/loopback IPs and localhost are rejected even when the
+    // connection is made through the proxy: they need no DNS resolution, so
+    // the proxy exemption (which exists for local-DNS false positives on CDN
+    // hostnames) must not cover them. The proxy may reach the host's loopback
+    // or LAN, turning this into a real SSRF path.
+    match crate::ssrf::ssrf_check_literal(feed_url) {
+        crate::ssrf::SsrfOutcome::Private => {
+            anyhow::bail!("blocked: private/loopback address: {}", feed_url);
+        }
+        crate::ssrf::SsrfOutcome::InvalidUrl => {
+            anyhow::bail!("invalid feed URL: {}", feed_url);
+        }
+        _ => {}
+    }
     if !state.is_routed_via_proxy(feed_url) {
         match crate::ssrf::ssrf_check(feed_url).await {
             crate::ssrf::SsrfOutcome::Private => {
@@ -375,6 +389,15 @@ pub async fn fetch_feed(
             // reported as "dns resolve failed" so is_net_error treats it as
             // transient. Substring contract: keep both wordings in sync with
             // sendpolicy::is_net_error.
+            match crate::ssrf::ssrf_check_literal(&next_str) {
+                crate::ssrf::SsrfOutcome::Private => {
+                    anyhow::bail!("blocked: redirect to private/loopback address");
+                }
+                crate::ssrf::SsrfOutcome::InvalidUrl => {
+                    anyhow::bail!("invalid redirect URL: {}", next_str);
+                }
+                _ => {}
+            }
             if !state.is_routed_via_proxy(&next_str) {
                 match crate::ssrf::ssrf_check(&next_str).await {
                     crate::ssrf::SsrfOutcome::Private => {
