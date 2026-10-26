@@ -158,7 +158,10 @@ impl MediaKind {
         }
         let lower = url.to_lowercase();
         let path_part = lower.split('?').next().unwrap_or(&lower);
-        const IMG: [&str; 8] = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".avif"];
+        const IMG: [&str; 12] = [
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".avif",
+            ".heic", ".heif", ".tif", ".tiff",
+        ];
         const VID: [&str; 6] = [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"];
         if IMG.iter().any(|e| path_part.ends_with(e)) {
             Self::Image
@@ -185,10 +188,17 @@ impl MediaKind {
             "image/gif" => "gif",
             "image/webp" => "webp",
             "image/bmp" => "bmp",
+            "image/avif" => "avif",
+            "image/svg+xml" => "svg",
+            "image/heic" | "image/heif" => "heic",
+            "image/tiff" => "tiff",
             "video/mp4" => "mp4",
             "video/webm" => "webm",
             "video/quicktime" => "mov",
             _ => match self {
+                // Extensionless image URLs (common on CDNs) use this fallback
+                // only until the downloaded bytes are sniffed; an unknown
+                // format must not be treated as a valid JPEG.
                 MediaKind::Image => "jpg",
                 MediaKind::Video => "mp4",
                 MediaKind::Other => "bin",
@@ -500,6 +510,60 @@ fn sniff_gif(path: &std::path::Path) -> bool {
         Ok(()) => &magic[..] == b"GIF87a" || &magic[..] == b"GIF89a",
         Err(_) => false,
     }
+}
+
+/// Detect an image format from its leading bytes. The URL/MIME hints are not
+/// sufficient for extensionless CDN URLs (and body `<img>` tags always carry
+/// `image/unknown`): without sniffing, an AVIF/HEIC/TIFF would be written with
+/// a `.jpg` fallback name and routed to sendPhoto, which Telegram rejects with
+/// IMAGE_PROCESS_FAILED. Returning the real extension lets the existing
+/// format/document classification work.
+fn detect_image_ext(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg");
+    }
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("png");
+    }
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if head.starts_with(b"BM") {
+        return Some("bmp");
+    }
+    // ISO BMFF: [size:4]["ftyp"][brand:4]...
+    if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        return match &head[8..12] {
+            b"avif" | b"avis" => Some("avif"),
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"hevm"
+            | b"hevs" | b"mif1" | b"msf1" => Some("heic"),
+            _ => None,
+        };
+    }
+    if head.starts_with(b"II*\0") || head.starts_with(b"MM\0*") {
+        return Some("tiff");
+    }
+    let start = head.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(head.len());
+    let trimmed = &head[start..];
+    if trimmed.starts_with(b"<svg")
+        || (trimmed.starts_with(b"<?xml") && head.windows(4).any(|w| w == b"<svg"))
+    {
+        return Some("svg");
+    }
+    None
+}
+
+/// Read the first 512 bytes of a downloaded file and detect its image format.
+/// A read error yields None (the URL/MIME extension remains in use).
+fn sniff_image_ext(path: &std::path::Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 512];
+    let n = f.read(&mut head).ok()?;
+    detect_image_ext(&head[..n])
 }
 
 /// Cheap pre-download GIF detection from the MIME hint or the URL path
@@ -1320,7 +1384,15 @@ async fn download_one(
         RawOutcome::Empty => return Ok(DownloadOutcome::Empty),
     };
 
-    let ext = kind.ext(mime, url);
+    let mut ext = kind.ext(mime, url);
+    // Extensionless CDN images carry no reliable type in the URL/MIME hints;
+    // sniff the actual bytes so AVIF/SVG/HEIC/TIFF are not mislabeled as JPEG
+    // and sent through sendPhoto (a deterministic 400).
+    if *kind == MediaKind::Image {
+        if let Some(detected) = sniff_image_ext(&tmp_path) {
+            ext = detected.to_string();
+        }
+    }
     // Keep the original extension and append the storage-only suffix, e.g.
     // `123456_uuid.jpg.tgsr`. path_input() strips it when uploading.
     let name = format!("{}_{}.{}{}", chrono::Utc::now().format("%H%M%S%f"), uuid::Uuid::new_v4(), ext, STORAGE_SUFFIX);
@@ -1882,6 +1954,35 @@ mod tests {
         std::fs::write(&base, b"not a directory").unwrap();
         assert!(ensure_outbound_dir(&base).is_err());
         std::fs::remove_file(&base).ok();
+    }
+
+    #[test]
+    fn detect_image_ext_identifies_unsupported_formats() {
+        // AVIF/HEIC: ISO BMFF with ftyp + brand.
+        assert_eq!(
+            detect_image_ext(b"\0\0\0\x1cftypavif\0\0\0\0"),
+            Some("avif")
+        );
+        assert_eq!(
+            detect_image_ext(b"\0\0\0\x1cftypheic\0\0\0\0"),
+            Some("heic")
+        );
+        // SVG, including an XML declaration before the root element.
+        assert_eq!(detect_image_ext(b"<svg xmlns=\"...\"></svg>"), Some("svg"));
+        assert_eq!(
+            detect_image_ext(b"<?xml version=\"1.0\"?><svg></svg>"),
+            Some("svg")
+        );
+        // TIFF little/big endian.
+        assert_eq!(detect_image_ext(b"II*\0rest"), Some("tiff"));
+        assert_eq!(detect_image_ext(b"MM\0*rest"), Some("tiff"));
+        // Formats that remain on the photo path.
+        assert_eq!(detect_image_ext(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(detect_image_ext(b"\x89PNG\r\n\x1a\nrest"), Some("png"));
+        assert_eq!(detect_image_ext(b"GIF89a..."), Some("gif"));
+        assert_eq!(detect_image_ext(b"RIFF\0\0\0\0WEBPVP8 "), Some("webp"));
+        // Unknown bytes: no override (URL/MIME fallback remains).
+        assert_eq!(detect_image_ext(b"not an image"), None);
     }
 
     #[test]
