@@ -239,6 +239,8 @@ pub async fn cleanup_logs(config: &Config) -> anyhow::Result<u64> {
 
 /// Clean up database tables.
 pub async fn cleanup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()> {
+    // Only orphaned markers expire; markers for existing subscriptions are
+    // kept regardless of age (see db::cleanup_sent_entries).
     let r1 = db::cleanup_sent_entries(db_pool, config.sent_entries_retention_days).await?;
     // The file_id cache is cleaned by retention period (default 30 days);
     // sent_messages is trimmed by row-count cap, so no time-based cleanup needed.

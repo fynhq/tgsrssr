@@ -49,6 +49,9 @@ pub struct Config {
     pub img_relay_domains: Vec<String>,
 
     // Cleanup
+    /// Retention for orphaned sent-entry markers only (no matching
+    /// subscription row). Markers for existing subscriptions are never purged
+    /// by age (see db::cleanup_sent_entries).
     pub sent_entries_retention_days: i64,
     pub cleanup_interval_minutes: u64,
     pub log_retention_days: i64,

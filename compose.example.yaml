@@ -124,7 +124,8 @@ services:
 
       ## ===== 清理与保留 / Cleanup & retention =====
 
-      ## 默认 180 / Default 180
+      ## 仅清理已无订阅的孤儿已读记录；仍存在的订阅永久保留。默认 180
+      ## Only orphaned sent-entry markers (no subscription row) expire; existing subscriptions are kept. Default 180
       # SENT_ENTRIES_RETENTION_DAYS: "180"
 
       ## 默认 60 / Default 60

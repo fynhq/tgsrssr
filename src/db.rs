@@ -1030,8 +1030,24 @@ pub async fn mark_entry_sent(db: &Db, chat_id: &str, feed_url: &str, entry_id: &
 // ===== Cleanup =====
 
 pub async fn cleanup_sent_entries(db: &Db, retention_days: i64) -> anyhow::Result<u64> {
+    // Time is not a safe criterion for an *existing* subscription: an entry
+    // can stay inside a source's rolling window (or reappear on the next full
+    // fetch) long after the retention period. Deleting its sent marker then
+    // makes the bot re-push an old entry — for X feeds without conditional
+    // requests this can re-post the whole visible window every retention
+    // cycle. Keep rows for any subscription that still exists (active,
+    // paused, or auto-disabled and waiting for self-heal); only clean up
+    // true orphans whose subscription was removed. `/sub` marks the current
+    // window as sent on re-subscribe, so keeping these rows cannot double
+    // push either.
     let result = sqlx::query(
-        "DELETE FROM sent_entries WHERE sent_at < datetime('now', ?)",
+        r#"DELETE FROM sent_entries
+           WHERE sent_at < datetime('now', ?)
+             AND NOT EXISTS (
+                 SELECT 1 FROM subscriptions s
+                 WHERE s.chat_id = sent_entries.chat_id
+                   AND s.feed_url = sent_entries.feed_url
+             )"#,
     )
     .bind(format!("-{} days", retention_days))
     .execute(db)
@@ -1613,6 +1629,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_sent_entries_keeps_active_subscription_rows() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO subscriptions (chat_id, feed_url) VALUES ('1', 'https://example.com/feed')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Old row for a subscription that still exists: must be kept even
+        // though it is past the retention period (re-pushing it after an
+        // inactive period is a regression).
+        sqlx::query(
+            "INSERT INTO sent_entries (chat_id, feed_url, entry_id, sent_at)
+             VALUES ('1', 'https://example.com/feed', 'old-active', datetime('now', '-200 days'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Old orphan (subscription removed): cleaned up.
+        sqlx::query(
+            "INSERT INTO sent_entries (chat_id, feed_url, entry_id, sent_at)
+             VALUES ('2', 'https://example.com/gone', 'old-orphan', datetime('now', '-200 days'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Recent orphan: kept until the retention period expires.
+        sqlx::query(
+            "INSERT INTO sent_entries (chat_id, feed_url, entry_id)
+             VALUES ('2', 'https://example.com/gone', 'recent-orphan')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let removed = cleanup_sent_entries(&pool, 180).await.unwrap();
+        assert_eq!(removed, 1, "only the expired orphan should be removed");
+        let remaining: Vec<(String, String)> = sqlx::query_as(
+            "SELECT chat_id, entry_id FROM sent_entries ORDER BY entry_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining,
+            vec![
+                ("1".to_string(), "old-active".to_string()),
+                ("2".to_string(), "recent-orphan".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
