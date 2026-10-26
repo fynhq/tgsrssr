@@ -779,6 +779,14 @@ fn extract_timeline_page(instructions: &Value) -> TimelinePage {
     let empty_instructions = Vec::new();
     for instr in instructions.as_array().unwrap_or(&empty_instructions) {
         let instr_type = instr["type"].as_str().unwrap_or("");
+        // Deliberately ignore `TimelinePinEntry`: a pinned tweet is often an
+        // old announcement. Pushing it would insert a post whose published
+        // time is older than the batch into the channel (and it would only be
+        // deduped after the first delivery). Recent pinned tweets normally
+        // also appear in the regular timeline, so parsing the pin adds little
+        // coverage while directly causing the "old pinned message" clutter.
+        // If this is ever implemented, gate it by a short published-time
+        // window and dedupe against the normal timeline by rest_id.
         // Dedicated pagination instruction: carries only a cursor entry
         // (entryId `cursor-bottom-…`), never tweets. Read the bottom token
         // from it, contributing neither tweets nor the non-cursor count.
@@ -2070,6 +2078,32 @@ mod tests {
             body,
             "<video src=\"https://video.twimg.com/z/g.mp4\"></video>"
         );
+    }
+
+    #[test]
+    fn pinned_timeline_instruction_is_intentionally_ignored() {
+        // Pinned old tweets must not be injected into the chronological push
+        // stream. Keep this test as the explicit record of that decision: if
+        // pin support is added later, it must come with an age gate + dedupe.
+        let instructions = serde_json::json!([{
+            "type": "TimelinePinEntry",
+            "entry": {
+                "entryId": "pin-1",
+                "content": {
+                    "itemContent": {
+                        "tweet_results": {
+                            "result": {
+                                "rest_id": "1",
+                                "legacy": { "id_str": "1", "full_text": "pinned" }
+                            }
+                        }
+                    }
+                }
+            }
+        }]);
+        let page = extract_timeline_page(&instructions);
+        assert!(page.tweets.is_empty());
+        assert_eq!(page.non_cursor_entries, 0);
     }
 
     #[test]
