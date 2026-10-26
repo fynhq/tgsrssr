@@ -1534,7 +1534,8 @@ async fn notify_download_failed(
 // ===== Outbox retry (persistent retry queue for failed sends) =====
 
 /// Register the outbox retry job: runs every 5 minutes, retries failed sends
-/// with exponential backoff (capped at 2h intervals), abandons after 72h.
+/// with exponential backoff (capped at 2h intervals), and abandons after 72h
+/// of actual retry attempts (never-attempted rows are not abandoned).
 pub async fn register_outbox_retry_job(
     sched: &JobScheduler,
     state: AppState,
@@ -1567,8 +1568,34 @@ fn outbox_backoff_secs(attempts: i64) -> i64 {
     }
 }
 
-/// Total elapsed time before abandoning an outbox entry (72 hours).
+/// Total elapsed time before abandoning an outbox entry (72 hours), measured
+/// from the first real retry attempt (not from enqueue time). Rows that never
+/// received a turn during a long backlog are retried instead of being silently
+/// abandoned.
 const OUTBOX_ABANDON_SECS: i64 = 72 * 3600;
+
+/// Rows fetched per retry round (every 5 minutes). Raised from 10 to 25 so a
+/// long Telegram outage cannot leave the oldest rows permanently at the back
+/// of the queue.
+const OUTBOX_BATCH_LIMIT: i64 = 25;
+
+/// Whether a queue row is past its 72h retry window. The clock starts at the
+/// first actual attempt, not at enqueue time; a row that has never been tried
+/// is never abandoned (it may simply have been behind a long backlog). Legacy
+/// rows without `last_attempt_at` fall back to `created_at`, matching the old
+/// behavior for rows that had already been attempted.
+fn outbox_abandon_due(
+    created_at: i64,
+    last_attempt_at: Option<i64>,
+    attempts: i64,
+    now: i64,
+) -> bool {
+    if attempts <= 0 {
+        return false;
+    }
+    let anchor = last_attempt_at.unwrap_or(created_at);
+    now - anchor >= OUTBOX_ABANDON_SECS
+}
 
 /// Unified construction of push-failure notifications (M5 fix: the original
 /// 4 format! templates were verbatim duplicates).
@@ -1682,9 +1709,15 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     let _guard = crate::state::ActiveFlagGuard(state.outbox_retry_active.clone());
 
     let now = chrono::Utc::now().timestamp();
-    let due = db::outbox_fetch_due(&state.db, now, 10).await?;
+    let due = db::outbox_fetch_due(&state.db, now, OUTBOX_BATCH_LIMIT).await?;
     if due.is_empty() {
         return Ok(());
+    }
+    if due.len() as i64 == OUTBOX_BATCH_LIMIT {
+        warn!(
+            batch = OUTBOX_BATCH_LIMIT,
+            "outbox retry batch is full; a backlog may be forming"
+        );
     }
 
     let transport = crate::media::MediaTransport::new(&state.config);
@@ -1713,12 +1746,15 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             }
         }
 
-        // Check if 72h elapsed -> abandon
-        if now - row.created_at >= OUTBOX_ABANDON_SECS {
+        // Check if 72h elapsed since the first actual attempt -> abandon.
+        // Measuring from created_at silently abandoned rows that sat behind a
+        // long outage backlog and were never retried even once.
+        if outbox_abandon_due(row.created_at, row.last_attempt_at, row.attempts, now) {
             warn!(
                 entry_id = %row.entry_id,
                 feed = %row.feed_url,
-                "outbox entry abandoned after 72h"
+                attempts = row.attempts,
+                "outbox entry abandoned after 72h of retries"
             );
             abandon_outbox_row(bot, state, &row, "notif_timeout_72h").await;
             continue;
@@ -1963,6 +1999,34 @@ fn extract_entry_link_from_json(entry_json: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbox_abandon_requires_an_attempt_and_uses_last_attempt() {
+        let now = 1_000_000_000;
+        // Never attempted: never abandoned, regardless of age.
+        assert!(!outbox_abandon_due(now - 10 * 24 * 3600, None, 0, now));
+        // Attempted 72h ago: abandoned.
+        assert!(outbox_abandon_due(
+            now - 10 * 24 * 3600,
+            Some(now - OUTBOX_ABANDON_SECS),
+            3,
+            now
+        ));
+        // Attempted recently even though enqueued long ago: still retried.
+        assert!(!outbox_abandon_due(
+            now - 10 * 24 * 3600,
+            Some(now - 3600),
+            2,
+            now
+        ));
+        // Legacy row (attempts>0, no last_attempt_at): use created_at.
+        assert!(outbox_abandon_due(
+            now - OUTBOX_ABANDON_SECS,
+            None,
+            1,
+            now
+        ));
+    }
 
     #[test]
     fn stale_zero_counts_up_and_warns_on_multiples() {

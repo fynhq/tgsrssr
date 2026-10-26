@@ -1212,7 +1212,8 @@ pub async fn find_sent_message(
 
 // next_retry_at/last_error are only used in SQL WHERE/UPDATE and never read
 // directly on the Rust side — kept to preserve the complete mapping of the
-// database schema.
+// database schema. `last_attempt_at` is read by the retry loop to measure the
+// 72h abandonment window from a real attempt instead of enqueue time.
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OutboxRow {
@@ -1234,6 +1235,9 @@ pub struct OutboxRow {
     pub attempts: i64,
     pub next_retry_at: i64,
     pub created_at: i64,
+    /// Unix seconds of the most recent retry attempt; NULL until the first
+    /// attempt (legacy rows may also be NULL).
+    pub last_attempt_at: Option<i64>,
     pub last_error: Option<String>,
 }
 
@@ -1284,7 +1288,7 @@ pub async fn outbox_insert(
 /// Fetch outbox entries that are due for retry.
 pub async fn outbox_fetch_due(db: &Db, now_ts: i64, limit: i64) -> anyhow::Result<Vec<OutboxRow>> {
     let rows = sqlx::query_as::<_, OutboxRow>(
-        "SELECT id, chat_id, feed_url, entry_id, feed_title, entry_json, media_json, meta_json, content_mode, source_display, link_preview, caption_above_media, author, attempts, next_retry_at, created_at, last_error FROM outbox WHERE next_retry_at <= ? ORDER BY next_retry_at ASC LIMIT ?",
+        "SELECT id, chat_id, feed_url, entry_id, feed_title, entry_json, media_json, meta_json, content_mode, source_display, link_preview, caption_above_media, author, attempts, next_retry_at, created_at, last_attempt_at, last_error FROM outbox WHERE next_retry_at <= ? ORDER BY next_retry_at ASC LIMIT ?",
     )
     .bind(now_ts)
     .bind(limit)
@@ -1311,13 +1315,15 @@ pub async fn outbox_update_retry(
     id: i64,
     attempts: i64,
     next_retry_at: i64,
+    last_attempt_at: i64,
     last_error: &str,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "UPDATE outbox SET attempts = ?, next_retry_at = ?, last_error = ? WHERE id = ?",
+        "UPDATE outbox SET attempts = ?, next_retry_at = ?, last_attempt_at = ?, last_error = ? WHERE id = ?",
     )
     .bind(attempts)
     .bind(next_retry_at)
+    .bind(last_attempt_at)
     .bind(last_error)
     .bind(id)
     .execute(db)
@@ -1722,6 +1728,41 @@ mod tests {
         pool.close().await;
         std::fs::remove_file(&db_path).ok();
         std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn outbox_retry_records_last_attempt() {
+        let pool = test_pool().await;
+        outbox_insert(
+            &pool,
+            "1",
+            "https://example.com/feed",
+            "e1",
+            "Feed",
+            "{}",
+            "[]",
+            "",
+            "title_link",
+            "source",
+            true,
+            false,
+            None,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        let due = outbox_fetch_due(&pool, 1, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].last_attempt_at, None);
+
+        outbox_update_retry(&pool, due[0].id, 1, 5, 123, "boom")
+            .await
+            .unwrap();
+        let due = outbox_fetch_due(&pool, 5, 10).await.unwrap();
+        assert_eq!(due[0].attempts, 1);
+        assert_eq!(due[0].last_attempt_at, Some(123));
+        assert_eq!(due[0].last_error.as_deref(), Some("boom"));
     }
 
     #[tokio::test]
