@@ -445,9 +445,10 @@ pub fn extract_cookie_value(set_cookie: &str, name: &str) -> Option<String> {
 // Blockquote folding
 // ---------------------------------------------------------------------------
 
-/// Unified blockquote folding rules: visible content > 200 chars uses
-/// `<blockquote expandable>` (collapsed by default), ≤ 200 uses a plain
-/// `<blockquote>` (shown expanded).
+/// Unified blockquote folding rules: visible content > 200 UTF-16 code units
+/// uses `<blockquote expandable>` (collapsed by default), ≤ 200 uses a plain
+/// `<blockquote>` (shown expanded). UTF-16 is Telegram's own length measure
+/// (an emoji counts as two units).
 /// Also trims leading/trailing whitespace inside the blockquote; for the
 /// RSSHub telegram channel pattern of "short header line + blank line +
 /// body" (e.g. "Zhao Xin:\n\nbody"), only the \n\n after the first short

@@ -1200,10 +1200,12 @@ async fn process_feed(
             }
 
             // Cookie-expired flag (for the /cookies panel status display):
-            // set immediately (global). Detection is typed first
-            // (PlatformError::AuthExpired); the legacy "cookie" substring is
-            // kept as a fallback for "cookie not configured" messages that
-            // predate the typed error.
+            // set immediately (global); this is NOT a push notification. The
+            // admin alert follows the platform-health hysteresis (two
+            // consecutive all-failed rounds), so one jitter round stays quiet.
+            // Detection is typed first (PlatformError::AuthExpired); the
+            // legacy "cookie" substring is kept as a fallback for "cookie not
+            // configured" messages that predate the typed error.
             let auth_expired = e.chain().any(|cause| {
                 matches!(
                     cause.downcast_ref::<crate::platforms::PlatformError>(),
