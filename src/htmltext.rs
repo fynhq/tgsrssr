@@ -912,48 +912,8 @@ fn tag_name(tag: &str) -> Option<String> {
 struct SplitScan {
     /// Safe-position candidates by priority (see `scan_split_candidates`).
     best: [Option<CutCandidate>; 4],
-    /// Open tags still spanning the window end: their fragments are needed to
-    /// balance the raw fallback cut.
+    /// Open tags still spanning the window end, used by `rebalance_chunks`.
     end_stack: Vec<(String, String)>,
-    /// Largest byte offset a raw fallback cut can use without landing inside
-    /// a tag (an unterminated tag shrinks this to the tag's start).
-    window_end: usize,
-}
-
-/// True when `s` starts with `&` and could still grow into a complete entity
-/// reference — so the scan window ended inside an entity and a raw cut must
-/// back off before the `&`. A body containing `;` is a completed (or dead)
-/// reference, never a pending prefix.
-fn is_entity_prefix(s: &str) -> bool {
-    let Some(body) = s.strip_prefix('&') else {
-        return false;
-    };
-    if body.is_empty() || body.contains(';') {
-        return body.is_empty();
-    }
-    if let Some(hex) = body.strip_prefix('#') {
-        if let Some(x) = hex.strip_prefix(['x', 'X']) {
-            return x.chars().all(|c| c.is_ascii_hexdigit());
-        }
-        return hex.chars().all(|c| c.is_ascii_digit());
-    }
-    let mut chars = body.chars();
-    chars
-        .next()
-        .map(|c| c.is_ascii_alphabetic())
-        .unwrap_or(false)
-        && chars.all(|c| c.is_ascii_alphanumeric())
-}
-
-/// Back a raw cut position off the end of `window[..pos]` when the text there
-/// ends inside a partial entity reference (`&amp` without the `;` yet), so a
-/// fallback split never amputates an entity.
-fn entity_backoff(text: &str, pos: usize) -> usize {
-    let head = &text[..pos];
-    match head.rfind('&') {
-        Some(amp) if is_entity_prefix(&head[amp..]) => amp,
-        _ => pos,
-    }
 }
 
 /// Scan the first `limit` UTF-16 units of `text` for safe split positions.
@@ -963,8 +923,8 @@ fn entity_backoff(text: &str, pos: usize) -> usize {
 /// before an opening tag, 2 = after whitespace in text, 3 = after a completed
 /// atomic token (entity, void or self-closing tag). The last occurrence
 /// within each priority wins. Text runs without whitespace (e.g. a long CJK
-/// anchor text) get no candidate here; they fall back to the raw cut, which
-/// `split_html_safe` balances with the stack state reported in `end_stack`.
+/// anchor text) get no candidate here; they fall back to `scan_raw_cut`, which
+/// returns the stack at the actual cut position.
 fn scan_split_candidates(text: &str, limit: usize) -> SplitScan {
     let window = take_utf16_prefix(text, limit);
     let mut best: [Option<CutCandidate>; 4] = Default::default();
@@ -985,11 +945,7 @@ fn scan_split_candidates(text: &str, limit: usize) -> SplitScan {
                         *slot = None;
                     }
                 }
-                return SplitScan {
-                    best,
-                    end_stack: stack,
-                    window_end: i,
-                };
+                return SplitScan { best, end_stack: stack };
             };
             let tag = &rest[..gt + 1];
             let end = i + gt + 1;
@@ -1039,8 +995,91 @@ fn scan_split_candidates(text: &str, limit: usize) -> SplitScan {
     SplitScan {
         best,
         end_stack: stack,
-        window_end: window.len(),
     }
+}
+
+/// Largest safe raw cut not exceeding `max_units`, together with the open-tag
+/// stack **at that exact position**.
+///
+/// The raw fallback in `split_html_safe` cannot reuse the stack from the end
+/// of the scan window: the cut is earlier, so a tag close that lies between
+/// the cut and the window end would be treated as already handled. That
+/// produced a head missing its closer and a tail starting with an orphan
+/// closer (Telegram rejects both). This scanner advances token by token
+/// (tags and entities are atomic), records only positions outside them, and
+/// snapshots the stack at the recorded position. Opening tags are only cut
+/// points *before* the tag, never right after (an empty visible head costs
+/// progress).
+fn scan_raw_cut(text: &str, max_units: usize) -> (usize, Vec<(String, String)>) {
+    let mut stack: Vec<(String, String)> = Vec::new();
+    let mut units = 0usize;
+    let mut i = 0usize;
+    let mut best = 0usize;
+    let mut best_stack: Vec<(String, String)> = Vec::new();
+
+    while i < text.len() {
+        let rest = &text[i..];
+        if rest.starts_with('<') {
+            let Some(gt) = rest.find('>') else {
+                // Unterminated tag: no cut may enter it.
+                break;
+            };
+            let tag = &rest[..gt + 1];
+            let tag_units = utf16_len(tag);
+            if units + tag_units > max_units {
+                break;
+            }
+            let is_close = tag.starts_with("</");
+            let name = tag_name(tag);
+            let self_closing = tag.ends_with("/>");
+            if let Some(name) = name {
+                if is_close {
+                    if let Some(idx) = stack.iter().rposition(|(n, _)| *n == name) {
+                        stack.truncate(idx);
+                    }
+                } else if !self_closing && !VOID_TAGS.contains(&name.as_str()) {
+                    // Opening tag: a cut before it is safe; a cut after it
+                    // would leave a visible-empty head once the opener is
+                    // re-prepended to the tail.
+                    if i > 0 && units > 0 {
+                        best = i;
+                        best_stack = stack.clone();
+                    }
+                    stack.push((name, tag.to_string()));
+                    units += tag_units;
+                    i += tag.len();
+                    continue;
+                }
+            }
+            units += tag_units;
+            i += tag.len();
+            best = i;
+            best_stack = stack.clone();
+            continue;
+        }
+        if let Some(m) = RE_ENTITY_REF.find(rest) {
+            let entity_units = utf16_len(&rest[..m.end()]);
+            if units + entity_units > max_units {
+                break;
+            }
+            units += entity_units;
+            i += m.end();
+            best = i;
+            best_stack = stack.clone();
+            continue;
+        }
+        let c = rest.chars().next().unwrap();
+        let char_units = c.len_utf16();
+        if units + char_units > max_units {
+            break;
+        }
+        units += char_units;
+        i += c.len_utf8();
+        best = i;
+        best_stack = stack.clone();
+    }
+
+    (best, best_stack)
 }
 
 /// Split a single HTML paragraph that exceeds `limit` at safe positions:
@@ -1049,10 +1088,11 @@ fn scan_split_candidates(text: &str, limit: usize) -> SplitScan {
 /// balanced by inheritance: the head chunk gets explicit closers and the tail
 /// chunk is re-opened with the same opening tags, so every chunk is
 /// well-formed Telegram HTML on its own. Text runs with no whitespace (a long
-/// CJK link text) fall back to a raw UTF-16 window cut, which is balanced the
-/// same way via the scan's end-of-window stack; the raw cut also backs off a
-/// pending entity so it never amputates `&amp`. A cut is taken at the limit
-/// itself when the window is pure text (nothing to balance).
+/// CJK link text) fall back to a raw UTF-16 cut produced by `scan_raw_cut`,
+/// which returns the stack at the cut position itself (never the window-end
+/// stack) and advances atomically over tags/entities, so the raw fallback also
+/// never amputates `<a …>` or `&amp;`. A cut is taken at the limit itself when
+/// the window is pure text (nothing to balance).
 pub fn split_html_safe(text: &str, limit: usize) -> Vec<String> {
     // Defense: limit=0 would cause a zero-progress infinite loop (all
     // current call sites use constants, so this cannot trigger).
@@ -1086,39 +1126,59 @@ pub fn split_html_safe(text: &str, limit: usize) -> Vec<String> {
             continue;
         }
         // Raw fallback for a text run with no whitespace (e.g. one long CJK
-        // link text): cut at the UTF-16 window boundary minus the space the
-        // appended closers need, never inside an unterminated tag, and back
-        // off a pending entity so the head's end never splits `&amp`. Balance
-        // both sides with the stack that spans the cut.
-        let openers: String = scan.end_stack.iter().map(|(_, t)| t.as_str()).collect();
-        let closers: String = scan
-            .end_stack
+        // link text): use a scanner that returns the largest cut outside any
+        // tag/entity *and the tag stack at that exact position*. Using the
+        // window-end stack here was wrong: a close tag between the cut and the
+        // window end was considered already handled, producing a head without
+        // its closer and a tail with an orphan closer.
+        //
+        // Appending closers consumes length too, so shrink the raw budget
+        // until the head + closers fits. Eight rounds are ample: the closer
+        // length only varies with the nesting depth, not the text length.
+        let mut budget = limit;
+        let (mut cut, mut cut_stack) = scan_raw_cut(&remaining, budget);
+        for _ in 0..8 {
+            if cut == 0 {
+                break;
+            }
+            let closers_len: usize = cut_stack
+                .iter()
+                .rev()
+                .map(|(n, _)| utf16_len(&format!("</{n}>")))
+                .sum();
+            if utf16_len(&remaining[..cut]) + closers_len <= limit {
+                break;
+            }
+            let new_budget = limit.saturating_sub(closers_len).max(1);
+            if new_budget >= budget {
+                break;
+            }
+            budget = new_budget;
+            let next = scan_raw_cut(&remaining, budget);
+            cut = next.0;
+            cut_stack = next.1;
+        }
+        if cut == 0 {
+            // Pathological input (e.g. a single tag/entity larger than the
+            // whole budget): keep the remainder as one over-long chunk instead
+            // of cutting inside markup. Telegram may reject it, but it is
+            // still valid HTML, and no content is cut in half.
+            chunks.push(remaining);
+            return chunks;
+        }
+        let openers: String = cut_stack.iter().map(|(_, t)| t.as_str()).collect();
+        let closers: String = cut_stack
             .iter()
             .rev()
             .map(|(n, _)| format!("</{n}>"))
             .collect();
-        // Reserve room for the closers so the head stays within `limit`; the
-        // reserve is capped at half the limit so the window keeps real width.
-        let reserve = utf16_len(&closers).min(limit / 2);
-        let raw_window = take_utf16_prefix(&remaining, limit - reserve)
-            .len()
-            .min(scan.window_end);
-        let mut cut = entity_backoff(&remaining, raw_window);
-        // Guarantee strict progress: the consumed prefix must outweigh the
-        // openers we hand to the tail. (Deep nesting under a tiny limit is the
-        // only way to hit this; accept a slightly over-limit head to advance.)
-        if utf16_len(&remaining[..cut]) <= utf16_len(&openers) {
-            cut = entity_backoff(
-                &remaining,
-                take_utf16_prefix(&remaining, utf16_len(&openers) + 1).len(),
-            );
-        }
-        if cut == 0 {
-            cut = remaining
-                .chars()
-                .next()
-                .map(|c| c.len_utf8())
-                .unwrap_or(1);
+        let head_len = utf16_len(&remaining[..cut]);
+        if head_len + utf16_len(&closers) > limit || head_len <= utf16_len(&openers) {
+            // No progress possible without exceeding the limit (deep nesting
+            // under a tiny budget). Emit the rest as one chunk: never emit
+            // malformed HTML or loop forever.
+            chunks.push(remaining);
+            return chunks;
         }
         chunks.push(format!("{}{}", &remaining[..cut], closers));
         remaining = format!("{}{}", openers, &remaining[cut..]);
@@ -1476,6 +1536,7 @@ mod tests {
     fn tag_balanced(c: &str) -> bool {
         c.matches("<a ").count() == c.matches("</a>").count()
             && c.matches("<b>").count() == c.matches("</b>").count()
+            && c.matches("<i>").count() == c.matches("</i>").count()
             && c.matches("<pre").count() == c.matches("</pre>").count()
     }
 
@@ -1495,6 +1556,42 @@ mod tests {
         // Content is preserved across the balanced re-wrapped fragments (the
         // inner text is contiguous per chunk, not across chunk boundaries).
         assert_eq!(out.iter().map(|c| c.matches('字').count()).sum::<usize>(), 100);
+    }
+
+    #[test]
+    fn split_safe_raw_cut_uses_stack_at_the_cut() {
+        // Regression: the raw fallback used the tag stack at the end of the
+        // scan window, not at the actual (earlier) cut. A closing tag between
+        // the cut and the window end was treated as already handled, so the
+        // head missed `</a>` and the tail started with an orphan `</a>`
+        // (Telegram rejects both). The exact geometries below previously
+        // produced an empty visible chunk such as `<b></a></b>`.
+        for (limit, open, close, n) in [
+            (4096usize, "<b><a href=\"u\">", "</a></b>", 8150usize),
+            (1024, "<b><i>", "</i></b>", 2024),
+            (1024, "<b><a href=\"u\">", "</a></b>", 2024),
+        ] {
+            let text = format!("{}{}{}", open, "中".repeat(n), close);
+            let chunks = split_html_safe(&text, limit);
+            assert!(chunks.len() >= 2, "expected a split at limit {limit}");
+            for c in &chunks {
+                assert!(tag_balanced(c), "unbalanced chunk at limit {limit}: {c:?}");
+                assert!(
+                    visible_len(c) > 0,
+                    "empty visible chunk at limit {limit}: {c:?}"
+                );
+                assert!(
+                    visible_len(c) <= limit,
+                    "chunk exceeds limit {limit}: visible={} {c:?}",
+                    visible_len(c)
+                );
+            }
+            assert_eq!(
+                chunks.iter().map(|c| c.matches('中').count()).sum::<usize>(),
+                n,
+                "content lost at limit {limit}"
+            );
+        }
     }
 
     #[test]
