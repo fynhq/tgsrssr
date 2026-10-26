@@ -1,11 +1,11 @@
-//! Unsubscribe flow: single unsub, unsub panel, unsub-all confirmation,
-//! OPML backup generation. Split out of callbacks/mod.rs (batch-3 refactor);
-//! behavior unchanged. Uses the parent module's private helpers (`deliver`,
-//! `nav_row`, `PageTarget`, `PAGE_SIZE`) via `super::`.
+//! Unsubscribe flow: single unsub, unsub panel, unsub-all confirmation.
+//! Split out of callbacks/mod.rs (batch-3 refactor). Uses the parent module's
+//! private helpers (`deliver`, `nav_row`, `PageTarget`, `PAGE_SIZE`) via
+//! `super::`.
 
 use teloxide::prelude::*;
 use teloxide::types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
-use tracing::{error, info};
+use tracing::{info, warn};
 
 use super::{deliver, deliver_error_page, fetch_sub_or_toast, nav_row, paginate, PageTarget};
 use crate::push::no_preview;
@@ -192,7 +192,8 @@ pub(super) async fn render_unsub_all_confirm(
     Ok(())
 }
 
-/// Handle unsub_all callback: generate OPML backup, send it, then delete all.
+/// Handle unsub_all callback: delete every subscription, then send a text
+/// notice (the former OPML file backup was removed by product decision).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_unsub_all_callback(
     bot: &Bot,
@@ -220,7 +221,7 @@ pub(super) async fn handle_unsub_all_callback(
     }
 
     // Idempotency protection: when the confirm button is double-tapped quickly, two callbacks
-    // run concurrently and would send the OPML backup twice.
+    // run concurrently and would delete/send the result twice.
     // On entry, edit the confirmation message to "Processing…" — Telegram rejects an edit whose
     // text is unchanged, so the second callback's edit inevitably fails (message is not modified),
     // which acts as the preemption.
@@ -252,16 +253,9 @@ pub(super) async fn handle_unsub_all_callback(
         }
     }
 
-    // Generate OPML
-    let opml = generate_opml(&subs);
-    let opml_bytes = opml.as_bytes().to_vec();
-
-    let chat = db::get_chat(&state.db, chat_id).await.ok().flatten();
-    let title = super::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
-    let safe_name: String = title.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
-    let filename = format!("rss_backup_{}.opml", safe_name);
-
-    // Send backup file first — only proceed if successful
+    // The notice and the final confirmation edit need the panel's chat. Check
+    // it before deleting anything so a message-less callback can never remove
+    // subscriptions with no way to report the result.
     let target_chat = match q.message.as_ref().map(|m| m.chat().id) {
         Some(t) => t,
         None => {
@@ -269,33 +263,16 @@ pub(super) async fn handle_unsub_all_callback(
             return Ok(());
         }
     };
+    let chat = db::get_chat(&state.db, chat_id).await.ok().flatten();
+    let title = super::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
 
-    let doc = teloxide::types::InputFile::memory(opml_bytes).file_name(filename.clone());
-    match bot.send_document(target_chat, doc)
-        .caption(i18n::t(lang, "unsuball_caption")
-            .replacen("{}", &title, 1)
-            .replacen("{}", &subs.len().to_string(), 1))
-        .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            error!(chat_id = chat_id, error = %e, "failed to send OPML backup");
-            bot.answer_callback_query(qid.clone())
-                .text(i18n::t(lang, "unsuball_backup_failed"))
-                .await?;
-            // Restore the confirmation page (the idempotency lock has already changed the message
-            // to "Processing…"; without restoring it, retries would be locked out forever).
-            render_unsub_all_confirm(bot, PageTarget::Edit(q), chat_id, state, page, ch_page, chlist_page, lang).await?;
-            return Ok(());
-        }
-    }
-
-    // Now delete all subscriptions
+    // Delete first; there is no file backup to gate the operation anymore.
     let count = match db::delete_all_subscriptions(&state.db, chat_id).await {
         Ok(c) => c,
         Err(e) => {
             bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1)).await.ok();
-            // Restore the confirmation page (same as above).
+            // Restore the confirmation page (the idempotency lock already
+            // changed the message to "Processing…").
             render_unsub_all_confirm(bot, PageTarget::Edit(q), chat_id, state, page, ch_page, chlist_page, lang).await?;
             return Ok(());
         }
@@ -304,65 +281,49 @@ pub(super) async fn handle_unsub_all_callback(
     // feed_configs overrides are dropped inside delete_all_subscriptions'
     // transaction, so re-subscribes start from channel defaults.
 
-    info!(chat_id = chat_id, count = count, "all subscriptions removed with backup");
+    info!(chat_id = chat_id, count = count, "all subscriptions removed");
 
-    // Operation complete: edit the confirmation message in place to show the
-    // result (avoid deleting messages). Falls back to sending a new message
-    // when the original can no longer be edited.
-    match &q.message {
-        Some(m) => {
-            let chat = m.chat().id;
-            let mid = m.id();
-            bot.answer_callback_query(qid.clone()).await.ok();
-            let text = i18n::t(lang, "unsuball_ok")
-                .replacen("{}", &crate::push::format_chat_title_html(&title, chat_id), 1)
-                .replacen("{}", &crate::push::format_chat_id_html(chat_id), 1)
-                .replacen("{}", &count.to_string(), 1);
-            let kb = InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback(i18n::t(lang, "unsuball_view"), format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page)),
-            ]]);
-            if bot
-                .edit_message_text(chat, mid, &text)
-                .parse_mode(ParseMode::Html)
-                .link_preview_options(no_preview())
-                .reply_markup(kb.clone())
+    bot.answer_callback_query(qid.clone()).await.ok();
+    // Replace the old OPML file with a plain notice, matching the single
+    // unsubscribe flow. A notice failure must not undo a completed deletion.
+    let notice = i18n::t(lang, "unsuball_ok")
+        .replacen("{}", &crate::push::format_chat_title_html(&title, chat_id), 1)
+        .replacen("{}", &crate::push::format_chat_id_html(chat_id), 1)
+        .replacen("{}", &count.to_string(), 1);
+    if let Err(e) = bot
+        .send_message(target_chat, &notice)
+        .parse_mode(ParseMode::Html)
+        .link_preview_options(no_preview())
+        .await
+    {
+        warn!(chat_id = chat_id, error = %e, "failed to send unsubscribe-all notice (deletion already committed)");
+    }
+
+    // Retire the confirmation panel in place; keep a button back to the
+    // channel page. Fall back to a fresh message when editing is impossible.
+    if let Some(m) = q.message.as_ref() {
+        let kb = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback(
+                i18n::t(lang, "unsuball_view"),
+                format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
+            ),
+        ]]);
+        if bot
+            .edit_message_text(m.chat().id, m.id(), i18n::t(lang, "closed"))
+            .reply_markup(kb.clone())
+            .await
+            .is_err()
+        {
+            bot.send_message(m.chat().id, i18n::t(lang, "closed"))
+                .reply_markup(kb)
                 .await
-                .is_err()
-            {
-                bot.send_message(chat, text)
-                    .parse_mode(ParseMode::Html)
-                    .link_preview_options(no_preview())
-                    .reply_markup(kb)
-                    .await
-                    .ok();
-            }
+                .ok();
         }
-        None => {
-            bot.answer_callback_query(qid.clone())
-                .text(i18n::t(lang, "unsuball_toast").replacen("{}", &count.to_string(), 1))
-                .await?;
-        }
+    } else {
+        bot.answer_callback_query(qid.clone())
+            .text(i18n::t(lang, "unsuball_toast").replacen("{}", &count.to_string(), 1))
+            .await?;
     }
 
     Ok(())
-}
-
-/// Generate OPML XML from subscriptions.
-fn generate_opml(subs: &[db::SubRow]) -> String {
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <opml version=\"2.0\">\n<head><title>RSS Subscriptions Backup</title></head>\n<body>\n",
-    );
-    for sub in subs {
-        let title = sub.feed_title.as_deref().unwrap_or(&sub.feed_url);
-        // OPML attribute escaping is exactly equivalent to push::escape_attr, so reuse it uniformly.
-        xml.push_str(&format!(
-            "  <outline type=\"rss\" text=\"{}\" title=\"{}\" xmlUrl=\"{}\"/>\n",
-            crate::push::escape_attr(title),
-            crate::push::escape_attr(title),
-            crate::push::escape_attr(&sub.feed_url)
-        ));
-    }
-    xml.push_str("</body>\n</opml>\n");
-    xml
 }

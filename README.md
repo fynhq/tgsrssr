@@ -122,7 +122,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 - 列表分页（每页 10 个），显示订阅数；源列表最新在前，停用源带 ⏸。
 - 频道设置：推送间隔（默认 30 分钟）、内容模式、来源显示、媒体在下（仅影响图片/视频/动图说明位置）、链接预览。
 - 源级设置：暂停/恢复、改名、内容筛选；推送间隔、内容模式、来源显示、媒体在下、链接预览可逐项覆盖，与频道相同会自动清除覆盖（✏️/🔗 标记）。
-- 退订管理：一键退订前先发送 OPML 备份；频道页支持一键恢复全部停用源。
+- 退订管理：一键退订全部（确认后在事务中执行，并发送文本结果通知；不再生成 OPML 文件）；频道页支持一键恢复全部停用源。
 - 频道列表底部可切换中文/English 界面。
 
 ## 推送与媒体
@@ -362,7 +362,7 @@ Subscribe with `https://t.me/<channel>`. Public channels only, no login required
 - Paginated lists (10 per page) with subscription counts; newest sources first; paused sources marked ⏸.
 - Channel settings: interval (default 30 min), content mode, source display, media below (affects photo/video/animation captions only), link preview.
 - Source settings: pause/resume, rename, content filter; per-source overrides for interval, content mode, source display, media below, and link preview (choosing the channel value clears the override; ✏️/🔗 markers).
-- Unsubscribe management: OPML backup is sent before bulk unsubscribe; channel page can resume all paused sources at once.
+- Unsubscribe management: bulk unsubscribe runs immediately after confirmation and sends a text result notice (no OPML file); channel page can resume all paused sources at once.
 - The channel list has a Chinese/English language switch.
 
 ## Push & Media
