@@ -132,26 +132,25 @@ async fn main() -> anyhow::Result<()> {
     // UIs) are matched by the two-letter ISO 639-1 code `zh` — the Bot API
     // rejects subtag forms like `zh-hans` ("invalid language code"), so a
     // single `zh` list serves both scripts. One shared text set
-    // (commands::menu_desc_zh). 4 calls total: the user-visible default menu
-    // and the admin Chat scope, each in EN-fallback + `zh`. A failure is
-    // logged and skipped — the other lists keep their registered state.
-    // Register the admin menu (full list, including cookies/loget) with a Chat
-    // scope (not ChatMember, which Telegram rejects in private chats; in a
-    // private chat chat_id == user_id, so this targets the admin's DM).
+    // (commands::menu_desc_zh).
+    //
+    // Commands are private-chat only, so the user menu is registered under
+    // AllPrivateChats and stale group/default menus are deleted below. The
+    // admin's full menu still uses a Chat scope (not ChatMember, which
+    // Telegram rejects in private chats; in a private chat chat_id == user_id,
+    // so this targets the admin's DM).
     let admin_scope = teloxide::types::BotCommandScope::Chat {
         chat_id: teloxide::types::Recipient::Id(teloxide::types::ChatId(cfg.admin_user_id)),
     };
-    for (scope_desc, cmds, scoped) in [
-        ("default", &user_cmds, None),
-        ("admin", &all_cmds, Some(&admin_scope)),
+    let private_scope = teloxide::types::BotCommandScope::AllPrivateChats;
+    for (scope_desc, cmds, scope) in [
+        ("private", &user_cmds, private_scope),
+        ("admin", &all_cmds, admin_scope),
     ] {
         for (lang, list) in menu_variants(cmds) {
-            let mut req = bot.set_my_commands(list);
+            let mut req = bot.set_my_commands(list).scope(scope.clone());
             if let Some(l) = &lang {
                 req = req.language_code(l.clone());
-            }
-            if let Some(s) = scoped {
-                req = req.scope(s.clone());
             }
             if let Err(e) = req.await {
                 error!(
@@ -159,6 +158,31 @@ async fn main() -> anyhow::Result<()> {
                     lang = %lang.unwrap_or_else(|| "en".into()),
                     error = %e,
                     "failed to set bot command menu"
+                );
+            }
+        }
+    }
+    // Remove menus inherited by groups/channels from older versions (the
+    // default scope is also cleared; private users are covered by the
+    // AllPrivateChats registrations above). Clear the language-specific `zh`
+    // fallback too: the previous version registered it under the default
+    // scope, and deleting only the default-language list would leave Chinese
+    // clients seeing the old menu in groups.
+    for (scope_desc, scope) in [
+        ("groups", teloxide::types::BotCommandScope::AllGroupChats),
+        ("default", teloxide::types::BotCommandScope::Default),
+    ] {
+        for lang in MENU_LANGUAGES_ZH.iter().map(|l| Some(*l)).chain([None]) {
+            let mut req = bot.delete_my_commands().scope(scope.clone());
+            if let Some(l) = lang {
+                req = req.language_code(l.to_string());
+            }
+            if let Err(e) = req.await {
+                error!(
+                    menu = scope_desc,
+                    lang = lang.unwrap_or("en"),
+                    error = %e,
+                    "failed to clear bot command menu"
                 );
             }
         }
@@ -265,6 +289,7 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
             // Whitelist check: consistent with the command-style /find —
             // non-whitelisted users are fully ignored silently.
             if state.config.is_allowed(user_id)
+                && msg.chat.is_private()
                 && matches!(
                     msg.forward_origin(),
                     Some(teloxide::types::MessageOrigin::Channel { .. })

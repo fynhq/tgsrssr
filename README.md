@@ -66,7 +66,9 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 1. 私聊 Bot 发送 `/start`
 2. 把 Bot 加入频道或群组（频道需发消息权限）
-3. 发送 `/sub <频道ID或@用户名> <RSS地址>`
+3. 在**私聊**中发送 `/sub <频道ID或@用户名> <RSS地址>`
+
+所有命令仅限私聊使用；群组/频道只作为推送目标。
 
 需要推送大视频时，可部署本地 Bot API，详见下文「本地 Bot API（可选）」。
 
@@ -86,7 +88,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 默认仅管理员与 `ALLOWED_USER_IDS` 白名单可用；设置 `OPEN_TO_ALL=true` 可对所有用户开放。管理员可在频道列表切换界面语言。
 `/cookies`、`/loget` 仅管理员可用；平台 cookie 由管理员配置后所有用户共享。
-`/list`、`/sub`、`/test` 在群组/频道内可省略频道参数。
+**所有命令与按钮面板仅限私聊**：群组/频道内的命令会被静默忽略（不产生任何回复），`/find` 的转发频道消息也需在私聊中操作；`/sub`、`/test`、`/list` 必须显式给出频道参数（`@用户名` 或数字 ID）。
 
 ## 支持的内容源
 
@@ -304,7 +306,9 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 1. Send `/start` to the bot in a private chat
 2. Add the bot to your channel or group (channels need permission to post)
-3. Send `/sub <channel ID or @username> <RSS URL>`
+3. Send `/sub <channel ID or @username> <RSS URL>` **in a private chat**
+
+All commands are private-chat only; groups/channels are push targets.
 
 To push large videos, deploy a local Bot API server — see "Local Bot API (optional)" below.
 
@@ -324,7 +328,7 @@ To push large videos, deploy a local Bot API server — see "Local Bot API (opti
 
 Only the admin and `ALLOWED_USER_IDS` whitelist can use the bot by default; set `OPEN_TO_ALL=true` to open it to everyone. The admin can switch the UI language from the channel list.
 `/cookies` and `/loget` are admin-only; platform cookies configured by the admin are shared by all users.
-`/list`, `/sub`, and `/test` can omit the channel argument inside a group/channel.
+**All commands and inline panels are private-chat only**: commands typed in groups/channels are silently ignored (no reply), and forwarding a channel message for `/find` must also happen in a private chat. `/sub`, `/test`, and `/list` must name the channel explicitly (`@username` or numeric ID).
 
 ## Supported Sources
 

@@ -264,6 +264,18 @@ pub async fn handle_callback(
         bot.answer_callback_query(qid).await.ok();
         return Ok(());
     }
+    // Commands/panels are private-chat only. Reject callbacks attached to a
+    // group/channel message (forged or left over from before the restriction)
+    // so an old panel cannot be used to manage a channel from a group.
+    if !q
+        .message
+        .as_ref()
+        .map(|m| m.chat().is_private())
+        .unwrap_or(false)
+    {
+        bot.answer_callback_query(qid).await.ok();
+        return Ok(());
+    }
 
     let lang = resolve_lang(&state, user_id, q.from.language_code.as_deref()).await;
 

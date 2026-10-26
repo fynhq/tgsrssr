@@ -73,7 +73,7 @@ fn cmd_args(msg: &Message) -> String {
 
 /// Link preview is always disabled for command responses. Responses may
 /// contain hyperlinked feed URLs that don't need preview cards (commands run
-/// in private chats as well as in groups/channels).
+/// in private chats only).
 /// The implementation is consolidated in push::no_preview (re-exported here so existing call paths stay unchanged).
 pub use crate::push::no_preview;
 
@@ -87,6 +87,12 @@ pub async fn handle_command(
 
     // Permission check: silently ignore non-whitelisted users.
     if !state.config.is_allowed(user_id) {
+        return Ok(());
+    }
+
+    // All commands are private-chat only (groups/channels are push targets
+    // only). Silently ignore so a group/channel never receives bot chatter.
+    if !msg.chat.is_private() {
         return Ok(());
     }
 
@@ -314,14 +320,12 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang: Lang) -> ResponseResult<()> {
     let parts: Vec<&str> = args.split_whitespace().collect();
 
-    // Determine target channel + URL list (same determination as /test):
-    // - First token looks like a channel reference (@name or negative ID) -> explicit channel + the rest are URLs
-    // - Inside a group/channel without a channel argument -> the current chat is the target
-    // - "/sub <url>..." in a group no longer mistakes the first URL for a channel name
+    // Determine target channel + URL list (commands are private-chat only):
+    // the first token must be an explicit channel reference (@name or negative
+    // ID); everything after it is a URL. A bare URL is not accepted as a
+    // channel, and there is no "current chat" fallback.
     let (channel_input, urls): (String, &[&str]) = if !parts.is_empty() && looks_like_chat_ref(parts[0]) {
         (parts[0].to_string(), &parts[1..])
-    } else if !parts.is_empty() && is_group_chat(msg) {
-        (msg.chat.id.0.to_string(), &parts[..])
     } else {
         bot.send_message(
             msg.chat.id,
@@ -505,12 +509,10 @@ async fn test_report(bot: &Bot, chat: teloxide::types::ChatId, progress_id: telo
 async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang: Lang) -> ResponseResult<()> {
     let parts: Vec<&str> = args.split_whitespace().collect();
 
-    // First token is a channel ref (@name or negative numeric ID) -> explicit target;
-    // otherwise, inside a group/channel, the current chat is the target.
+    // First token must be a channel ref (@name or negative numeric ID);
+    // commands are private-chat only, so there is no current-chat fallback.
     let (channel_input, rest): (String, &[&str]) = if !parts.is_empty() && looks_like_chat_ref(parts[0]) {
         (parts[0].to_string(), &parts[1..])
-    } else if !parts.is_empty() && is_group_chat(msg) {
-        (msg.chat.id.0.to_string(), &parts[..])
     } else {
         bot.send_message(msg.chat.id, i18n::t(lang, "test_usage"))
             .parse_mode(ParseMode::Html)
@@ -1175,27 +1177,17 @@ pub async fn handle_pending_op(
     Ok(())
 }
 
-/// True when the message comes from a group/supergroup/channel (not a private chat).
-fn is_group_chat(msg: &Message) -> bool {
-    msg.chat.is_group() || msg.chat.is_supergroup() || msg.chat.is_channel()
-}
-
 /// True when a token looks like a chat reference: @username or a negative numeric ID.
 fn looks_like_chat_ref(s: &str) -> bool {
     s.starts_with('@') || (s.starts_with('-') && s[1..].parse::<i64>().is_ok())
 }
 
-/// Resolve the target chat argument: explicit arg wins; inside a group/channel an
-/// empty arg means "the current chat"; in a private chat an empty arg is invalid.
-fn resolve_target_input(msg: &Message, args: &str) -> Option<String> {
+/// Resolve the target chat argument. Commands are private-chat only, so an
+/// empty argument is always invalid: the target channel/group must be named
+/// explicitly (`@name` or its numeric id).
+fn resolve_target_input(_msg: &Message, args: &str) -> Option<String> {
     let args = args.trim();
-    if !args.is_empty() {
-        return Some(args.to_string());
-    }
-    if is_group_chat(msg) {
-        return Some(msg.chat.id.0.to_string());
-    }
-    None
+    (!args.is_empty()).then(|| args.to_string())
 }
 
 /// Best-effort chat registration: try getChat, but never fail the command.
