@@ -131,7 +131,9 @@ impl Config {
             bot_api_media_dir,
             outbound_ttl_hours: env_parse_or("MEDIA_OUTBOUND_TTL_HOURS", 80).max(1),
             media_max_size_gb: env_parse_or("MEDIA_MAX_SIZE_GB", 10).max(1),
-            long_image_aspect_ratio: env_parse_or("LONG_IMAGE_ASPECT_RATIO", 8.0),
+            long_image_aspect_ratio: validate_aspect_ratio(
+                env_parse_or("LONG_IMAGE_ASPECT_RATIO", 8.0),
+            ),
             // Floor of 1: MAX_VIDEO_PUSH_MB=0 would make cap=min(transport,0)=0
             // and skip every media item.
             max_video_push_mb: env_parse_or("MAX_VIDEO_PUSH_MB", 100).max(1),
@@ -232,7 +234,10 @@ fn parse_id_list(key: &str) -> Vec<i64> {
 /// `from_env` so it is unit-testable without touching process env.
 fn validate_single_admin(ids: Vec<i64>) -> anyhow::Result<i64> {
     match ids.len() {
-        1 => Ok(ids[0]),
+        1 if ids[0] > 0 => Ok(ids[0]),
+        1 => Err(anyhow::anyhow!(
+            "ADMIN_USER_IDS must be a positive Telegram user ID"
+        )),
         0 => Err(anyhow::anyhow!(
             "ADMIN_USER_IDS is required and must contain exactly one user ID"
         )),
@@ -240,6 +245,20 @@ fn validate_single_admin(ids: Vec<i64>) -> anyhow::Result<i64> {
             "ADMIN_USER_IDS must contain exactly one user ID, got {}",
             n
         )),
+    }
+}
+
+/// A non-finite or non-positive aspect ratio would make every image (or none)
+/// take the document path silently. Keep the documented 8.0 default and warn.
+fn validate_aspect_ratio(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        eprintln!(
+            "WARNING: LONG_IMAGE_ASPECT_RATIO has invalid value '{}', using default 8.0",
+            value
+        );
+        8.0
     }
 }
 
@@ -263,6 +282,24 @@ mod tests {
         let err = validate_single_admin(vec![1, 2]).unwrap_err().to_string();
         assert!(err.contains("exactly one"), "unexpected message: {}", err);
         assert!(err.contains("got 2"), "unexpected message: {}", err);
+    }
+
+    #[test]
+    fn non_positive_admin_rejected() {
+        for id in [0, -1] {
+            let err = validate_single_admin(vec![id]).unwrap_err().to_string();
+            assert!(err.contains("positive"), "unexpected message: {}", err);
+        }
+    }
+
+    #[test]
+    fn invalid_aspect_ratio_falls_back() {
+        use super::validate_aspect_ratio;
+        assert_eq!(validate_aspect_ratio(8.0), 8.0);
+        assert_eq!(validate_aspect_ratio(0.0), 8.0);
+        assert_eq!(validate_aspect_ratio(-1.0), 8.0);
+        assert_eq!(validate_aspect_ratio(f64::NAN), 8.0);
+        assert_eq!(validate_aspect_ratio(f64::INFINITY), 8.0);
     }
 
     #[test]

@@ -152,7 +152,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 | 变量 | 说明 | 默认 |
 |---|---|---|
 | `TELOXIDE_TOKEN` | BotFather token（**必填**） | - |
-| `ADMIN_USER_IDS` | 管理员，**必须配置且只允许一个**用户 ID；可用 /cookies、/loget，接收平台告警 | - |
+| `ADMIN_USER_IDS` | 管理员，**必须配置且只允许一个正整数**用户 ID；可用 /cookies、/loget，接收平台告警 | - |
 | `ALLOWED_USER_IDS` | 用户白名单 ID，逗号分隔（可选；管理员隐式放行） | 空 |
 | `OPEN_TO_ALL` | true = 对所有用户开放；false = 仅管理员+白名单 | false |
 | `BOT_API_URL` | 本地 Bot API 地址；空 = 官方 API | 空 |
@@ -170,7 +170,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 | `DOWNLOAD_CONCURRENCY` | 下载并发上限 | 4 |
 | `MEDIA_OUTBOUND_TTL_HOURS` | 媒体文件保留（小时） | 80 |
 | `MEDIA_MAX_SIZE_GB` | 媒体目录总配额（GB） | 10 |
-| `LONG_IMAGE_ASPECT_RATIO` | 长图判定高宽比阈值 | 8.0 |
+| `LONG_IMAGE_ASPECT_RATIO` | 长图判定高宽比阈值（必须为有限正数） | 8.0 |
 | `CLEANUP_INTERVAL_MINUTES` | 清理任务周期（分钟） | 60 |
 | `DB_PATH` | SQLite 路径 | data/rss_bot.db |
 | `MEDIA_DIR` | 媒体目录 | media |
@@ -392,7 +392,7 @@ Subscribe with `https://t.me/<channel>`. Public channels only, no login required
 | Variable | Description | Default |
 |---|---|---|
 | `TELOXIDE_TOKEN` | BotFather token (**required**) | - |
-| `ADMIN_USER_IDS` | Admin, **required, exactly one** user ID; can use /cookies and /loget, receives platform alerts | - |
+| `ADMIN_USER_IDS` | Admin, **required, exactly one positive** user ID; can use /cookies and /loget, receives platform alerts | - |
 | `ALLOWED_USER_IDS` | Whitelisted user IDs, comma-separated (optional; admin is implicitly allowed) | empty |
 | `OPEN_TO_ALL` | true = open to all users; false = admin + whitelist only | false |
 | `BOT_API_URL` | Local Bot API address; empty = official API | empty |
@@ -410,7 +410,7 @@ Subscribe with `https://t.me/<channel>`. Public channels only, no login required
 | `DOWNLOAD_CONCURRENCY` | Max concurrent downloads | 4 |
 | `MEDIA_OUTBOUND_TTL_HOURS` | Media file retention (hours) | 80 |
 | `MEDIA_MAX_SIZE_GB` | Total media directory quota (GB) | 10 |
-| `LONG_IMAGE_ASPECT_RATIO` | Aspect-ratio threshold for long-image detection | 8.0 |
+| `LONG_IMAGE_ASPECT_RATIO` | Aspect-ratio threshold for long-image detection (finite positive number) | 8.0 |
 | `CLEANUP_INTERVAL_MINUTES` | Cleanup job interval (minutes) | 60 |
 | `DB_PATH` | SQLite path | data/rss_bot.db |
 | `MEDIA_DIR` | Media directory | media |
