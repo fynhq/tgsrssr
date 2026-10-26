@@ -510,6 +510,13 @@ pub async fn add_subscription_with_sent(
         .execute(&mut *tx)
         .await?;
     }
+    // Re-enabling through /sub must clear the auto-disable notification edge
+    // flag, exactly like the panel resume paths. Otherwise a later failure
+    // that reaches the threshold stays silent because the stale flag remains.
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(setting_key::auto_disable_notified(chat_id, feed_url))
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
