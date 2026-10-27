@@ -170,14 +170,15 @@ async fn fetch_x_user_with_ct0(
     auth_token: &str,
     ct0: &str,
     screen_name: &str,
-    known_sent: Option<&std::collections::HashSet<String>>,
+    // Part of the platform fetch contract; X no longer uses the snapshot
+    // (pagination always walks the cursor and the scheduler filters later).
+    _known_sent: Option<&std::collections::HashSet<String>>,
     lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     // Step 2: resolve screen_name → rest_id + display name.
     let (rest_id, display_name) = resolve_user(state, auth_token, ct0, screen_name).await?;
 
     // Step 3: fetch user timeline.
-    let _ = known_sent;
     let tweets = fetch_user_tweets(state, auth_token, ct0, &rest_id, screen_name).await?;
 
     // Step 4: convert to entries (dedup by entry id within the batch, matching
