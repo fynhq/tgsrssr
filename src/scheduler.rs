@@ -1537,7 +1537,7 @@ async fn notify_download_failed(
 
 /// Register the outbox retry job: runs every 5 minutes, retries failed sends
 /// with exponential backoff (capped at 2h intervals), and abandons after 72h
-/// of actual retry attempts (never-attempted rows are not abandoned).
+/// from the first actual retry attempt (never-attempted rows are not abandoned).
 pub async fn register_outbox_retry_job(
     sched: &JobScheduler,
     state: AppState,
@@ -1584,18 +1584,21 @@ const OUTBOX_BATCH_LIMIT: i64 = 25;
 /// Whether a queue row is past its 72h retry window. The clock starts at the
 /// first actual attempt, not at enqueue time; a row that has never been tried
 /// is never abandoned (it may simply have been behind a long backlog). Legacy
-/// rows without `last_attempt_at` fall back to `created_at`, matching the old
+/// rows without `first_attempt_at` fall back to `created_at`, matching the old
 /// behavior for rows that had already been attempted.
+///
+/// Do not anchor at the most recent attempt: continuous retries would refresh
+/// the anchor forever and the row would never be abandoned.
 fn outbox_abandon_due(
     created_at: i64,
-    last_attempt_at: Option<i64>,
+    first_attempt_at: Option<i64>,
     attempts: i64,
     now: i64,
 ) -> bool {
     if attempts <= 0 {
         return false;
     }
-    let anchor = last_attempt_at.unwrap_or(created_at);
+    let anchor = first_attempt_at.unwrap_or(created_at);
     now - anchor >= OUTBOX_ABANDON_SECS
 }
 
@@ -1751,7 +1754,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         // Check if 72h elapsed since the first actual attempt -> abandon.
         // Measuring from created_at silently abandoned rows that sat behind a
         // long outage backlog and were never retried even once.
-        if outbox_abandon_due(row.created_at, row.last_attempt_at, row.attempts, now) {
+        if outbox_abandon_due(row.created_at, row.first_attempt_at, row.attempts, now) {
             warn!(
                 entry_id = %row.entry_id,
                 feed = %row.feed_url,
@@ -2004,25 +2007,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outbox_abandon_requires_an_attempt_and_uses_last_attempt() {
+    fn outbox_abandon_requires_an_attempt_and_uses_first_attempt() {
         let now = 1_000_000_000;
         // Never attempted: never abandoned, regardless of age.
         assert!(!outbox_abandon_due(now - 10 * 24 * 3600, None, 0, now));
-        // Attempted 72h ago: abandoned.
+        // First attempt past 72h, even if retries kept happening since:
+        // this is the regression the last_attempt_at anchor missed.
         assert!(outbox_abandon_due(
             now - 10 * 24 * 3600,
-            Some(now - OUTBOX_ABANDON_SECS),
-            3,
+            Some(now - OUTBOX_ABANDON_SECS - 1),
+            5,
             now
         ));
-        // Attempted recently even though enqueued long ago: still retried.
+        // First attempt recent even though enqueued long ago: still retried.
         assert!(!outbox_abandon_due(
             now - 10 * 24 * 3600,
             Some(now - 3600),
             2,
             now
         ));
-        // Legacy row (attempts>0, no last_attempt_at): use created_at.
+        // Legacy row (attempts>0, no first_attempt_at): use created_at.
         assert!(outbox_abandon_due(
             now - OUTBOX_ABANDON_SECS,
             None,
