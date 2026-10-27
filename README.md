@@ -52,10 +52,10 @@ docker compose up -d --build   # 首次约 5-10 分钟
 
 ### 静态二进制
 
-从 [Releases](../../releases) 下载 Linux tar.gz（x86_64 / aarch64，musl 静态链接，包名含 `-musl`），先校验再解压：
+从 [Releases](../../releases) 下载 Linux tar.gz（x86_64 / aarch64，musl 静态链接，包名含 `-musl`）与 `SHA256SUMS`，先校验再解压：
 
 ```bash
-sha256sum -c tgsrssr-vX.Y.Z-<arch>-musl.tar.gz.sha256
+sha256sum -c --ignore-missing SHA256SUMS
 tar xzf tgsrssr-vX.Y.Z-<arch>-musl.tar.gz
 TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 ```
@@ -221,7 +221,7 @@ services:
 ## 开发者
 
 - Rust 1.96+；`cargo build --release --locked`，产物在 `target/release/tgsrssr`。
-- SQLite 表结构见 [`migrations/`](migrations/)；CI 在 tag push 时构建 linux/amd64 + linux/arm64 镜像，并上传带 `.sha256` 的静态二进制。
+- SQLite 表结构见 [`migrations/`](migrations/)；CI 在 tag push 时构建 linux/amd64 + linux/arm64 镜像，并上传静态二进制与合并的 `SHA256SUMS` 校验文件。
 - Docker 部署推荐 Linux；macOS/Windows Docker Desktop 需改用 bridge 网络。
 
 ## 致谢
@@ -292,10 +292,10 @@ docker compose up -d --build   # ~5-10 minutes on first run
 
 ### Static binary
 
-Download a Linux tar.gz from [Releases](../../releases) (x86_64 / aarch64, musl static; the archive name includes `-musl`), verify it, then extract:
+Download a Linux tar.gz from [Releases](../../releases) (x86_64 / aarch64, musl static; the archive name includes `-musl`) plus `SHA256SUMS`, verify, then extract:
 
 ```bash
-sha256sum -c tgsrssr-vX.Y.Z-<arch>-musl.tar.gz.sha256
+sha256sum -c --ignore-missing SHA256SUMS
 tar xzf tgsrssr-vX.Y.Z-<arch>-musl.tar.gz
 TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 ```
@@ -461,7 +461,7 @@ services:
 ## Developers
 
 - Rust 1.96+; `cargo build --release --locked`; output at `target/release/tgsrssr`.
-- SQLite schema lives in [`migrations/`](migrations/); CI builds linux/amd64 + linux/arm64 images and uploads static binaries with `.sha256` files on tag push.
+- SQLite schema lives in [`migrations/`](migrations/); CI builds linux/amd64 + linux/arm64 images and uploads static binaries with a combined `SHA256SUMS` file on tag push.
 - Docker deployment is recommended on Linux; macOS/Windows Docker Desktop requires bridge networking.
 
 ## Acknowledgements
