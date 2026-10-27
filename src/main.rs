@@ -243,7 +243,7 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
         let new_id = new_chat_id.0.to_string();
         match db::migrate_chat_id(&state.db, &old_id, &new_id).await {
             Ok(()) => info!(old_chat_id = %old_id, new_chat_id = %new_id, "chat id migrated after group upgrade"),
-            Err(e) => error!(old_chat_id = %old_id, new_chat_id = %new_id, error = %e, "chat id migration failed"),
+            Err(e) => error!(old_chat_id = %old_id, new_chat_id = %new_id, error = format!("{:#}", e), "chat id migration failed"),
         }
         return Ok(());
     }

@@ -736,11 +736,29 @@ fn append_weibo_media(body: &mut String, mblog: &Value, owner_mid: &str) {
                     owner_attr
                 ));
             }
-        } else if !has_pics && !page_pic_url.is_empty() {
-            // Video stream unavailable (expired/paywalled/API drift) but the
-            // cover exists: send the cover as an image instead of dropping
-            // the only visual element silently.
-            body.push_str(&img_tag(page_pic_url));
+        } else if !has_pics {
+            // Video stream unavailable (expired/paywalled/API drift). Keep
+            // the cover as the visual element; log both outcomes so a missing
+            // stream is distinguishable from a post that never had video.
+            let mblog_id = status_id_str(mblog).unwrap_or_default();
+            let uid = mblog["user"]["id"]
+                .as_u64()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            if page_pic_url.is_empty() {
+                tracing::warn!(
+                    mblog_id = %mblog_id,
+                    uid = %uid,
+                    "weibo video has no stream URL and no cover image; visual content lost"
+                );
+            } else {
+                tracing::debug!(
+                    mblog_id = %mblog_id,
+                    uid = %uid,
+                    "weibo video has no stream URL; falling back to the cover image"
+                );
+                body.push_str(&img_tag(page_pic_url));
+            }
         }
     } else if page_info["type"].as_str() == Some("live") {
         // Live posts: no video stream to push; extract the cover image

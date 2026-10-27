@@ -270,6 +270,11 @@ pub(super) async fn handle_unsub_all_callback(
     let count = match db::delete_all_subscriptions(&state.db, chat_id).await {
         Ok(c) => c,
         Err(e) => {
+            tracing::error!(
+                chat_id = chat_id,
+                error = format!("{:#}", e),
+                "failed to delete all subscriptions (transaction rolled back)"
+            );
             bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1)).await.ok();
             // Restore the confirmation page (the idempotency lock already
             // changed the message to "Processing…").
@@ -308,16 +313,23 @@ pub(super) async fn handle_unsub_all_callback(
                 format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
             ),
         ]]);
-        if bot
+        if let Err(e) = bot
             .edit_message_text(m.chat().id, m.id(), i18n::t(lang, "closed"))
             .reply_markup(kb.clone())
             .await
-            .is_err()
         {
-            bot.send_message(m.chat().id, i18n::t(lang, "closed"))
+            if let Err(send_err) = bot
+                .send_message(m.chat().id, i18n::t(lang, "closed"))
                 .reply_markup(kb)
                 .await
-                .ok();
+            {
+                warn!(
+                    chat_id = chat_id,
+                    edit_error = %e,
+                    send_error = %send_err,
+                    "failed to retire the unsubscribe-all panel (both edit and fallback send failed)"
+                );
+            }
         }
     } else {
         bot.answer_callback_query(qid.clone())

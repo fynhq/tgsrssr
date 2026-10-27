@@ -416,6 +416,13 @@ async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
                 // this op so the fresh-cache fast path finds it instead of
                 // re-downloading the whole document on every GraphQL call.
                 let fallback = fallback_query_id(op);
+                if !fallback.is_empty() {
+                    tracing::warn!(
+                        op = op,
+                        fallback = fallback,
+                        "X query-ID document is missing the operation; caching the hardcoded fallback"
+                    );
+                }
                 (!fallback.is_empty()).then(|| fallback.to_string())
             });
             cache.ids = ids;

@@ -635,6 +635,12 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let subs = match db::get_subscriptions(&state.db, &chat_id).await {
         Ok(s) => s,
         Err(e) => {
+            tracing::warn!(
+                user_id = user_id,
+                chat_id = %chat_id,
+                error = format!("{:#}", e),
+                "test: failed to read subscriptions; using defaults"
+            );
             config_warnings.push(
                 i18n::t(lang, "test_config_read_failed")
                     .replace("{:#}", &format!("{:#}", e)),
@@ -650,6 +656,12 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let eff = match db::get_effective_config(&state.db, &chat_id, &feed_url).await {
         Ok(e) => Some(e),
         Err(e) => {
+            tracing::warn!(
+                user_id = user_id,
+                chat_id = %chat_id,
+                error = format!("{:#}", e),
+                "test: failed to read effective config; using defaults"
+            );
             config_warnings.push(
                 i18n::t(lang, "test_config_read_failed")
                     .replace("{:#}", &format!("{:#}", e)),

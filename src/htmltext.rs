@@ -1120,6 +1120,11 @@ pub fn split_html_safe(text: &str, limit: usize) -> Vec<String> {
     while utf16_len(&remaining) > limit {
         iters += 1;
         if iters > 200_000 {
+            tracing::warn!(
+                limit = limit,
+                remaining_units = utf16_len(&remaining),
+                "split_html_safe hit the iteration guard; emitting an over-long remainder"
+            );
             chunks.push(remaining);
             return chunks;
         }
@@ -1175,6 +1180,11 @@ pub fn split_html_safe(text: &str, limit: usize) -> Vec<String> {
             // whole budget): keep the remainder as one over-long chunk instead
             // of cutting inside markup. Telegram may reject it, but it is
             // still valid HTML, and no content is cut in half.
+            tracing::warn!(
+                limit = limit,
+                remaining_units = utf16_len(&remaining),
+                "split_html_safe found no safe raw cut; emitting an over-long remainder"
+            );
             chunks.push(remaining);
             return chunks;
         }
@@ -1189,6 +1199,13 @@ pub fn split_html_safe(text: &str, limit: usize) -> Vec<String> {
             // No progress possible without exceeding the limit (deep nesting
             // under a tiny budget). Emit the rest as one chunk: never emit
             // malformed HTML or loop forever.
+            tracing::warn!(
+                limit = limit,
+                head_units = head_len,
+                closers_units = utf16_len(&closers),
+                openers_units = utf16_len(&openers),
+                "split_html_safe cannot make progress within the limit; emitting an over-long remainder"
+            );
             chunks.push(remaining);
             return chunks;
         }

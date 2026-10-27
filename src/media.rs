@@ -560,9 +560,21 @@ fn detect_image_ext(head: &[u8]) -> Option<&'static str> {
 /// A read error yields None (the URL/MIME extension remains in use).
 fn sniff_image_ext(path: &std::path::Path) -> Option<&'static str> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "image sniff: open failed; keeping URL/MIME extension");
+            return None;
+        }
+    };
     let mut head = [0u8; 512];
-    let n = f.read(&mut head).ok()?;
+    let n = match f.read(&mut head) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "image sniff: read failed; keeping URL/MIME extension");
+            return None;
+        }
+    };
     detect_image_ext(&head[..n])
 }
 
@@ -1404,6 +1416,14 @@ async fn download_one(
     // and sent through sendPhoto (a deterministic 400).
     if *kind == MediaKind::Image {
         if let Some(detected) = sniff_image_ext(&tmp_path) {
+            if detected != ext.as_str() {
+                tracing::debug!(
+                    url = %url,
+                    url_ext = %ext,
+                    sniffed_ext = detected,
+                    "image extension overridden by magic-byte sniff"
+                );
+            }
             ext = detected.to_string();
         }
     }
