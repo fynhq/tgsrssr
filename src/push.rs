@@ -874,11 +874,11 @@ fn entry_summary(entry: &Entry, max_chars: usize, meta: Option<&crate::entrymeta
         return String::new();
     }
     // Truncate on the Telegram-HTML the body pipeline already produced:
-    // media hrefs were dropped upstream by `html_to_telegram_html` (per
-    // `is_media_href`), so every surviving anchor is a real content link
-    // (e.g. the WeChat article behind "本文来自微信公众号：账号名") and stays
-    // clickable in the summary. The cut counts display characters only —
-    // href text never eats into the budget.
+    // image media hrefs were dropped upstream, while video links are kept, so
+    // surviving anchors are real content/video links (e.g. the WeChat article
+    // behind "本文来自微信公众号：账号名") and stay clickable in the summary.
+    // The cut counts display characters only — href text never eats into the
+    // budget.
     let (cut, truncated) = truncate_html_keep_links(&html, max_chars);
     // Whitespace at the edges comes from flattened block tags (the old
     // plain-text path trimmed the same way); an all-whitespace cut means the
@@ -2622,15 +2622,16 @@ mod tests {
     }
 
     #[test]
-    fn entry_summary_still_drops_media_only_anchors() {
-        // Media links (href is a media resource) were removed upstream by
-        // html_to_telegram_html before the summary cut, so the summary
-        // keeps no video page URL or its card text.
+    fn entry_summary_keeps_video_anchor() {
+        // Video links survive the body pipeline, so the summary keeps the
+        // clickable card instead of dropping the anchor and its label.
         let body = "<p>正文。</p><a href=\"https://video.weibo.com/show?fid=1034:1\">微博视频</a>";
         let summary = entry_summary(&rss_entry_with_body(body), 140, None);
         assert!(summary.contains("正文。"), "body lost: {summary}");
-        assert!(!summary.contains("video.weibo.com"), "media href leaked: {summary}");
-        assert!(!summary.contains("<a"), "media anchor survived: {summary}");
+        assert!(
+            summary.contains(r#"<a href="https://video.weibo.com/show?fid=1034:1">微博视频</a>"#),
+            "video anchor lost: {summary}"
+        );
     }
 
     // ===== build_rich_ops (album pool: videos + images in one album) =====

@@ -657,8 +657,10 @@ pub fn html_to_plain(html: &str) -> String {
 }
 
 /// True when an anchor href points at a media resource (a video page or an
-/// image/video file). Such links are dropped from the text because the media
-/// is sent as a separate attachment.
+/// image/video file). Media extraction drops these anchors entirely so card
+/// icons are not sent as standalone photos. Text rendering keeps video hrefs
+/// (see `is_video_href`) but still drops image ones, because those images are
+/// sent as attachments.
 pub fn is_media_href(href: &str) -> bool {
     let lower = href.to_lowercase();
     // Weibo video page / card links. Note: wblive (livestream) links are NOT
@@ -673,11 +675,30 @@ pub fn is_media_href(href: &str) -> bool {
     MEDIA_EXT.iter().any(|e| path.ends_with(e))
 }
 
+/// True when an anchor href points at a video resource (a video page or a
+/// direct video file). Such links stay in the rendered text even though the
+/// video is sent as an attachment: when it is oversized/failed the link is the
+/// only way to reach the source, and when it is delivered the link is still a
+/// useful entry point. Image media links remain filtered by `is_media_href`.
+fn is_video_href(href: &str) -> bool {
+    let lower = href.to_lowercase();
+    if lower.contains("video.weibo.com") || lower.contains("weibo.com/tv/") {
+        return true;
+    }
+    let path = lower.split('?').next().unwrap_or(&lower);
+    const VIDEO_EXT: [&str; 4] = [".mp4", ".mov", ".webm", ".m4v"];
+    VIDEO_EXT.iter().any(|e| path.ends_with(e))
+}
+
 /// Convert an HTML fragment into Telegram HTML:
-/// - media (`<img>`/`<video>`/`<source>`) is dropped entirely — media is sent
-///   as separate photo/video, so its URL must never leak into the text;
-/// - hyperlinks (including Weibo `#topic#` hashtag search links) become `<a href>…</a>`
-///   so hashtags render as clickable hyperlinks, not markdown source;
+/// - `<img>`/`<video>`/`<source>` media tags are dropped entirely — media is
+///   sent as separate photo/video attachments;
+/// - video hyperlinks (video pages / direct video files) are kept so users can
+///   open the source when the video is skipped or delivered; image media links
+///   are still dropped with their text;
+/// - other hyperlinks (including Weibo `#topic#` hashtag search links) become
+///   `<a href>…</a>` so hashtags render as clickable hyperlinks, not markdown
+///   source;
 /// - `<br>` / block closes become newlines;
 /// - all other markup is flattened to escaped plain text.
 ///
@@ -715,9 +736,6 @@ pub fn html_to_telegram_html(html: &str) -> String {
     // (e.g. the "video cannot be displayed, please go to Weibo Video to
     // watch" text from RSSHub <video> blocks).
     s = RE_VIDEO_FALLBACK_TEXT.replace_all(&s, "").to_string();
-    // Also remove the "XX's Weibo Video" card text that may leak if the <a>
-    // block wasn't caught by is_media_href (e.g. unusual href format).
-    s = RE_WEIBO_VIDEO_CARD_TEXT.replace_all(&s, "").to_string();
 
     // 2) Line breaks and block boundaries. Other block closers (</li>, </tr>,
     //    headings, ...) also become newlines; otherwise their text runs
@@ -733,9 +751,9 @@ pub fn html_to_telegram_html(html: &str) -> String {
     s = RE_BLOCKQUOTE_CLOSE.replace_all(&s, "\u{FFFE}BQC\u{FFFE}").to_string();
 
     // 3) Extract anchors to placeholders, remembering (href, text).
-    //    Anchors whose href is itself a media resource (video pages / image or
-    //    video files) are dropped entirely — that media is sent as an
-    //    attachment, so its link must not leak into the text.
+    //    Anchors whose href is a non-video media resource (image files) are
+    //    dropped entirely — that image is sent as an attachment, so its link
+    //    must not leak into the text. Video hrefs are kept for source access.
     let mut links: Vec<(String, String)> = Vec::new();
     let mut buf = String::new();
     let mut last = 0usize;
@@ -743,8 +761,8 @@ pub fn html_to_telegram_html(html: &str) -> String {
         let whole = caps.get(0).unwrap();
         buf.push_str(&s[last..whole.start()]);
         let href = unescape_html(&caps[1]);
-        if is_media_href(&href) {
-            // Drop the media link (text + href).
+        if is_media_href(&href) && !is_video_href(&href) {
+            // Drop the image media link (text + href).
             last = whole.end();
             continue;
         }
@@ -757,6 +775,13 @@ pub fn html_to_telegram_html(html: &str) -> String {
         last = whole.end();
     }
     buf.push_str(&s[last..]);
+
+    // Remove the "XX's Weibo Video" card text that may leak if the <a> block
+    // wasn't caught by is_media_href (e.g. unusual href format). This must run
+    // after anchor extraction: a kept video anchor's label lives in `links`,
+    // and removing it earlier would leave an empty anchor that is then
+    // dropped.
+    let buf = RE_WEIBO_VIDEO_CARD_TEXT.replace_all(&buf, "").to_string();
 
     // 4) Flatten remaining markup, decode entities, escape for Telegram.
     //    `decode_entities` is the visible-text decoder: it maps HTML5
@@ -811,23 +836,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn weibo_hashtag_becomes_hyperlink_and_media_stripped() {
+    fn weibo_hashtag_and_video_link_kept_media_stripped() {
         // Real RSSHub/Weibo fragment: hashtag wrapped in <a><span class="surl-text">,
-        // plus <img>/<video> media that must NOT leak into the text.
+        // plus <img>/<video> media tags that must NOT leak into the text.
+        // The video card anchor itself stays clickable.
         let html = r#"#话题A#<a href="https://m.weibo.cn/search?containerid=231522type%3D1&amp;q=%23%E8%AF%9D%E9%A2%98B%23" data-hide=""><span class="surl-text">#话题B#</span></a> 正文内容。<a href="https://video.weibo.com/show?fid=1034:1" data-hide=""><span class="url-icon"><img src="https://h5.sinaimg.cn/x.png"></span><span class="surl-text">微博视频</span></a><br clear="both"><img src="https://tvax4.sinaimg.cn/mw2000/abc.jpg" referrerpolicy="no-referrer"><video controls="controls" poster="https://tvax1.sinaimg.cn/p.jpg"><source src="https://f.video.weibocdn.com/v.mp4"></video>"#;
 
         let out = html_to_telegram_html(html);
 
         // Hashtag kept as a clickable hyperlink with decoded href.
         assert!(out.contains(r#"<a href="https://m.weibo.cn/search?containerid=231522type%3D1&amp;q=%23%E8%AF%9D%E9%A2%98B%23">#话题B#</a>"#), "out: {}", out);
+        // Video card link kept as a clickable hyperlink.
+        assert!(out.contains(r#"<a href="https://video.weibo.com/show?fid=1034:1">微博视频</a>"#), "video link lost: {}", out);
         // Plain hashtag text preserved.
         assert!(out.contains("#话题A#"));
-        // Media URLs must not leak.
+        // Media tag URLs must not leak.
         assert!(!out.contains("sinaimg.cn"), "out: {}", out);
         assert!(!out.contains("weibocdn.com"), "out: {}", out);
         assert!(!out.contains("![") && !out.contains("]("), "md syntax leaked: {}", out);
         // Body text preserved.
         assert!(out.contains("正文内容。"));
+    }
+
+    #[test]
+    fn weibo_video_card_label_with_owner_prefix_kept() {
+        // The "XX的微博视频" label is also the anchor text; the cleanup must
+        // only remove leaked copies outside anchors, not this one.
+        let html = r#"正文<a href="https://video.weibo.com/show?fid=1034:123" data-hide=""><span class="url-icon"><img src="https://h5.sinaimg.cn/x.png"></span><span class="surl-text">某某的微博视频</span></a>"#;
+        let out = html_to_telegram_html(html);
+        assert!(out.contains(r#"<a href="https://video.weibo.com/show?fid=1034:123">某某的微博视频</a>"#), "out: {}", out);
+        assert!(!out.contains("sinaimg.cn"), "icon leaked: {}", out);
+        assert!(out.contains("正文"), "body lost: {}", out);
+    }
+
+    #[test]
+    fn leaked_weibo_video_card_text_still_removed() {
+        // Text-shaped residue outside an anchor is still cleaned up.
+        let out = html_to_telegram_html("正文 某某的微博视频");
+        assert_eq!(out, "正文");
+    }
+
+    #[test]
+    fn video_anchor_without_visible_text_is_dropped() {
+        let html = r#"正文<a href="https://video.weibo.com/show?fid=1"><img src="https://h5.sinaimg.cn/x.png"></a>结尾"#;
+        let out = html_to_telegram_html(html);
+        assert!(!out.contains("<a"), "empty anchor kept: {}", out);
+        assert!(!out.contains("video.weibo.com"), "href leaked: {}", out);
+        assert!(out.contains("正文") && out.contains("结尾"), "out: {}", out);
+    }
+
+    #[test]
+    fn image_media_anchor_still_dropped() {
+        let html = r#"正文<a href="https://example.com/a.jpg">查看图片</a>结尾"#;
+        let out = html_to_telegram_html(html);
+        assert!(!out.contains("example.com"), "image href leaked: {}", out);
+        assert!(!out.contains("查看图片"), "image link text leaked: {}", out);
+        assert!(out.contains("正文") && out.contains("结尾"), "out: {}", out);
+    }
+
+    #[test]
+    fn direct_video_file_anchor_kept() {
+        let html = r#"<a href="https://cdn.example.com/v.mp4">视频</a>"#;
+        let out = html_to_telegram_html(html);
+        assert_eq!(out, r#"<a href="https://cdn.example.com/v.mp4">视频</a>"#);
     }
 
     #[test]
