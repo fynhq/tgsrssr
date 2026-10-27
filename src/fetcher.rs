@@ -859,6 +859,28 @@ mod tests {
     }
 
     #[test]
+    fn weibo_video_post_keeps_topic_and_video_anchors() {
+        // Exact shape of a native Weibo video post: two topic anchors plus a
+        // trailing video-card anchor. Topic hrefs are absolute and
+        // percent-encoded; the video card icon must not leak.
+        let html = r#"【听！<a  href="https://m.weibo.cn/search?containerid=231522type%3D1%26t%3D10%26q%3D%23%E8%BF%99%E6%98%AF%E5%8C%97%E4%BA%AC%E4%B8%8A%E7%A9%BA%E6%B2%BB%E6%84%88%E7%9A%84%E8%87%AA%E7%84%B6%E4%B9%8B%E5%A3%B0%23&extparam=%23%E8%BF%99%E6%98%AF%E5%8C%97%E4%BA%AC%E4%B8%8A%E7%A9%BA%E6%B2%BB%E6%84%88%E7%9A%84%E8%87%AA%E7%84%B6%E4%B9%8B%E5%A3%B0%23&luicode=20000061&lfid=5358755204040101&launchid=10000360-page_H5" data-hide=""><span class="surl-text">#这是北京上空治愈的自然之声#</span></a>】<a  href="https://m.weibo.cn/search?containerid=231522type%3D1%26t%3D10%26q%3D%23%E5%8C%97%E4%BA%AC%E5%B8%822026%E8%A7%82%E9%B8%9F%E5%9C%B0%E5%9B%BE%E8%AF%B7%E6%94%B6%E5%A5%BD%23&extparam=%23%E5%8C%97%E4%BA%AC%E5%B8%822026%E8%A7%82%E9%B8%9F%E5%9C%B0%E5%9B%BE%E8%AF%B7%E6%94%B6%E5%A5%BD%23&luicode=20000061&lfid=5358755204040101&launchid=10000360-page_H5" data-hide=""><span class="surl-text">#北京市2026观鸟地图请收好#</span></a> 作为东亚-澳大利西亚候鸟迁徙的关键节点.<a  href="https://video.weibo.com/show?fid=1034:5358754758328361" data-hide=""><span class='url-icon'><img style='width: 1rem;height: 1rem' src='https://h5.sinaimg.cn/upload/2015/09/25/3/timeline_card_small_video_default.png'></span><span class="surl-text">人民日报的微博视频</span></a> "#;
+        let out = html_to_telegram_html(html);
+        assert!(
+            out.contains(">#这是北京上空治愈的自然之声#</a>"),
+            "first topic lost: {out}"
+        );
+        assert!(
+            out.contains(">#北京市2026观鸟地图请收好#</a>"),
+            "second topic lost: {out}"
+        );
+        assert!(
+            out.contains(r#"<a href="https://video.weibo.com/show?fid=1034:5358754758328361">人民日报的微博视频</a>"#),
+            "video card lost: {out}"
+        );
+        assert!(!out.contains("h5.sinaimg.cn"), "card icon leaked: {out}");
+    }
+
+    #[test]
     fn weibo_video_card_label_with_owner_prefix_kept() {
         // The "XX的微博视频" label is also the anchor text; the cleanup must
         // only remove leaked copies outside anchors, not this one.
