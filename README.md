@@ -52,11 +52,11 @@ docker compose up -d --build   # 首次约 5-10 分钟
 
 ### 静态二进制
 
-从 [Releases](../../releases) 下载 Linux tar.gz（x86_64 / aarch64，musl 静态链接），先校验再解压：
+从 [Releases](../../releases) 下载 Linux tar.gz（x86_64 / aarch64，musl 静态链接，包名含 `-musl`），先校验再解压：
 
 ```bash
-sha256sum -c tgsrssr-vX.Y.Z-<arch>.tar.gz.sha256
-tar xzf tgsrssr-vX.Y.Z-<arch>.tar.gz
+sha256sum -c tgsrssr-vX.Y.Z-<arch>-musl.tar.gz.sha256
+tar xzf tgsrssr-vX.Y.Z-<arch>-musl.tar.gz
 TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 ```
 
@@ -292,11 +292,11 @@ docker compose up -d --build   # ~5-10 minutes on first run
 
 ### Static binary
 
-Download a Linux tar.gz from [Releases](../../releases) (x86_64 / aarch64, musl static), verify it, then extract:
+Download a Linux tar.gz from [Releases](../../releases) (x86_64 / aarch64, musl static; the archive name includes `-musl`), verify it, then extract:
 
 ```bash
-sha256sum -c tgsrssr-vX.Y.Z-<arch>.tar.gz.sha256
-tar xzf tgsrssr-vX.Y.Z-<arch>.tar.gz
+sha256sum -c tgsrssr-vX.Y.Z-<arch>-musl.tar.gz.sha256
+tar xzf tgsrssr-vX.Y.Z-<arch>-musl.tar.gz
 TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 ```
 
