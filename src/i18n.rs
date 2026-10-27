@@ -421,8 +421,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "unsub_panel_multi") => "Tap a feed to unsubscribe:\nPage {} / {}, {} feeds total",
         (Lang::Zh, "unsub_panel_single") => "点击要退订的源：\n共 {} 个源",
         (Lang::En, "unsub_panel_single") => "Tap a feed to unsubscribe:\n{} feeds total",
-        (Lang::Zh, "unsub_all_btn") => "退订全部（含备份）",
-        (Lang::En, "unsub_all_btn") => "Unsubscribe all (with backup)",
+        (Lang::Zh, "unsub_all_btn") => "退订全部",
+        (Lang::En, "unsub_all_btn") => "Unsubscribe all",
         // Feed-page back button: reused by render_feed_page as well.
         (Lang::Zh, "unsub_back") => "返回频道页",
         (Lang::En, "unsub_back") => "Back to channel",
