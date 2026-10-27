@@ -309,10 +309,11 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
     if !target.exists() {
         // Best-effort WAL truncate for disk hygiene. It is NOT the consistency
         // mechanism anymore: a checkpoint can complete with busy=0 and a
-        // concurrent writer can then trigger another checkpoint while we copy
-        // the main file, producing a torn backup. `VACUUM INTO` below reads a
-        // consistent snapshot (including the WAL) regardless of concurrent
-        // activity, so a busy checkpoint must not skip the backup.
+        // concurrent writer can then trigger another checkpoint while the
+        // main file is being copied (the old approach), producing a torn
+        // backup. `VACUUM INTO` below reads a consistent snapshot (including
+        // the WAL) regardless of concurrent activity, so a busy checkpoint
+        // must not skip the backup.
         match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .fetch_one(db_pool)
             .await

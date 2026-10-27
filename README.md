@@ -37,7 +37,7 @@
 
 ```bash
 cp compose.example.yaml compose.yaml
-# 编辑 compose.yaml，填入 TELOXIDE_TOKEN 和 ADMIN_USER_IDS（管理员，仅一个）
+# 编辑 compose.yaml，填入 TELOXIDE_TOKEN 和 ADMIN_USER_IDS（管理员，仅一个正整数）
 docker compose pull
 docker compose up -d
 docker logs -f tgsrssr
@@ -136,7 +136,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 ## 内容筛选
 
-- 源级黑名单/白名单，关键词逗号分隔，匹配标题、不区分大小写。
+- 源级黑名单/白名单，关键词可用半角/全角逗号或分号分隔，匹配标题、不区分大小写。
 - 典型场景：过滤 GitHub releases 中的 beta/rc 版本。
 
 ## 可靠性与调度
@@ -168,9 +168,9 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 | `SCHEDULER_INTERVAL_MINUTES` | 抓取调度周期（分钟） | 5 |
 | `FETCH_CONCURRENCY` | 抓取并发上限 | 8 |
 | `DOWNLOAD_CONCURRENCY` | 下载并发上限 | 4 |
-| `MEDIA_OUTBOUND_TTL_HOURS` | 媒体文件保留（小时） | 80 |
+| `MEDIA_OUTBOUND_TTL_HOURS` | 媒体文件保留（小时；outbox 待重试媒体受清理保护） | 80 |
 | `MEDIA_MAX_SIZE_GB` | 媒体目录总配额（GB） | 10 |
-| `LONG_IMAGE_ASPECT_RATIO` | 长图判定高宽比阈值（必须为有限正数） | 8.0 |
+| `LONG_IMAGE_ASPECT_RATIO` | 长图判定高宽比阈值（有限正数；0/负数/NaN/∞ 告警并回退 8.0） | 8.0 |
 | `CLEANUP_INTERVAL_MINUTES` | 清理任务周期（分钟） | 60 |
 | `DB_PATH` | SQLite 路径 | data/rss_bot.db |
 | `MEDIA_DIR` | 媒体目录 | media |
@@ -277,7 +277,7 @@ The following channels are powered by tgsrssr:
 
 ```bash
 cp compose.example.yaml compose.yaml
-# Edit compose.yaml: set TELOXIDE_TOKEN and ADMIN_USER_IDS (exactly one admin)
+# Edit compose.yaml: set TELOXIDE_TOKEN and ADMIN_USER_IDS (exactly one positive admin ID)
 docker compose pull
 docker compose up -d
 docker logs -f tgsrssr
@@ -376,7 +376,7 @@ Subscribe with `https://t.me/<channel>`. Public channels only, no login required
 
 ## Content Filtering
 
-- Per-source blacklist/whitelist; comma-separated keywords matched against titles, case-insensitive.
+- Per-source blacklist/whitelist; keywords separated by half-width/full-width commas or semicolons, matched against titles, case-insensitive.
 - Typical use: filtering beta/rc releases from GitHub releases feeds.
 
 ## Reliability & Scheduling
@@ -408,9 +408,9 @@ Subscribe with `https://t.me/<channel>`. Public channels only, no login required
 | `SCHEDULER_INTERVAL_MINUTES` | Fetch scheduling interval (minutes) | 5 |
 | `FETCH_CONCURRENCY` | Max concurrent fetches | 8 |
 | `DOWNLOAD_CONCURRENCY` | Max concurrent downloads | 4 |
-| `MEDIA_OUTBOUND_TTL_HOURS` | Media file retention (hours) | 80 |
+| `MEDIA_OUTBOUND_TTL_HOURS` | Media file retention (hours; media for pending outbox retries is protected) | 80 |
 | `MEDIA_MAX_SIZE_GB` | Total media directory quota (GB) | 10 |
-| `LONG_IMAGE_ASPECT_RATIO` | Aspect-ratio threshold for long-image detection (finite positive number) | 8.0 |
+| `LONG_IMAGE_ASPECT_RATIO` | Aspect-ratio threshold for long-image detection (finite positive; 0/negative/NaN/∞ warn and fall back to 8.0) | 8.0 |
 | `CLEANUP_INTERVAL_MINUTES` | Cleanup job interval (minutes) | 60 |
 | `DB_PATH` | SQLite path | data/rss_bot.db |
 | `MEDIA_DIR` | Media directory | media |

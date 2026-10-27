@@ -81,10 +81,12 @@ pub fn make_entry(
     }
 }
 
-/// Typed platform failures. Authentication expiry is the only class that sets
-/// the cookie-expired flag (`/cookies` panel status). The admin push alert is
-/// still gated by the platform-health hysteresis (two consecutive all-failed
-/// rounds), so a single transient auth-shaped response does not page anyone;
+/// Typed platform failures. Authentication expiry is the only typed class that
+/// sets the cookie-expired flag (`/cookies` panel status); the legacy "cookie"
+/// substring fallback can still set it for pre-typed messages. The admin push
+/// alert is still gated by the platform-health hysteresis (two consecutive
+/// all-failed rounds), so a single transient auth-shaped response does not
+/// page anyone;
 /// before this type the scheduler keyed the flag on the substring "cookie", so
 /// an x.com 429/5xx/Cloudflare response without ct0 was misclassified as an
 /// expired cookie and counted toward auto-disable.

@@ -32,10 +32,11 @@ services:
       ## BotFather token
       TELOXIDE_TOKEN: "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
 
-      ## 管理员：必须配置，且只能一个用户 ID；可用 /cookies、/loget，接收平台告警。
-      ## 配置 0 个或多个将在启动时直接报错退出。
-      ## Admin: required, exactly one user ID; can use /cookies & /loget, receives
-      ## platform alerts. Setting zero or multiple IDs makes startup fail with an error.
+      ## 管理员：必须配置，且只能一个正整数用户 ID；可用 /cookies、/loget，接收平台告警。
+      ## 配置 0 个、多个或非正数将在启动时直接报错退出。
+      ## Admin: required, exactly one positive user ID; can use /cookies & /loget,
+      ## receives platform alerts. Setting zero, multiple, or non-positive IDs
+      ## makes startup fail with an error.
       ADMIN_USER_IDS: "123456789"
 
       ## ===== 访问控制 / Access control =====
@@ -82,15 +83,15 @@ services:
       ## Default 100; oversized videos are not pushed, fall back to text with a notice
       # MAX_VIDEO_PUSH_MB: "100"
 
-      ## 默认 80（须覆盖 outbox 72h 重试窗口）
-      ## Default 80 (must cover the 72h outbox retry window)
+      ## 默认 80；仅清理无引用的媒体，outbox 待重试媒体由清理任务保护
+      ## Default 80; only unreferenced media expires, outbox retry media is protected
       # MEDIA_OUTBOUND_TTL_HOURS: "80"
 
       ## 默认 10 / Default 10
       # MEDIA_MAX_SIZE_GB: "10"
 
-      ## 默认 8.0；高宽比超阈值的图片转文档发送
-      ## Default 8.0; images exceeding this aspect ratio are sent as documents
+      ## 默认 8.0；高宽比超阈值的图片转文档发送；非法值（0/负数/NaN/∞）告警并回退 8.0
+      ## Default 8.0; images exceeding this aspect ratio are sent as documents; invalid values (0/negative/NaN/∞) warn and fall back to 8.0
       # LONG_IMAGE_ASPECT_RATIO: "8.0"
 
       ## ===== 图片中转（默认关闭：BASE_URL 为空即不生效）=====

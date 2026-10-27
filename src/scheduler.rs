@@ -488,7 +488,7 @@ async fn process_feed(
     // seconds; a single retry can save the round.
     let is_rss_source = platform_of_url(&sub.feed_url).is_none();
     // Batch sent-entry snapshot for platform enrichment only (Weibo detail /
-    // vote, X pagination). It is deliberately not used for the final push
+    // vote; X ignores it). It is deliberately not used for the final push
     // filter: it is taken before the fetch and can go stale while an
     // overlapping outbox retry finishes the same entry. A failed read must
     // also fail closed — treating it as "nothing sent" would re-push the whole

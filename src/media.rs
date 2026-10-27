@@ -196,9 +196,10 @@ impl MediaKind {
             "video/webm" => "webm",
             "video/quicktime" => "mov",
             _ => match self {
-                // Extensionless image URLs (common on CDNs) use this fallback
-                // only until the downloaded bytes are sniffed; an unknown
-                // format must not be treated as a valid JPEG.
+                // Extensionless image URLs (common on CDNs) start with this
+                // fallback and are overridden by magic-byte sniffing after
+                // download. If sniffing is unavailable, an unsupported image
+                // may still reach sendPhoto with the wrong extension.
                 MediaKind::Image => "jpg",
                 MediaKind::Video => "mp4",
                 MediaKind::Other => "bin",
@@ -1502,8 +1503,9 @@ pub fn photo_format_compatible(path: &std::path::Path) -> bool {
     )
 }
 
-/// Determine whether an image will be sent as a document (>10MB / long image
-/// / w+h>10000 / compression risk).
+/// Size/dimension criterion for routing an image to sendDocument (>10MB /
+/// long image / w+h>10000 / compression risk). Format compatibility is a
+/// separate `photo_format_compatible` check; callers combine both.
 /// The classification stage in push.rs reuses this function (single source of
 /// truth, prevents rule drift).
 ///

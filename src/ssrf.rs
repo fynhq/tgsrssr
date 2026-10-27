@@ -100,10 +100,11 @@ pub async fn ssrf_check(url: &str) -> SsrfOutcome {
 
 /// SSRF check for requests that will be connected on the proxy side and thus
 /// cannot use a local DNS verdict. It still blocks targets that need no DNS:
-/// private/loopback/link-local literal IPs (including bracketed IPv6) and
-/// `localhost` names. Domain names are allowed because their resolution
-/// happens on the proxy side; a local lookup would produce false positives
-/// for CDN hostnames (the documented proxy exemption).
+/// private/loopback/link-local literal IPs (including bracketed IPv6),
+/// `localhost` names, and non-http(s) schemes (reported as Private). Domain
+/// names are allowed because their resolution happens on the proxy side; a
+/// local lookup would produce false positives for CDN hostnames (the
+/// documented proxy exemption).
 ///
 /// Without this, a proxy-routed feed could target `http://127.0.0.1:8081`
 /// or `http://192.168.x.x` directly, which the pre-existing blanket proxy

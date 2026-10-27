@@ -285,7 +285,8 @@ pub async fn fetch_feed(
     // Native platform fetch (weibo / X / Telegram): bypass the RSS/HTTP
     // pipeline entirely. Registry-driven — new platforms route automatically.
     // `known_sent` lets platform fetchers skip enrichment requests for entries
-    // the scheduler already pushed (Weibo long-text/vote detail, X pagination).
+    // the scheduler already pushed (currently Weibo long-text/vote detail; X
+    // ignores the snapshot and always walks the cursor).
     // `lang` selects the owner's language for user-visible fallback labels.
     if let Some(p) = crate::platforms::platform_for_url(feed_url) {
         return (p.fetch)(state, feed_url.to_string(), known_sent, lang).await;
