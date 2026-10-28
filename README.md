@@ -62,6 +62,8 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 
 > 二进制方式需自行安装 ffmpeg（视频缩略图/时长）。
 
+Android（Termux）另有 `tgsrssr-vX.Y.Z-aarch64-android.tar.gz`（Android 7+/API 24，仅限 Termux，不是普通 Android 应用），同样需安装 ffmpeg；TLS 使用内置 Mozilla 根证书校验。
+
 ### 首次使用
 
 1. 私聊 Bot 发送 `/start`
@@ -221,7 +223,7 @@ services:
 ## 开发者
 
 - Rust 1.96+；`cargo build --release --locked`，产物在 `target/release/tgsrssr`。
-- SQLite 表结构见 [`migrations/`](migrations/)；CI 在 tag push 时构建 linux/amd64 + linux/arm64 镜像，并上传静态二进制与合并的 `SHA256SUMS` 校验文件。
+- SQLite 表结构见 [`migrations/`](migrations/)；CI 在 tag push 时构建 linux/amd64 + linux/arm64 镜像，并上传 Linux musl 与 Android（Termux）静态二进制及合并的 `SHA256SUMS` 校验文件。
 - Docker 部署推荐 Linux；macOS/Windows Docker Desktop 需改用 bridge 网络。
 
 ## 致谢
@@ -301,6 +303,8 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 ```
 
 > The binary approach requires ffmpeg installed separately (video thumbnails/duration).
+
+Android (Termux) builds are published as `tgsrssr-vX.Y.Z-aarch64-android.tar.gz` (Android 7+/API 24, Termux only; not a regular Android app) and also require ffmpeg. The Android build validates HTTPS with bundled Mozilla roots.
 
 ### First use
 
@@ -461,7 +465,7 @@ services:
 ## Developers
 
 - Rust 1.96+; `cargo build --release --locked`; output at `target/release/tgsrssr`.
-- SQLite schema lives in [`migrations/`](migrations/); CI builds linux/amd64 + linux/arm64 images and uploads static binaries with a combined `SHA256SUMS` file on tag push.
+- SQLite schema lives in [`migrations/`](migrations/); CI builds linux/amd64 + linux/arm64 images and uploads Linux musl and Android (Termux) static binaries with a combined `SHA256SUMS` file on tag push.
 - Docker deployment is recommended on Linux; macOS/Windows Docker Desktop requires bridge networking.
 
 ## Acknowledgements

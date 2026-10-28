@@ -127,6 +127,10 @@ jobs:
           - target: aarch64-unknown-linux-musl
             arch: aarch64-linux-musl
             cross: true
+          # Termux (Android 7+/API 24). Not a regular Android app.
+          - target: aarch64-linux-android
+            arch: aarch64-android
+            android: true
     steps:
       - uses: actions/checkout@v4
 
@@ -147,11 +151,32 @@ jobs:
         if: matrix.cross
         run: cargo install cross
 
+      - name: Install cargo-ndk (android)
+        if: matrix.android
+        run: cargo install cargo-ndk --locked --version 4.1.2
+
+      # GitHub-hosted Ubuntu images ship the Android NDK; use the newest
+      # installed one instead of downloading ~700MB per run.
+      - name: Locate Android NDK
+        if: matrix.android
+        run: |
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          ndk="$(ls -d "$sdk"/ndk/* | sort -V | tail -n1)"
+          test -n "$ndk"
+          echo "Using NDK $ndk"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+
       - name: Build
         env:
           CARGO_INCREMENTAL: "0"
         run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
+          if [ "${{ matrix.android }}" = "true" ]; then
+            # API 24 = Android 7 (Termux minimum); align LOAD segments for
+            # devices using 16 KB memory pages.
+            export RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+            cargo ndk -t arm64-v8a -P 24 build --release --locked
+          elif [ "${{ matrix.cross }}" = "true" ]; then
             cross build --release --locked --target ${{ matrix.target }}
           else
             cargo build --release --locked --target ${{ matrix.target }}

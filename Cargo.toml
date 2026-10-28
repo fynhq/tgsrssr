@@ -73,6 +73,12 @@ regex = "1.13.1"
 sha2 = "0.11.1"
 futures-util = "0.3"
 
+# Android/Termux builds: reqwest 0.13's rustls path defaults to
+# rustls-platform-verifier, which requires a JVM app context that Termux does
+# not provide. Use the bundled Mozilla roots instead (see state::build_client).
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-root-certs = "1.0.11"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -226,6 +226,18 @@ impl AppState {
             if let Some(p) = proxy {
                 b = b.proxy(reqwest::Proxy::all(p)?);
             }
+            // Android/Termux has no JVM app context, which reqwest 0.13's
+            // default rustls verifier (rustls-platform-verifier) requires.
+            // Use the bundled Mozilla roots so a plain shell binary can
+            // complete TLS handshakes.
+            #[cfg(target_os = "android")]
+            {
+                let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                    .iter()
+                    .map(|der| reqwest::Certificate::from_der(der.as_ref()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                b = b.tls_certs_only(roots);
+            }
             Ok(b.build()?)
         }
 
