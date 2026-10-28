@@ -136,8 +136,12 @@ pub async fn user_lang(state: &AppState, user_id: i64, msg: Option<&Message>) ->
 /// local dev builds.  The semver part always comes from Cargo.toml.
 pub const VERSION: &str = env!("APP_VERSION");
 
+/// Public repository, linked from the version line in /start and /about.
+pub const REPO_URL: &str = "https://github.com/fynhq/tgsrssr";
+
 fn about_text(lang: Lang) -> String {
-    i18n::t(lang, "start_text").replace("{}", VERSION)
+    let version_link = format!(r#"<a href="{REPO_URL}">v{VERSION}</a>"#);
+    i18n::t(lang, "start_text").replace("{}", &version_link)
 }
 
 async fn handle_start(bot: &Bot, msg: &Message, state: &AppState, user_id: i64) -> ResponseResult<()> {
@@ -160,7 +164,10 @@ async fn handle_start(bot: &Bot, msg: &Message, state: &AppState, user_id: i64) 
             detected
         }
     };
-    bot.send_message(msg.chat.id, about_text(lang)).await?;
+    bot.send_message(msg.chat.id, about_text(lang))
+        .parse_mode(ParseMode::Html)
+        .link_preview_options(no_preview())
+        .await?;
     Ok(())
 }
 
@@ -1347,4 +1354,19 @@ async fn handle_loget(bot: &Bot, msg: &Message, state: &AppState, args: &str, la
     let input = InputFile::memory(bytes).file_name(filename.clone());
     bot.send_document(msg.chat.id, input).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn about_text_links_version_to_repo() {
+        let expected = format!(r#"<a href="{REPO_URL}">v{VERSION}</a>"#);
+        for lang in [Lang::Zh, Lang::En] {
+            let text = about_text(lang);
+            assert!(text.contains(&expected), "missing version link for {lang:?}");
+            assert!(!text.contains("{}"), "placeholder left in {lang:?} text");
+        }
+    }
 }

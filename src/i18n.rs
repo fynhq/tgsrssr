@@ -89,8 +89,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "invalid_interval") => "Invalid interval (must be at least 1 minute)",
 
         // ===== /start & /about =====
-        (Lang::Zh, "start_text") => "你好，我是 RSS 订阅 Bot，将我加入频道或群组后开始工作。\n版本：v{}",
-        (Lang::En, "start_text") => "Hi! I'm an RSS subscription Bot. Add me to a channel or group to get started.\nVersion: v{}",
+        (Lang::Zh, "start_text") => "你好，我是 RSS 订阅 Bot，将我加入频道或群组后开始工作。\n版本：{}",
+        (Lang::En, "start_text") => "Hi! I'm an RSS subscription Bot. Add me to a channel or group to get started.\nVersion: {}",
 
         // ===== Command descriptions =====
         // The command menu is localized outside this table: the client picks
