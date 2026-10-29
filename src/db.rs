@@ -4,6 +4,8 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 pub type Db = SqlitePool;
 
 /// Unified constructor for settings-table key names.
@@ -536,6 +538,39 @@ pub async fn sent_entry_ids(
         .fetch_all(db)
         .await?;
     Ok(rows.into_iter().map(|r| r.get("entry_id")).collect())
+}
+
+/// Stable 64-bit marker hash for an entry id (SHA-256 truncated to 8 bytes).
+/// The fetch-cycle filter stores these instead of full id strings. A 64-bit
+/// collision is vanishingly rare and would only skip that one entry; the
+/// exact `entry_dedup_state` recheck before each send still uses the raw id.
+pub fn entry_marker_hash(entry_id: &str) -> u64 {
+    let digest = Sha256::digest(entry_id.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
+}
+
+/// Compact form of [`sent_entry_ids`] for the fetch-cycle filter. Rows are
+/// streamed one at a time, so loading a long-lived subscription's history does
+/// not build a full rows vector plus a full `String` set at once.
+pub async fn sent_entry_id_hashes(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<std::collections::HashSet<u64>> {
+    use futures_util::TryStreamExt;
+    let mut rows = sqlx::query_scalar::<_, String>(
+        "SELECT entry_id FROM sent_entries WHERE chat_id = ? AND feed_url = ?",
+    )
+    .bind(chat_id)
+    .bind(feed_url)
+    .fetch(db);
+    let mut set = std::collections::HashSet::new();
+    while let Some(id) = rows.try_next().await? {
+        set.insert(entry_marker_hash(&id));
+    }
+    Ok(set)
 }
 
 /// Batch form of the per-entry outbox check for one subscription. The fetch
@@ -2068,5 +2103,34 @@ mod tests {
             entry_dedup_state(&pool, "1", "https://example.com/other", "sent-entry").await.unwrap(),
             (false, false)
         );
+    }
+
+    #[test]
+    fn entry_marker_hash_is_stable_and_distinct() {
+        let a = entry_marker_hash("entry-a");
+        assert_eq!(a, entry_marker_hash("entry-a"));
+        assert_ne!(a, entry_marker_hash("entry-b"));
+        assert_ne!(entry_marker_hash(""), entry_marker_hash("x"));
+    }
+
+    #[tokio::test]
+    async fn sent_entry_id_hashes_matches_sent_ids_for_the_subscription() {
+        let pool = test_pool().await;
+        let feed = "https://example.com/feed";
+        mark_entry_sent(&pool, "1", feed, "e1").await.unwrap();
+        mark_entry_sent(&pool, "1", feed, "e2").await.unwrap();
+        mark_entry_sent(&pool, "2", feed, "other-chat").await.unwrap();
+        mark_entry_sent(&pool, "1", "https://example.com/other", "other-feed")
+            .await
+            .unwrap();
+
+        let ids = sent_entry_ids(&pool, "1", feed).await.unwrap();
+        let hashes = sent_entry_id_hashes(&pool, "1", feed).await.unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains(&entry_marker_hash("e1")));
+        assert!(hashes.contains(&entry_marker_hash("e2")));
+        assert!(!hashes.contains(&entry_marker_hash("other-chat")));
+        assert!(!hashes.contains(&entry_marker_hash("other-feed")));
     }
 }

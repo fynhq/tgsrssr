@@ -506,28 +506,36 @@ async fn process_feed(
     // seconds; a single retry can save the round.
     let is_rss_source = platform_of_url(&sub.feed_url).is_none();
     // Batch sent-entry snapshot for platform enrichment only (Weibo detail /
-    // vote; X ignores it). It is deliberately not used for the final push
+    // vote). X/TG/RSS ignore the parameter entirely, so only Weibo pays for
+    // this full-history query. If another platform starts consuming
+    // `known_sent`, extend this gate instead of loading it unconditionally.
+    // It is deliberately not used for the final push
     // filter: it is taken before the fetch and can go stale while an
     // overlapping outbox retry finishes the same entry. A failed read must
     // also fail closed — treating it as "nothing sent" would re-push the whole
     // source window.
-    let known_sent_snapshot = match db::sent_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                feed = %cfg.feed_url,
-                error = %e,
-                "sent-entry batch query failed, deferring feed"
-            );
-            return Ok(FeedStatus::Failed);
-        }
-    };
+    let known_sent_snapshot: Option<std::collections::HashSet<String>> =
+        if platform_of_url(&sub.feed_url) == Some("weibo") {
+            match db::sent_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!(
+                        feed = %cfg.feed_url,
+                        error = %e,
+                        "sent-entry batch query failed, deferring feed"
+                    );
+                    return Ok(FeedStatus::Failed);
+                }
+            }
+        } else {
+            None
+        };
     let result = fetcher::fetch_feed(
         state,
         &sub.feed_url,
         sub.http_etag.as_deref(),
         sub.http_last_modified.as_deref(),
-        Some(&known_sent_snapshot),
+        known_sent_snapshot.as_ref(),
         lang,
     )
     .await;
@@ -552,13 +560,16 @@ async fn process_feed(
                 &sub.feed_url,
                 sub.http_etag.as_deref(),
                 sub.http_last_modified.as_deref(),
-                Some(&known_sent_snapshot),
+                known_sent_snapshot.as_ref(),
                 lang,
             )
             .await
         }
         other => other,
     };
+    // The enrichment snapshot is no longer needed once fetching (including the
+    // one-shot retry) is done; release it before the much slower send loop.
+    drop(known_sent_snapshot);
 
     let mut feed_failed = false;
     match result {
@@ -659,9 +670,11 @@ async fn process_feed(
             // retry authority. These sets are queried again after the fetch:
             // the pre-fetch snapshot is only for enrichment and may be stale
             // (an overlapping outbox retry can finish while the fetch runs).
+            // Sent ids are held as 64-bit marker hashes: a long-lived source's
+            // history stays compact and is streamed row by row.
             // A read error must fail closed and leave the headers untouched,
             // so the whole feed is retried next round instead of being pushed.
-            let known_sent = match db::sent_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+            let known_sent = match db::sent_entry_id_hashes(&state.db, &cfg.chat_id, &cfg.feed_url).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(
@@ -710,7 +723,7 @@ async fn process_feed(
                 if !seen_eids.insert(eid.clone()) {
                     continue;
                 }
-                if known_sent.contains(&eid) {
+                if known_sent.contains(&db::entry_marker_hash(&eid)) {
                     continue;
                 }
                 if outbox_ids.contains(&eid) {
@@ -735,6 +748,12 @@ async fn process_feed(
             {
                 pending.sort_by_key(|e| e.published.or(e.updated));
             }
+            // The filter sets are not needed during the (much slower) send
+            // loop; release them now instead of holding a long-lived
+            // subscription's history for the whole entry-processing phase.
+            drop(known_sent);
+            drop(outbox_ids);
+            drop(seen_eids);
 
             // True when an entry loop was cut short (filtering or pushing).
             // The response's negotiation headers are only saved when everything
