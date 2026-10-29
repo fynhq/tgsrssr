@@ -160,14 +160,15 @@ services:
       ## Media directory (a local directory is fine for single-container deployments)
       - ./media:/app/media
       ## 仅当部署本地 telegram-bot-api 时：把上面 ./media 换成与 bot-api 共享的宿主目录，
-      ## 并追加 bot-api 容器内的映射路径（富消息附件 file:// 直读；标准发送仍从本地
-      ## 路径流式上传），同时设置 BOT_API_URL 与 BOT_API_MEDIA_DIR，例如：
+      ## 并设置 BOT_API_URL 与 BOT_API_MEDIA_DIR。bot-api 容器需把同一宿主目录挂到
+      ## BOT_API_MEDIA_DIR（富消息图片/视频附件由 bot-api 服务器 file:// 直读）；标准发送
+      ## 由本进程从 /app/media 流式上传，本容器无需挂载 BOT_API_MEDIA_DIR。例如：
       ## Only when deploying a local telegram-bot-api: replace ./media above with a host
-      ## directory shared with bot-api, add the bot-api container's mapped path (rich-message
-      ## file:// attachments; standard sends still stream from the local path),
-      ## and set BOT_API_URL and BOT_API_MEDIA_DIR. Example:
+      ## directory shared with bot-api and set BOT_API_URL / BOT_API_MEDIA_DIR. The bot-api
+      ## container must mount that host directory at BOT_API_MEDIA_DIR (rich-message photo/video
+      ## attachments are read server-side via file://); standard sends stream from /app/media,
+      ## so this container does not need to mount BOT_API_MEDIA_DIR. Example:
       # - ../telegram-bot-api/media:/app/media
-      # - ../telegram-bot-api/media:/var/lib/telegram-bot-api-media
       - ./logs:/app/logs
     logging:
       driver: json-file
