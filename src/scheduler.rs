@@ -1,5 +1,6 @@
 use teloxide::prelude::*;
 use teloxide::types::ChatId;
+use tokio::sync::Semaphore;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{debug, error, info, warn};
 
@@ -171,6 +172,17 @@ struct PlatRoundStats {
     last_err: tokio::sync::Mutex<std::collections::HashMap<&'static str, String>>,
 }
 
+/// Maximum number of RSS sources processed concurrently by one fetch cycle.
+///
+/// The fetch semaphore inside `fetcher::fetch_feed` only covers the request
+/// stage; after fetching, a task keeps its whole parsed `FeedResult` alive
+/// while it downloads media and sends messages. Without a second cap, that
+/// retained state (and the concurrent uploads) scales with the number of due
+/// subscriptions instead of the fetch concurrency. Platform sources stay
+/// strictly serial and are intentionally not gated here, so they can start
+/// immediately after the RSS tasks are spawned.
+const RSS_PROCESS_CONCURRENCY: usize = 8;
+
 /// One full fetch cycle: find due subscriptions, fetch, push new entries.
 /// Media/pipeline warnings notify the channel owner immediately
 /// (notify_owner_html) instead of being batched until the end of the cycle.
@@ -224,11 +236,15 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         .into_iter()
         .partition(|(sub, _)| platform_of_url(&sub.feed_url).is_some());
 
-    // Plain RSS sources: per-source parallelism is enforced by
-    // `state.fetch_semaphore` inside fetcher::fetch_feed (same
-    // FETCH_CONCURRENCY cap, and it also covers /sub and /test). Keeping a
-    // second scheduler-local semaphore with the same capacity only acquired
-    // another permit without changing effective concurrency.
+    // Plain RSS sources: the fetch request itself is bounded by
+    // `state.fetch_semaphore` inside fetcher::fetch_feed (FETCH_CONCURRENCY,
+    // which also covers /sub and /test). `process_sem` bounds the whole
+    // per-source processing (fetch + media downloads + sends): a task keeps
+    // its parsed FeedResult alive until its last entry is pushed, so without
+    // this cap the retained memory would scale with the number of due
+    // subscriptions instead of a fixed limit. Platform sources stay serial
+    // and are deliberately not gated so they keep their priority.
+    let process_sem = std::sync::Arc::new(Semaphore::new(RSS_PROCESS_CONCURRENCY));
     // Each handle is paired with a copy of the feed_url: once sub is moved
     // into the spawn closure, the source identifier can no longer be obtained
     // at the join site and failure logs would lose their locator info
@@ -238,6 +254,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         let state = state.clone();
         let bot = bot.clone();
         let stats = stats.clone();
+        let process_sem = process_sem.clone();
         let feed_url = sub.feed_url.clone();
         handles.push((feed_url, tokio::spawn(async move {
             // Staggered start: avoid all sources hitting their respective
@@ -247,6 +264,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             if idx > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(600 * idx as u64)).await;
             }
+            let _permit = process_sem.acquire_owned().await?;
             process_feed(&state, &bot, sub, cfg, &stats).await
         })));
     }
