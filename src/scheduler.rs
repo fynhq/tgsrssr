@@ -1751,11 +1751,11 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     let _guard = crate::state::ActiveFlagGuard(state.outbox_retry_active.clone());
 
     let now = chrono::Utc::now().timestamp();
-    let due = db::outbox_fetch_due(&state.db, now, OUTBOX_BATCH_LIMIT).await?;
-    if due.is_empty() {
+    let due_ids = db::outbox_due_ids(&state.db, now, OUTBOX_BATCH_LIMIT).await?;
+    if due_ids.is_empty() {
         return Ok(());
     }
-    if due.len() as i64 == OUTBOX_BATCH_LIMIT {
+    if due_ids.len() as i64 == OUTBOX_BATCH_LIMIT {
         warn!(
             batch = OUTBOX_BATCH_LIMIT,
             "outbox retry batch is full; a backlog may be forming"
@@ -1764,7 +1764,17 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
 
     let transport = crate::media::MediaTransport::new(&state.config);
 
-    for row in due {
+    for id in due_ids {
+        // Fetch only this row: a batch of full rows can carry very large
+        // entry_json values, so the id list is the only shared batch state.
+        let row = match db::outbox_get(&state.db, id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(outbox_id = id, error = %e, "outbox: row fetch failed, skipping");
+                continue;
+            }
+        };
         // Dedup guard first: if the entry was already delivered via the normal
         // fetch path (e.g. network recovered and the next cycle re-pushed it),
         // drop the queued copy instead of double-posting. Checking this before

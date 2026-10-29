@@ -1,5 +1,8 @@
+use std::collections::{BinaryHeap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use futures_util::TryStreamExt;
 use sqlx::Row;
 use tokio::fs;
 use tracing::{info, warn};
@@ -56,9 +59,9 @@ pub async fn run_all_cleanup(config: &Config, db_pool: &Db) {
 /// would miss entries that need protection.
 async fn outbox_protected_paths(db_pool: &Db) -> anyhow::Result<std::collections::HashSet<PathBuf>> {
     let mut set = std::collections::HashSet::new();
-    let media_jsons = db::outbox_all_media_json(db_pool).await?;
-    for mj in &media_jsons {
-        if let Ok(items) = serde_json::from_str::<Vec<crate::media::MediaItem>>(mj) {
+    let mut media_jsons = db::outbox_media_json_stream(db_pool);
+    while let Some(mj) = media_jsons.try_next().await? {
+        if let Ok(items) = serde_json::from_str::<Vec<crate::media::MediaItem>>(&mj) {
             for item in &items {
                 set.insert(item.path.clone());
                 if let Some(tp) = &item.thumb_path {
@@ -119,6 +122,63 @@ pub async fn cleanup_outbound(
     Ok(removed)
 }
 
+/// Maximum number of candidate files kept in memory by one quota pass (the
+/// oldest ones). When the overage needs more, another pass re-walks the tree.
+const QUOTA_BATCH_FILES: usize = 8192;
+/// Maximum re-walks per cleanup round. A heavily oversized tree is trimmed
+/// across multiple hourly rounds instead of scanning unboundedly.
+const QUOTA_MAX_PASSES: usize = 4;
+
+/// Keep the `k` oldest entries from `items`. The max-heap evicts the newest
+/// entry whenever it holds more than `k`, so memory stays bounded while the
+/// selection remains oldest-first (ties fall back to path order).
+fn keep_oldest<I>(items: I, k: usize) -> Vec<(SystemTime, PathBuf, u64)>
+where
+    I: IntoIterator<Item = (SystemTime, PathBuf, u64)>,
+{
+    let mut heap: BinaryHeap<(SystemTime, PathBuf, u64)> = BinaryHeap::with_capacity(k + 1);
+    for item in items {
+        heap.push(item);
+        if heap.len() > k {
+            heap.pop();
+        }
+    }
+    let mut out = heap.into_vec();
+    out.sort_by_key(|(t, _, _)| *t);
+    out
+}
+
+/// Oldest deletable files under `root`, bounded to `k` entries. Outbox-
+/// protected paths and files modified within the recent cutoff are skipped;
+/// the recursive walk is blocking filesystem IO and is called from
+/// `spawn_blocking`.
+fn oldest_candidates(
+    root: &Path,
+    k: usize,
+    protected: &HashSet<PathBuf>,
+    recent_cutoff: SystemTime,
+) -> Vec<(SystemTime, PathBuf, u64)> {
+    let candidates = WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            if !entry.file_type().is_file() {
+                return None;
+            }
+            let path = entry.path();
+            if protected.contains(path) {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if mtime >= recent_cutoff {
+                return None;
+            }
+            Some((mtime, path.to_path_buf(), meta.len()))
+        });
+    keep_oldest(candidates, k)
+}
+
 /// Enforce total media directory size limit.
 pub async fn enforce_media_quota(
     config: &Config,
@@ -130,28 +190,9 @@ pub async fn enforce_media_quota(
         return Ok(0);
     }
 
-    // The recursive walk is blocking filesystem IO; keep it off the async
-    // worker (multi-GB media trees can take seconds).
-    let media_dir = config.media_dir.clone();
-    let mut files: Vec<(PathBuf, SystemTime, u64)> = tokio::task::spawn_blocking(move || {
-        let mut files = Vec::new();
-        for entry in WalkDir::new(&media_dir).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if let Ok(meta) = entry.metadata() {
-                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                files.push((entry.path().to_path_buf(), mtime, meta.len()));
-            }
-        }
-        files
-    })
-    .await?;
-    files.sort_by_key(|(_, t, _)| *t);
-
-    // outbox_protected (paths referenced by pending retries) is passed in by
-    // the caller: those must not be deleted, otherwise MediaOnly retries lose
-    // their media.
+    // outbox_protected (paths referenced by pending retries) must not be
+    // deleted, otherwise MediaOnly retries lose their media.
+    let protected = Arc::new(outbox_protected.clone());
     let mut freed = 0u64;
     let mut deleted_files = 0u64;
     let mut remaining = total;
@@ -161,28 +202,52 @@ pub async fn enforce_media_quota(
     // just downloaded and about to be sent. Skipping files modified within
     // the last hour avoids this race.
     let recent_cutoff = SystemTime::now() - Duration::from_secs(3600);
-    for (path, mtime, size) in files {
+
+    for _pass in 0..QUOTA_MAX_PASSES {
         if remaining <= max_bytes {
             break;
         }
-        if outbox_protected.contains(&path) {
-            continue;
+        let media_dir = config.media_dir.clone();
+        let protected = Arc::clone(&protected);
+        let batch = tokio::task::spawn_blocking(move || {
+            oldest_candidates(&media_dir, QUOTA_BATCH_FILES, &protected, recent_cutoff)
+        })
+        .await?;
+        if batch.is_empty() {
+            break;
         }
-        if mtime >= recent_cutoff {
-            continue;
-        }
-        // Only deduct from the quota on successful deletion: deducting on
-        // failure would over-report freed space and stop cleanup prematurely.
-        match fs::remove_file(&path).await {
-            Ok(()) => {
-                remaining -= size;
-                freed += size;
-                deleted_files += 1;
+        let mut progressed = false;
+        for (_mtime, path, size) in batch {
+            if remaining <= max_bytes {
+                break;
             }
-            Err(e) => {
-                warn!(path = ?path, error = %e, "failed to remove file for quota");
+            if outbox_protected.contains(&path) {
+                continue;
+            }
+            // Only deduct from the quota on successful deletion: deducting on
+            // failure would over-report freed space and stop cleanup prematurely.
+            match fs::remove_file(&path).await {
+                Ok(()) => {
+                    remaining -= size;
+                    freed += size;
+                    deleted_files += 1;
+                    progressed = true;
+                }
+                Err(e) => {
+                    warn!(path = ?path, error = %e, "failed to remove file for quota");
+                }
             }
         }
+        if !progressed {
+            break;
+        }
+    }
+    if remaining > max_bytes {
+        warn!(
+            remaining,
+            max_bytes,
+            "media quota still exceeded after cleanup passes; remaining files are retried next round"
+        );
     }
     // One aggregated line per round instead of a per-file warn: on instances
     // where the quota is persistently saturated this fires hundreds of times
@@ -399,4 +464,31 @@ pub async fn dir_size(path: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: u64, name: &str, size: u64) -> (SystemTime, PathBuf, u64) {
+        (SystemTime::UNIX_EPOCH + Duration::from_secs(secs), PathBuf::from(name), size)
+    }
+
+    #[test]
+    fn keep_oldest_keeps_the_oldest_k_in_order() {
+        let items = (0..10).map(|i| at(i, &format!("f{i}"), i));
+        let out = keep_oldest(items, 3);
+        let names: Vec<String> = out
+            .iter()
+            .map(|(_, p, _)| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["f0", "f1", "f2"]);
+    }
+
+    #[test]
+    fn keep_oldest_handles_fewer_items_than_the_cap() {
+        let out = keep_oldest(vec![at(1, "only", 1)], 8);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, PathBuf::from("only"));
+    }
 }

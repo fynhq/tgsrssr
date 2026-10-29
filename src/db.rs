@@ -1431,10 +1431,12 @@ pub async fn outbox_insert(
     Ok(result.rows_affected() > 0)
 }
 
-/// Fetch outbox entries that are due for retry.
-pub async fn outbox_fetch_due(db: &Db, now_ts: i64, limit: i64) -> anyhow::Result<Vec<OutboxRow>> {
-    let rows = sqlx::query_as::<_, OutboxRow>(
-        "SELECT id, chat_id, feed_url, entry_id, feed_title, entry_json, media_json, meta_json, content_mode, source_display, link_preview, caption_above_media, author, attempts, next_retry_at, created_at, first_attempt_at, last_error FROM outbox WHERE next_retry_at <= ? ORDER BY next_retry_at ASC LIMIT ?",
+/// Ids of outbox rows due for retry (oldest first). The caller fetches each
+/// full row one at a time, so a batch of large `entry_json` values is never
+/// loaded into memory at once.
+pub async fn outbox_due_ids(db: &Db, now_ts: i64, limit: i64) -> anyhow::Result<Vec<i64>> {
+    let rows = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM outbox WHERE next_retry_at <= ? ORDER BY next_retry_at ASC, id ASC LIMIT ?",
     )
     .bind(now_ts)
     .bind(limit)
@@ -1443,16 +1445,28 @@ pub async fn outbox_fetch_due(db: &Db, now_ts: i64, limit: i64) -> anyhow::Resul
     Ok(rows)
 }
 
-/// Return every media_json value still referenced by the outbox (all rows,
-/// no limit, one narrow column). Used by the media cleanup pass to build the
-/// "protected paths" set — loading media_json alone avoids dragging each
-/// row's entry_json / meta_json blobs into memory, which outbox_fetch_due
-/// (the full-row variant) would.
-pub async fn outbox_all_media_json(db: &Db) -> anyhow::Result<Vec<String>> {
-    let rows = sqlx::query("SELECT media_json FROM outbox WHERE media_json IS NOT NULL AND media_json <> '' AND media_json <> '[]'")
-        .fetch_all(db)
-        .await?;
-    Ok(rows.into_iter().filter_map(|r| r.get::<Option<String>, _>("media_json")).collect())
+/// Fetch one complete outbox row by id. Returns None when the row was removed
+/// between the id listing and this lookup.
+pub async fn outbox_get(db: &Db, id: i64) -> anyhow::Result<Option<OutboxRow>> {
+    let row = sqlx::query_as::<_, OutboxRow>(
+        "SELECT id, chat_id, feed_url, entry_id, feed_title, entry_json, media_json, meta_json, content_mode, source_display, link_preview, caption_above_media, author, attempts, next_retry_at, created_at, first_attempt_at, last_error FROM outbox WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
+}
+
+/// Stream every media_json value still referenced by the outbox (one narrow
+/// column, no limit). Used by the media cleanup pass to build the "protected
+/// paths" set without holding every row's JSON string in memory at once.
+pub fn outbox_media_json_stream(
+    db: &Db,
+) -> impl futures_util::Stream<Item = sqlx::Result<String>> + '_ {
+    sqlx::query_scalar::<_, String>(
+        "SELECT media_json FROM outbox WHERE media_json IS NOT NULL AND media_json <> '' AND media_json <> '[]'",
+    )
+    .fetch(db)
 }
 
 /// Update outbox entry after a failed retry attempt.
@@ -1909,27 +1923,34 @@ mod tests {
         )
         .await
         .unwrap();
-        let due = outbox_fetch_due(&pool, 1, 10).await.unwrap();
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].first_attempt_at, None);
+        let due_ids = outbox_due_ids(&pool, 1, 10).await.unwrap();
+        assert_eq!(due_ids.len(), 1);
+        let row = outbox_get(&pool, due_ids[0]).await.unwrap().unwrap();
+        assert_eq!(row.first_attempt_at, None);
 
-        outbox_update_retry(&pool, due[0].id, 1, 5, 123, "boom")
+        outbox_update_retry(&pool, row.id, 1, 5, 123, "boom")
             .await
             .unwrap();
-        let due = outbox_fetch_due(&pool, 5, 10).await.unwrap();
-        assert_eq!(due[0].attempts, 1);
-        assert_eq!(due[0].first_attempt_at, Some(123));
-        assert_eq!(due[0].last_error.as_deref(), Some("boom"));
+        let due_ids = outbox_due_ids(&pool, 5, 10).await.unwrap();
+        let row = outbox_get(&pool, due_ids[0]).await.unwrap().unwrap();
+        assert_eq!(row.attempts, 1);
+        assert_eq!(row.first_attempt_at, Some(123));
+        assert_eq!(row.last_error.as_deref(), Some("boom"));
 
         // A later retry must not move the first-attempt anchor; otherwise the
         // 72h window would never expire under continuous failures.
-        outbox_update_retry(&pool, due[0].id, 2, 10, 456, "still boom")
+        outbox_update_retry(&pool, row.id, 2, 10, 456, "still boom")
             .await
             .unwrap();
-        let due = outbox_fetch_due(&pool, 10, 10).await.unwrap();
-        assert_eq!(due[0].attempts, 2);
-        assert_eq!(due[0].first_attempt_at, Some(123));
-        assert_eq!(due[0].last_error.as_deref(), Some("still boom"));
+        let due_ids = outbox_due_ids(&pool, 10, 10).await.unwrap();
+        let row = outbox_get(&pool, due_ids[0]).await.unwrap().unwrap();
+        assert_eq!(row.attempts, 2);
+        assert_eq!(row.first_attempt_at, Some(123));
+        assert_eq!(row.last_error.as_deref(), Some("still boom"));
+
+        // A removed row is reported as missing rather than an error.
+        outbox_delete(&pool, row.id).await.unwrap();
+        assert!(outbox_get(&pool, row.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2058,6 +2079,53 @@ mod tests {
                 format!("stale_zero:{}:{}", new, feed),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn outbox_media_json_stream_skips_empty_values() {
+        use futures_util::TryStreamExt;
+        let pool = test_pool().await;
+        let item = crate::media::MediaItem {
+            path: std::path::PathBuf::from("a.jpg"),
+            kind: crate::media::MediaKind::Image,
+            width: 1,
+            height: 1,
+            size: 1,
+            is_gif: false,
+            thumb_path: None,
+            duration_secs: None,
+            content_hash: "h".into(),
+            is_retweet: false,
+        };
+        let media_json = serde_json::to_string(&vec![item]).unwrap();
+        for (entry, media) in [("with-media", media_json.as_str()), ("empty", "[]")] {
+            outbox_insert(
+                &pool,
+                "1",
+                "https://example.com/feed",
+                entry,
+                "Feed",
+                "{}",
+                media,
+                "",
+                "title_link",
+                "source",
+                true,
+                false,
+                None,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut stream = outbox_media_json_stream(&pool);
+        let mut values = Vec::new();
+        while let Some(v) = stream.try_next().await.unwrap() {
+            values.push(v);
+        }
+        assert_eq!(values, vec![media_json]);
     }
 
     #[tokio::test]
