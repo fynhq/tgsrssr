@@ -238,12 +238,15 @@ pub const MAX_BODY_BYTES: u64 = 20 * 1024 * 1024;
 /// `ctx` identifies the source in error messages (e.g. feed URL or channel
 /// name).
 pub async fn read_body_capped(resp: reqwest::Response, ctx: &str) -> anyhow::Result<Vec<u8>> {
-    if let Some(len) = resp.content_length() {
-        if len > MAX_BODY_BYTES {
-            anyhow::bail!("response too large ({} bytes) for {}", len, ctx);
-        }
+    let content_length = resp.content_length().unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        anyhow::bail!("response too large ({} bytes) for {}", content_length, ctx);
     }
-    let mut body_buf: Vec<u8> = Vec::new();
+    // Pre-size from Content-Length (checked against the cap above) so a large
+    // body does not pay the repeated reallocation/doubling peak. Chunked
+    // responses without the header still grow dynamically and are checked
+    // while reading below.
+    let mut body_buf: Vec<u8> = Vec::with_capacity(content_length as usize);
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
     while let Some(chunk) = stream.next().await {
@@ -458,6 +461,9 @@ pub async fn fetch_feed(
 
     let feed = feed_rs::parser::parse(&bytes[..])
         .with_context(|| format!("parse failed: {}", feed_url))?;
+    // The parser returns an owned model; release the raw body now instead of
+    // keeping it alive alongside the parsed entries for the rest of the call.
+    drop(bytes);
 
     let feed_title = feed.title.map(|t| t.content).filter(|s| !s.trim().is_empty());
 
@@ -596,12 +602,29 @@ pub fn entry_author(entry: &Entry) -> Option<String> {
 /// is already valid Telegram HTML — only media tags are stripped,
 /// formatting tags (<b>/<i>/<s>/<code>/<a>/<blockquote>) are preserved.
 pub fn entry_body_html(entry: &Entry, max: usize, meta: Option<&crate::entrymeta::EntryMeta>) -> String {
-    let content = entry.content.as_ref();
-    let html = content
-        .and_then(|c| c.body.clone())
-        .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()))
-        .unwrap_or_default();
+    entry_body_html_from_source(entry_body_source(entry), max, meta)
+}
 
+/// The raw body source used for rendering and media extraction: the entry
+/// content body when present, otherwise the summary. Borrowed so callers do
+/// not clone the (possibly huge) body just to inspect it.
+pub fn entry_body_source(entry: &Entry) -> &str {
+    entry
+        .content
+        .as_ref()
+        .and_then(|c| c.body.as_deref())
+        .or_else(|| entry.summary.as_ref().map(|s| s.content.as_str()))
+        .unwrap_or_default()
+}
+
+/// Render a raw body source into Telegram HTML. Split out from
+/// `entry_body_html` so callers that only need a short prefix (title+summary)
+/// can cap the input before conversion.
+pub(crate) fn entry_body_html_from_source(
+    html: &str,
+    max: usize,
+    meta: Option<&crate::entrymeta::EntryMeta>,
+) -> String {
     // Pre-rendered Telegram HTML (weibo markdown posts): skip the generic
     // html_to_telegram_html conversion which would strip formatting tags.
     // Only remove media tags (<img>/<video>/<source>) — media is sent as
@@ -611,12 +634,12 @@ pub fn entry_body_html(entry: &Entry, max: usize, meta: Option<&crate::entrymeta
     let is_prerendered = meta.map(|m| m.prerendered_html).unwrap_or(false);
 
     let tg = if is_prerendered {
-        let s = RE_VIDEO_BLOCK.replace_all(&html, "").to_string();
+        let s = RE_VIDEO_BLOCK.replace_all(html, "").to_string();
         let s = RE_IMG.replace_all(&s, "").to_string();
         let s = RE_SOURCE.replace_all(&s, "").to_string();
         collapse_blank_lines(&s)
     } else {
-        html_to_telegram_html(&html)
+        html_to_telegram_html(html)
     };
 
     // Check visible text length (strip all tags) against the limit.
@@ -626,8 +649,12 @@ pub fn entry_body_html(entry: &Entry, max: usize, meta: Option<&crate::entrymeta
     if visible.chars().count() <= max {
         return tg;
     }
+    // Release the converted/visible copies before building the plain fallback
+    // (large bodies otherwise keep several full-size strings alive at once).
+    drop(tg);
+    drop(visible);
     // Overflow: emit truncated plain text (always parseable, no links).
-    let plain = crate::htmltext::decode_entities(&strip_tags(&html));
+    let plain = crate::htmltext::decode_entities(&strip_tags(html));
     let plain = collapse_blank_lines(&plain);
     crate::htmltext::escape_html(&truncate_text(plain.trim(), max))
 }

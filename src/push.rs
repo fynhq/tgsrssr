@@ -863,15 +863,47 @@ fn source_line(entry: &Entry, feed_title: &str, author: Option<&str>, sd: Source
 
 /// Max visible characters kept in a `Title+summary` excerpt.
 const SUMMARY_MAX_CHARS: usize = 140;
+/// Raw HTML prefix converted for a summary. A summary only needs the first
+/// 140 visible characters; converting a multi-megabyte body just to discard
+/// it is a large transient allocation. The cut respects UTF-8 and tag
+/// boundaries; when the prefix carries no visible text (e.g. a huge inline
+/// image), the caller falls back to the full conversion.
+const SUMMARY_INPUT_CAP: usize = 256 * 1024;
+
+/// Truncate a raw HTML source to at most `cap` bytes without splitting a
+/// UTF-8 code point or a tag (cut after the last complete `>` at/before the
+/// cap). Plain text without any tag is cut directly; a malformed tag fragment
+/// with no closing `>` yields an empty prefix so the caller can fall back.
+fn truncate_html_input(html: &str, cap: usize) -> &str {
+    if html.len() <= cap {
+        return html;
+    }
+    let mut end = cap;
+    while end > 0 && !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = &html[..end];
+    match prefix.rfind('>') {
+        Some(i) => &html[..=i],
+        None if !prefix.contains('<') => prefix,
+        None => "",
+    }
+}
 
 /// Build a short summary from the entry body: the first `max_chars` visible
 /// characters as Telegram-HTML with hyperlinks preserved, with "......"
 /// appended when truncated. Returns empty string when the body has no
 /// visible text.
 fn entry_summary(entry: &Entry, max_chars: usize, meta: Option<&crate::entrymeta::EntryMeta>) -> String {
-    let html = fetcher::entry_body_html(entry, 100_000, meta);
-    if html.is_empty() {
-        return String::new();
+    let source = fetcher::entry_body_source(entry);
+    let capped = truncate_html_input(source, SUMMARY_INPUT_CAP);
+    let mut html = fetcher::entry_body_html_from_source(capped, 100_000, meta);
+    let (mut cut, mut truncated) = truncate_html_keep_links(&html, max_chars);
+    if cut.trim().is_empty() && capped.len() < source.len() {
+        // The prefix was all markup (e.g. a huge inline image); only the full
+        // body can produce a summary.
+        html = fetcher::entry_body_html(entry, 100_000, meta);
+        (cut, truncated) = truncate_html_keep_links(&html, max_chars);
     }
     // Truncate on the Telegram-HTML the body pipeline already produced:
     // image media hrefs were dropped upstream, while video links are kept, so
@@ -879,7 +911,6 @@ fn entry_summary(entry: &Entry, max_chars: usize, meta: Option<&crate::entrymeta
     // behind "本文来自微信公众号：账号名") and stay clickable in the summary.
     // The cut counts display characters only — href text never eats into the
     // budget.
-    let (cut, truncated) = truncate_html_keep_links(&html, max_chars);
     // Whitespace at the edges comes from flattened block tags (the old
     // plain-text path trimmed the same way); an all-whitespace cut means the
     // body had no visible content.
@@ -2623,6 +2654,51 @@ mod tests {
             summary.contains(r#"<a href="https://video.weibo.com/show?fid=1034:1">微博视频</a>"#),
             "video anchor lost: {summary}"
         );
+    }
+
+    #[test]
+    fn truncate_html_input_respects_utf8_and_tag_boundaries() {
+        let html = "<p>第一个段落。</p><p>第二个段落。</p>";
+        let cut = truncate_html_input(html, 25);
+        assert!(html.starts_with(cut));
+        assert!(cut.ends_with('>'), "cut inside a tag: {cut:?}");
+
+        // Cap lands inside a multi-byte character: back off to a boundary.
+        let text = "中文".repeat(10);
+        let cut = truncate_html_input(&text, 5);
+        assert_eq!(cut, "中");
+
+        // A malformed tag fragment with no closing '>' yields an empty prefix
+        // so the caller can fall back to the full conversion.
+        assert_eq!(truncate_html_input("<img src=\"unfinished", 8), "");
+    }
+
+    #[test]
+    fn entry_summary_large_body_uses_prefix_without_changing_output() {
+        // A body far above the summary input cap must produce exactly the
+        // same excerpt as the old full-body conversion.
+        let body = format!("<p>{}</p>", "正文".repeat(200_000));
+        let entry = rss_entry_with_body(&body);
+        let full = fetcher::entry_body_html(&entry, 100_000, None);
+        let (cut, truncated) = truncate_html_keep_links(&full, SUMMARY_MAX_CHARS);
+        let expected = if truncated {
+            format!("{}......", cut.trim())
+        } else {
+            cut.trim().to_string()
+        };
+        assert_eq!(entry_summary(&entry, SUMMARY_MAX_CHARS, None), expected);
+    }
+
+    #[test]
+    fn entry_summary_prefix_all_markup_falls_back_to_full_body() {
+        // The first SUMMARY_INPUT_CAP bytes are only <img> markup; the prefix
+        // has no visible text, so the summary must fall back to the full body.
+        let body = format!(
+            "{}<p>后面的正文</p>",
+            "<img src=\"https://example.com/x\">".repeat(20_000)
+        );
+        let summary = entry_summary(&rss_entry_with_body(&body), 140, None);
+        assert_eq!(summary, "后面的正文");
     }
 
     // ===== build_rich_ops (album pool: videos + images in one album) =====

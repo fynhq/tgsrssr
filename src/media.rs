@@ -836,19 +836,14 @@ pub fn extract_media_urls(
     }
 
     // Body HTML: extract media from <video> blocks and <img> tags.
-    let body = entry
-        .content
-        .as_ref()
-        .and_then(|c| c.body.clone())
-        .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()))
-        .unwrap_or_default();
+    let body = crate::fetcher::entry_body_source(entry);
     if !body.is_empty() {
         // 1) <video> blocks: each block contains multiple <source> children
         //    (alternative qualities of the SAME video). Extract only the FIRST
         //    <source> per block to avoid sending duplicates. Some producers
         //    (e.g. the native weibo fetcher) put the URL directly on the
         //    <video src="..."> tag instead of using <source> children.
-        for caps in RE_VIDEO_BLOCK.captures_iter(&body) {
+        for caps in RE_VIDEO_BLOCK.captures_iter(body) {
             let block = caps.get(0).unwrap().as_str();
             let owner_mid = RE_VIDEO_OWNER_MID
                 .captures(block)
@@ -862,7 +857,7 @@ pub fn extract_media_urls(
             }
         }
         // Remove <video> blocks so <img> regex doesn't pick up poster images.
-        let mut remaining = RE_VIDEO_BLOCK.replace_all(&body, "").to_string();
+        let mut remaining = RE_VIDEO_BLOCK.replace_all(body, "").to_string();
 
         // 2) Remove <a> blocks whose href is a media/video link (video cards).
         //    These contain icon <img> tags that must NOT be sent as images.
@@ -928,17 +923,12 @@ pub fn extract_media_urls(
 /// Returns (video_src_url, poster_url) pairs for <video> tags with poster attributes.
 /// Used to provide cover image fallback when a video is too large or fails to send.
 pub fn extract_video_posters(entry: &Entry) -> Vec<(String, String)> {
-    let body = entry
-        .content
-        .as_ref()
-        .and_then(|c| c.body.clone())
-        .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()))
-        .unwrap_or_default();
+    let body = crate::fetcher::entry_body_source(entry);
     if body.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
-    for caps in RE_VIDEO_BLOCK.captures_iter(&body) {
+    for caps in RE_VIDEO_BLOCK.captures_iter(body) {
         let block = caps.get(0).unwrap().as_str();
         let poster = match RE_VIDEO_POSTER.captures(block) {
             Some(pc) => crate::htmltext::unescape_html(&pc[1]),
