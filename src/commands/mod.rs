@@ -1335,23 +1335,36 @@ async fn handle_loget(bot: &Bot, msg: &Message, state: &AppState, args: &str, la
         return Ok(());
     }
 
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
+    // Validate readability and emptiness before handing the path to the
+    // uploader, so a missing/permission problem still gets the dedicated
+    // message (and the send itself streams the file instead of buffering it).
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "loget: read failed");
+            tracing::warn!(error = %e, path = %path.display(), "loget: open failed");
             bot.send_message(msg.chat.id, i18n::t(lang, "loget_read_failed"))
                 .await?;
             return Ok(());
         }
     };
+    let len = match file.metadata().await {
+        Ok(meta) => meta.len(),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "loget: metadata failed");
+            bot.send_message(msg.chat.id, i18n::t(lang, "loget_read_failed"))
+                .await?;
+            return Ok(());
+        }
+    };
+    drop(file);
 
-    if bytes.is_empty() {
+    if len == 0 {
         bot.send_message(msg.chat.id, i18n::t(lang, "loget_empty").replacen("{}", date, 1))
             .await?;
         return Ok(());
     }
 
-    let input = InputFile::memory(bytes).file_name(filename.clone());
+    let input = InputFile::file(path.clone()).file_name(filename.clone());
     bot.send_document(msg.chat.id, input).await?;
     Ok(())
 }

@@ -54,11 +54,13 @@ services:
 
       ## ===== 平台/网络拓扑（按部署环境调整）/ Platform & network topology =====
 
-      ## bot-api 容器内的媒体目录路径（file:// 零拷贝）。默认即此值，仅当本地
-      ## bot-api 部署使用了不同的容器内路径时才需取消注释并修改。
-      ## Media directory path inside the bot-api container (file:// zero-copy). This
-      ## is the default; uncomment only if your local bot-api uses a different
-      ## in-container path.
+      ## bot-api 容器内的共享媒体目录（富消息附件 file:// 直读；非空 +
+      ## BOT_API_URL 启用 2GB 上限）。默认即此值，仅当本地 bot-api 部署使用了
+      ## 不同的容器内路径时才需取消注释并修改。
+      ## Shared media directory inside the bot-api container (rich-message file://
+      ## attachments; non-empty + BOT_API_URL enables the 2GB cap). This is the
+      ## default; uncomment only if your local bot-api uses a different in-container
+      ## path.
       # BOT_API_MEDIA_DIR: "/var/lib/telegram-bot-api-media"
 
       ## 默认空=官方 API；本地 bot-api 时设置
@@ -158,9 +160,11 @@ services:
       ## Media directory (a local directory is fine for single-container deployments)
       - ./media:/app/media
       ## 仅当部署本地 telegram-bot-api 时：把上面 ./media 换成与 bot-api 共享的宿主目录，
-      ## 并追加 bot-api 容器内的映射路径（file:// 零拷贝），同时设置 BOT_API_URL 与 BOT_API_MEDIA_DIR，例如：
+      ## 并追加 bot-api 容器内的映射路径（富消息附件 file:// 直读；标准发送仍从本地
+      ## 路径流式上传），同时设置 BOT_API_URL 与 BOT_API_MEDIA_DIR，例如：
       ## Only when deploying a local telegram-bot-api: replace ./media above with a host
-      ## directory shared with bot-api, add the bot-api container's mapped path (file:// zero-copy),
+      ## directory shared with bot-api, add the bot-api container's mapped path (rich-message
+      ## file:// attachments; standard sends still stream from the local path),
       ## and set BOT_API_URL and BOT_API_MEDIA_DIR. Example:
       # - ../telegram-bot-api/media:/app/media
       # - ../telegram-bot-api/media:/var/lib/telegram-bot-api-media

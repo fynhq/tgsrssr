@@ -45,10 +45,10 @@ const CAPTION_LIMIT: usize = 1024;
 const RICH_TEXT_MAX: usize = 32768;
 const RICH_MEDIA_MAX: usize = 50;
 /// Safety cap for rich attachments held in memory until the response
-/// arrives. Photos/videos use `file://` on the local Bot API and do not count;
-/// documents always use multipart bytes (to keep their logical file name) and
-/// therefore always count. Very large sets fall back to the album path
-/// instead of risking the bot process.
+/// arrives. Rich-message photos/videos use `file://` on the local Bot API and
+/// do not count; documents always use multipart bytes (to keep their logical
+/// file name) and therefore always count. Very large sets fall back to the
+/// album path instead of risking the bot process.
 const RICH_MEMORY_MEDIA_MAX: u64 = 128 * 1024 * 1024;
 /// The existing album chunk size; > this triggers the rich-media enhancement.
 const ALBUM_LIMIT: usize = 10;
@@ -1004,27 +1004,25 @@ fn format_caption(
 }
 
 /// Build the InputFile for a local file path.
-/// - Local Bot API + translatable path → `InputFile::file` (server reads its
-///   own mount: zero copy, no RAM, 2GB cap).
-/// - Otherwise → memory upload (official API or untranslatable path).
+///
+/// The file is uploaded by this process as a streaming multipart part
+/// (teloxide reads it from disk chunk by chunk), so the heap never holds the
+/// whole file. The bot-api namespace path is only used by rich-message
+/// `file://` attachments, not by the standard send path.
+///
+/// A pre-open validates existence/readability up front: callers that treat a
+/// failure as "skip this attachment" (thumbnails) keep that behaviour instead
+/// of failing the whole request later.
 ///
 /// Storage-suffixed paths (`.tgsr`) are uploaded under their logical name
 /// (suffix stripped), so Telegram sees the original extension and document
 /// names stay clean. Old paths without the suffix keep the previous filename
 /// behavior.
-async fn path_input(
-    path: &std::path::Path,
-    transport: &crate::media::MediaTransport,
-) -> anyhow::Result<InputFile> {
+async fn path_input(path: &std::path::Path) -> anyhow::Result<InputFile> {
     let logical_name = crate::media::logical_file_name(path);
     let physical_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    let input = if let Some(bp) = transport.bot_path(path) {
-        InputFile::file(std::path::PathBuf::from(bp))
-    } else {
-        // Reading a media file can be tens of MB; use async IO instead of
-        // blocking a tokio worker while the bytes are loaded.
-        InputFile::memory(tokio::fs::read(path).await?)
-    };
+    tokio::fs::File::open(path).await?;
+    let input = InputFile::file(path.to_path_buf());
     Ok(if logical_name.as_str() != physical_name {
         input.file_name(logical_name)
     } else {
@@ -1035,14 +1033,13 @@ async fn path_input(
 /// Cache-aware input construction: first look up the file_id cache by
 /// "content hash:send mode"; on a hit use `InputFile::Id` directly
 /// (Telegram's server already has the file, no re-upload needed).
-/// On a miss fall back to local file / memory upload.
+/// On a miss stream the local file (no whole-file read).
 /// The cache key carries a send-mode suffix (photo/gif/video/doc): the same
 /// content sent via different modes yields non-interchangeable file_ids, so
 /// they are cached separately to avoid cross-use.
 async fn resolve_input(
     db: &Db,
     item: &MediaItem,
-    transport: &crate::media::MediaTransport,
     mode: &str,
     use_cache: bool,
 ) -> anyhow::Result<InputFile> {
@@ -1052,7 +1049,7 @@ async fn resolve_input(
             return Ok(InputFile::file_id(teloxide::types::FileId(fid)));
         }
     }
-    path_input(&item.path, transport).await
+    path_input(&item.path).await
 }
 
 /// Extract the media file_id from a sent message by send mode (used to write
@@ -1140,7 +1137,8 @@ pub struct PushCtx<'a> {
 /// - long images (h/w > threshold) → sendDocument (avoid photo-viewer cropping)
 /// - videos → sendVideo (single) or mixed into media group when with images
 /// - caption position follows the channel setting for all platforms
-/// - transport: local Bot API uses file:// zero-copy; official API uploads bytes
+/// - transport: standard sends stream the local file as multipart (constant
+///   heap memory); rich-message attachments may use file:// on a local Bot API
 /// - automatic enhancement: text >1024 or album media >10 may go through one
 ///   rich message first; any rich failure falls back to the normal path below
 /// - any send failure → fall back to text-only so the entry is never lost, and
@@ -1345,7 +1343,6 @@ pub async fn send_entry_with_media(
             "",
             false,
             &gif_ops,
-            transport,
             reply_to,
             "rich_gifs",
         )
@@ -1362,7 +1359,7 @@ pub async fn send_entry_with_media(
     }
 
     if !rich_delivered && !rich_ops.is_empty() {
-        let rich = send_rich_ops_with_retry(bot, db, chat_id, &caption, caption_above, &rich_ops, transport, None, "main").await;
+        let rich = send_rich_ops_with_retry(bot, db, chat_id, &caption, caption_above, &rich_ops, None, "main").await;
         match rich {
             Ok((_, first_msg)) => {
                 anchor = first_msg;
@@ -1438,7 +1435,7 @@ pub async fn send_entry_with_media(
                 // navigation. The text is already delivered, so a document
                 // failure does not affect entry completeness.
                 for (di, d) in docs.iter().enumerate() {
-                    if let Err(de) = send_doc_msg(bot, db, chat_id, d, "", fallback_msg_id, transport).await {
+                    if let Err(de) = send_doc_msg(bot, db, chat_id, d, "", fallback_msg_id).await {
                         tracing::warn!(
                             chat_id = chat_id,
                             entry_id = %fetcher::entry_id(entry),
@@ -1454,7 +1451,7 @@ pub async fn send_entry_with_media(
                 // the fallback body message.
                 if !rt_photos.is_empty() {
                     let rt_ops = build_rich_ops(&rt_photos, &[], &[]);
-                    if let Err((_, _, re)) = send_rich_ops(bot, db, chat_id, "", false, &rt_ops, transport, 0, fallback_msg_id).await {
+                    if let Err((_, _, re)) = send_rich_ops(bot, db, chat_id, "", false, &rt_ops, 0, fallback_msg_id).await {
                         tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %re, "retweet images send failed after text fallback");
                     }
                 }
@@ -1496,7 +1493,7 @@ pub async fn send_entry_with_media(
     if !rich_delivered && !docs.is_empty() {
         let reply_to = anchor.as_ref().map(|m| m.id);
         let cap = if anchor.is_none() { caption.as_str() } else { "" };
-        match send_doc_group(bot, db, chat_id, &docs, cap, reply_to, transport).await {
+        match send_doc_group(bot, db, chat_id, &docs, cap, reply_to).await {
             Ok(msgs) => {
                 first_doc_msg = msgs.into_iter().next();
             }
@@ -1519,7 +1516,7 @@ pub async fn send_entry_with_media(
                 }
                 for (i, d) in docs.iter().enumerate().skip(delivered.len()) {
                     let cap = if i == 0 && anchor.is_none() { caption.as_str() } else { "" };
-                    match send_doc_msg(bot, db, chat_id, d, cap, chain_id, transport).await {
+                    match send_doc_msg(bot, db, chat_id, d, cap, chain_id).await {
                         Ok(m) => {
                             if first_doc_msg.is_none() {
                                 first_doc_msg = Some(m.clone());
@@ -1555,7 +1552,7 @@ pub async fn send_entry_with_media(
         let rt_ops = build_rich_ops(&rt_photos, &[], &[]);
         // Network backoff retry consistent with the main rich_ops (resume
         // from the breakpoint).
-        let rt_res = send_rich_ops_with_retry(bot, db, chat_id, rt_caption, caption_above, &rt_ops, transport, rt_reply_to, "rt_images").await;
+        let rt_res = send_rich_ops_with_retry(bot, db, chat_id, rt_caption, caption_above, &rt_ops, rt_reply_to, "rt_images").await;
         match rt_res {
             Ok((_, first_rt_msg)) => {
                 // When retweet images become the only delivered carrier,
@@ -1757,7 +1754,6 @@ async fn send_doc_group(
     docs: &[&MediaItem],
     caption: &str,
     reply_to: Option<teloxide::types::MessageId>,
-    transport: &crate::media::MediaTransport,
 ) -> Result<Vec<Message>, (Vec<Message>, anyhow::Error)> {
     let chat = ChatId(chat_id);
     let caption = normalize_blockquote_fold(caption);
@@ -1767,7 +1763,7 @@ async fn send_doc_group(
     // through sendDocument (consistent with build_rich_ops sending a single
     // photo via send_photo).
     if docs.len() == 1 {
-        let m = send_doc_msg(bot, db, chat_id, docs[0], caption, reply_to, transport)
+        let m = send_doc_msg(bot, db, chat_id, docs[0], caption, reply_to)
             .await
             .map_err(|e| (Vec::new(), e))?;
         return Ok(vec![m]);
@@ -1788,7 +1784,7 @@ async fn send_doc_group(
         // sendMediaGroup requires 2-10 items; a trailing single document
         // (11/21/31 docs) must go through sendDocument instead of a group.
         if chunk.len() == 1 {
-            let m = send_doc_msg(bot, db, chat_id, chunk[0], group_caption, reply_msg_id, transport)
+            let m = send_doc_msg(bot, db, chat_id, chunk[0], group_caption, reply_msg_id)
                 .await
                 .map_err(|e| (all_msgs.clone(), e))?;
             if first_msg_id.is_none() {
@@ -1805,7 +1801,7 @@ async fn send_doc_group(
         let msgs = loop {
             let mut group: Vec<InputMedia> = Vec::new();
             for (j, d) in chunk.iter().enumerate() {
-                let inp = resolve_input(db, d, transport, "doc", use_cache)
+                let inp = resolve_input(db, d, "doc", use_cache)
                     .await
                     .map_err(|e| (all_msgs.clone(), e))?;
                 let mut im = InputMediaDocument::new(inp);
@@ -1823,7 +1819,7 @@ async fn send_doc_group(
                 // Converted-to-document long/large images carry a thumbnail
                 if use_thumbs {
                     if let Some(tp) = &d.thumb_path {
-                        if let Ok(tin) = path_input(tp, transport).await {
+                        if let Ok(tin) = path_input(tp).await {
                             im.thumbnail = Some(tin);
                         }
                     }
@@ -1895,7 +1891,6 @@ async fn send_doc_msg(
     d: &MediaItem,
     caption: &str,
     reply_to: Option<teloxide::types::MessageId>,
-    transport: &crate::media::MediaTransport,
 ) -> anyhow::Result<Message> {
     pace(chat_id).await;
     // Unified blockquote folding rules
@@ -1911,7 +1906,7 @@ async fn send_doc_msg(
     let mut flood_tries = 0u32;
     let mut transient_tries = 0usize;
     let m = loop {
-        let inp = resolve_input(db, d, transport, "doc", use_cache).await?;
+        let inp = resolve_input(db, d, "doc", use_cache).await?;
         let mut req = bot.send_document(ChatId(chat_id), inp);
         // Image documents opt out of content-type detection: a WebP document
         // is otherwise detected as a sticker, and stickers cannot carry a
@@ -1926,7 +1921,7 @@ async fn send_doc_msg(
         // retries so the document itself is still delivered.
         if attach_thumb {
             if let Some(tp) = &d.thumb_path {
-                if let Ok(tin) = path_input(tp, transport).await {
+                if let Ok(tin) = path_input(tp).await {
                     req = req.thumbnail(tin);
                 }
             }
@@ -1999,7 +1994,6 @@ async fn send_rich_ops(
     caption: &str,
     caption_above: bool,
     ops: &[RichOp<'_>],
-    transport: &crate::media::MediaTransport,
     resume: usize,
     // When set, the FIRST op replies to this message (used by retweet
     // inline images to quote the main entry message).
@@ -2018,7 +2012,7 @@ async fn send_rich_ops(
         } else {
             reply_first_to
         };
-        match send_op(bot, db, chat_id, op_caption, caption_above, op, transport, reply_to).await {
+        match send_op(bot, db, chat_id, op_caption, caption_above, op, reply_to).await {
             Err(e) => return Err((i, first_msg.map(Box::new), anyhow::anyhow!("{:#}", e))),
             Ok(msgs) => {
                 if first_msg.is_none() {
@@ -2043,12 +2037,11 @@ async fn send_rich_ops_with_retry(
     caption: &str,
     caption_above: bool,
     ops: &[RichOp<'_>],
-    transport: &crate::media::MediaTransport,
     reply_first_to: Option<teloxide::types::MessageId>,
     ctx: &str,
 ) -> Result<(usize, Option<Message>), RichSendFailure> {
     let mut first_delivered: Option<Box<Message>> = None;
-    let mut res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, transport, 0, reply_first_to).await;
+    let mut res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, 0, reply_first_to).await;
     if let Err((_, first, _)) = &res {
         first_delivered = first.clone();
     }
@@ -2060,7 +2053,7 @@ async fn send_rich_ops_with_retry(
         let Some(sent) = retry_from else { break };
         tracing::warn!(chat_id = chat_id, ctx = ctx, resume = sent, backoff = backoff, "rich send network error, backing off before retry");
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-        res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, transport, sent, reply_first_to).await;
+        res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, sent, reply_first_to).await;
         if first_delivered.is_none() {
             if let Err((_, first, _)) = &res {
                 first_delivered = first.clone();
@@ -2097,7 +2090,6 @@ async fn send_op(
     caption: &str,
     caption_above: bool,
     op: &RichOp<'_>,
-    transport: &crate::media::MediaTransport,
     reply_to: Option<teloxide::types::MessageId>,
 ) -> anyhow::Result<Vec<Message>> {
     let chat = ChatId(chat_id);
@@ -2113,7 +2105,7 @@ async fn send_op(
     match op {
         RichOp::Photo(p) => {
             let m = send_with_cache_retry(db, chat_id, op, |cache_enabled| { let use_cache = cache_enabled; async move {
-                let inp = resolve_input(db, p, transport, "photo", use_cache).await?;
+                let inp = resolve_input(db, p, "photo", use_cache).await?;
                 let mut req = bot
                     .send_photo(chat, inp)
                     .caption(caption)
@@ -2129,7 +2121,7 @@ async fn send_op(
         }
         RichOp::Gif(g) => {
             let m = send_with_cache_retry(db, chat_id, op, |cache_enabled| { let use_cache = cache_enabled; async move {
-                let inp = resolve_input(db, g, transport, "gif", use_cache).await?;
+                let inp = resolve_input(db, g, "gif", use_cache).await?;
                 let mut req = bot
                     .send_animation(chat, inp)
                     .caption(caption)
@@ -2145,7 +2137,7 @@ async fn send_op(
         }
         RichOp::Video(v) => {
             let m = send_with_cache_retry(db, chat_id, op, |cache_enabled| { let use_cache = cache_enabled; async move {
-                let inp = resolve_input(db, v, transport, "video", use_cache).await?;
+                let inp = resolve_input(db, v, "video", use_cache).await?;
                 let mut req = bot
                     .send_video(chat, inp)
                     .caption(caption)
@@ -2156,7 +2148,7 @@ async fn send_op(
                     req = req.duration(d);
                 }
                 if let Some(tp) = &v.thumb_path {
-                    if let Ok(tin) = path_input(tp, transport).await {
+                    if let Ok(tin) = path_input(tp).await {
                         req = req.thumbnail(tin);
                     }
                 }
@@ -2170,7 +2162,7 @@ async fn send_op(
         }
         RichOp::Group(items) => {
             let msgs = send_with_cache_retry(db, chat_id, op, |cache_enabled| { let use_cache = cache_enabled; async move {
-                let group = build_group_inputs(db, items, transport, caption, caption_above, use_cache).await?;
+                let group = build_group_inputs(db, items, caption, caption_above, use_cache).await?;
                 let mut req = bot.send_media_group(chat, group);
                 if let Some(rp) = rp {
                     req = req.reply_parameters(rp.clone());
@@ -2227,7 +2219,6 @@ where
 async fn build_group_inputs(
     db: &Db,
     items: &[&MediaItem],
-    transport: &crate::media::MediaTransport,
     caption: &str,
     caption_above: bool,
     use_cache: bool,
@@ -2235,7 +2226,7 @@ async fn build_group_inputs(
     let mut group: Vec<InputMedia> = Vec::new();
     for (j, m) in items.iter().enumerate() {
         let mode = group_item_mode(m);
-        let inp = resolve_input(db, m, transport, mode, use_cache).await?;
+        let inp = resolve_input(db, m, mode, use_cache).await?;
         match m.kind {
             MediaKind::Video => {
                 let mut im = InputMediaVideo::new(inp);
@@ -2252,7 +2243,7 @@ async fn build_group_inputs(
                     im.duration = Some(d.min(65535) as u16);
                 }
                 if let Some(tp) = &m.thumb_path {
-                    if let Ok(tin) = path_input(tp, transport).await {
+                    if let Ok(tin) = path_input(tp).await {
                         im.thumbnail = Some(tin);
                     }
                 }

@@ -83,10 +83,12 @@ pub const MAX_PHOTO_BYTES: u64 = 10 * 1024 * 1024;
 /// (see config.rs, default 100MB): oversized videos are not pushed (pipeline
 /// clogging + upload timeout risk); the entry degrades to plain text and
 /// the admin gets a dedicated notification.
-/// Download cap when uploading via memory (official Bot API). The official
+/// Download cap when uploading through the official Bot API. The official
 /// API rejects uploads above 50MB, so we cap at 49MB to leave headroom.
-pub const MAX_VIDEO_MEMORY_BYTES: u64 = 49 * 1024 * 1024;
-/// Download cap when the local Bot API reads files directly (file:// path).
+/// (Uploads are streamed from disk; the name reflects the endpoint, not RAM.)
+pub const MAX_VIDEO_OFFICIAL_BYTES: u64 = 49 * 1024 * 1024;
+/// Download cap in local Bot API mode (the server accepts uploads up to 2GB;
+/// standard sends stream multipart, rich attachments may use file://).
 pub const MAX_VIDEO_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_MEDIA_PER_ENTRY: usize = 30; // At most 3 groups (≤10 each, Telegram mediaGroup cap)
 /// On-disk suffix appended to every downloaded media/thumbnail file. It keeps
@@ -97,12 +99,15 @@ const STORAGE_SUFFIX: &str = ".tgsr";
 
 /// How media reaches the Bot API server.
 ///
-/// - `file` mode (local Bot API + shared mount): we hand the server a
-///   `file://` path in *its* filesystem namespace — zero copy, no RAM usage,
-///   2GB cap. The path is derived by translating our MEDIA_DIR prefix into
-///   BOT_API_MEDIA_DIR, so no absolute path is hardcoded in code.
-/// - `memory` mode (official API or empty BOT_API_MEDIA_DIR): read the file
-///   and upload bytes; capped at 49MB (official API rejects uploads > 50MB).
+/// - `file` mode (local Bot API + shared mount): raises the per-file upload cap
+///   to 2GB. Standard sends still stream the local file through teloxide's
+///   multipart uploader (constant heap memory); rich-message photo/video
+///   attachments use a `file://` path in the server's namespace so the server
+///   reads them directly. The namespace path is derived by translating our
+///   MEDIA_DIR prefix into BOT_API_MEDIA_DIR, so no absolute path is hardcoded.
+/// - `official` mode (official API or empty BOT_API_MEDIA_DIR): uploads are
+///   streamed from disk too; capped at 49MB (the official API rejects
+///   uploads > 50MB).
 #[derive(Debug, Clone)]
 pub struct MediaTransport {
     local_prefix: Option<PathBuf>,
@@ -130,8 +135,8 @@ impl MediaTransport {
     }
 
     /// Translate one of our local media paths into the Bot API server's
-    /// namespace. Returns None when not translatable (caller falls back to
-    /// memory upload).
+    /// namespace for rich-message `file://` attachments. Returns None when not
+    /// translatable (rich falls back to multipart bytes / the standard path).
     pub fn bot_path(&self, local: &Path) -> Option<String> {
         let lp = self.local_prefix.as_ref()?;
         let bp = self.bot_prefix.as_ref()?;
@@ -143,7 +148,7 @@ impl MediaTransport {
         if self.use_file() {
             MAX_VIDEO_FILE_BYTES
         } else {
-            MAX_VIDEO_MEMORY_BYTES
+            MAX_VIDEO_OFFICIAL_BYTES
         }
     }
 }

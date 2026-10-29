@@ -39,8 +39,9 @@ pub struct Config {
     // (key = "cookie:<platform>"); configured by admins via /cookies.
 
     // Media transport: where the Bot API server sees our media directory.
-    // Empty => official API or unknown mount: upload via memory.
-    // Set => local Bot API with a shared mount: send via file:// zero-copy.
+    // Empty => official API (or unknown mount): 49MB upload cap.
+    // Set => local Bot API mode: 2GB cap; standard sends stream multipart,
+    // rich-message attachments may use file:// server-side reads.
     pub bot_api_media_dir: String,
 
     // Image relay
@@ -96,7 +97,8 @@ impl Config {
         let media_dir = PathBuf::from(env_or("MEDIA_DIR", "media"));
         let log_dir = PathBuf::from(env_or("LOG_DIR", "logs"));
         // Path where the Bot API server sees our media dir (shared mount).
-        // Default matches telegram-bot-api compose mount; empty disables file://.
+        // Default matches telegram-bot-api compose mount; empty disables
+        // local Bot API mode (official-API 49MB cap).
         let bot_api_media_dir = env_or("BOT_API_MEDIA_DIR", "/var/lib/telegram-bot-api-media");
 
         let rss_proxy = std::env::var("RSS_PROXY").ok().filter(|s| !s.is_empty());

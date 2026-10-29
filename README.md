@@ -158,7 +158,7 @@ Android（Termux）另有 `tgsrssr-vX.Y.Z-aarch64-android.tar.gz`（Android 7+/A
 | `ALLOWED_USER_IDS` | 用户白名单 ID，逗号分隔（可选；管理员隐式放行） | 空 |
 | `OPEN_TO_ALL` | true = 对所有用户开放；false = 仅管理员+白名单 | false |
 | `BOT_API_URL` | 本地 Bot API 地址；空 = 官方 API | 空 |
-| `BOT_API_MEDIA_DIR` | bot-api 容器内媒体目录（file:// 零拷贝） | /var/lib/telegram-bot-api-media |
+| `BOT_API_MEDIA_DIR` | bot-api 容器内的共享媒体目录（富消息附件 file:// 直读；非空 + `BOT_API_URL` 启用 2GB 上限） | /var/lib/telegram-bot-api-media |
 | `RSS_PROXY` | 抓取 SOCKS5 代理（如 `socks5h://127.0.0.1:1080`） | 空 |
 | `RSS_NO_PROXY` | 不走代理的域名（逗号分隔） | 空 |
 | `RSS_INSECURE_HOSTS` | 跳过 TLS 验证的域名 | 空 |
@@ -183,14 +183,14 @@ Android（Termux）另有 `tgsrssr-vX.Y.Z-aarch64-android.tar.gz`（Android 7+/A
 
 ## 本地 Bot API（可选）
 
-官方 API 的媒体先读入内存再上传，单文件上限 50MB（本项目取 49MB）。部署本地 Bot API 并启用 `file://` 零拷贝后，物理上限提高到 2GB；实际视频仍受 `MAX_VIDEO_PUSH_MB`（默认 100）约束。
+媒体上传统一由本进程从本地文件流式 multipart 上传（按块读取，堆内存常量，不整文件读入）。官方 API 的单文件上限为 50MB（本项目取 49MB）；部署本地 Bot API 后上限提高到 2GB，标准发送仍是流式 multipart，富消息的图片/视频附件可由 bot-api 服务器通过 `file://` 直读（文档附件仍走 multipart bytes 以保留文件名）。实际视频仍受 `MAX_VIDEO_PUSH_MB`（默认 100）约束。
 
 | 模式 | 触发条件 | 传输方式 | 单文件上限 |
 |---|---|---|---|
-| `memory`（官方 API） | `BOT_API_URL` 留空 | 读入内存上传 | 49MB |
-| `file://`（本地零拷贝） | `BOT_API_URL` 已设且 `BOT_API_MEDIA_DIR` 非空 | 本地路径直读 | 2GB |
+| 官方 API | `BOT_API_URL` 留空 | 客户端从本地文件流式 multipart | 49MB |
+| 本地 Bot API | `BOT_API_URL` 已设且 `BOT_API_MEDIA_DIR` 非空 | 客户端流式 multipart；富消息图片/视频附件可 file:// 服务器直读 | 2GB |
 
-两个容器必须挂载同一宿主媒体目录。以下仅列出与零拷贝相关的配置：
+富消息的 `file://` 附件要求两个容器挂载同一宿主媒体目录；标准发送从 bot 自己的 `MEDIA_DIR` 流式读取，不依赖 bot 容器访问 `BOT_API_MEDIA_DIR`。以下仅列出相关配置：
 
 ```yaml
 # telegram-bot-api
@@ -213,7 +213,7 @@ services:
       - ../telegram-bot-api/media:/app/media
 ```
 
-`BOT_API_MEDIA_DIR` 默认即 `/var/lib/telegram-bot-api-media`，仅当 bot-api 容器内路径不同才需修改。由于该默认值非空，**是否启用零拷贝只看 `BOT_API_URL` 是否设置**。
+`BOT_API_MEDIA_DIR` 默认即 `/var/lib/telegram-bot-api-media`，仅当 bot-api 容器内路径不同才需修改。由于该默认值非空，**是否启用本地 Bot API 模式（2GB 上限）只看 `BOT_API_URL` 是否设置**。
 
 ## 通知
 
@@ -400,7 +400,7 @@ Subscribe with `https://t.me/<channel>`. Public channels only, no login required
 | `ALLOWED_USER_IDS` | Whitelisted user IDs, comma-separated (optional; admin is implicitly allowed) | empty |
 | `OPEN_TO_ALL` | true = open to all users; false = admin + whitelist only | false |
 | `BOT_API_URL` | Local Bot API address; empty = official API | empty |
-| `BOT_API_MEDIA_DIR` | Media dir inside the bot-api container (file:// zero-copy) | /var/lib/telegram-bot-api-media |
+| `BOT_API_MEDIA_DIR` | Shared media dir inside the bot-api container (rich-message file:// attachments; non-empty + `BOT_API_URL` enables the 2GB cap) | /var/lib/telegram-bot-api-media |
 | `RSS_PROXY` | Fetch SOCKS5 proxy (e.g. `socks5h://127.0.0.1:1080`) | empty |
 | `RSS_NO_PROXY` | Domains bypassing the proxy (comma-separated) | empty |
 | `RSS_INSECURE_HOSTS` | Domains skipping TLS verification | empty |
@@ -425,14 +425,14 @@ The full set of tunables (cleanup, backup, cache retention, etc.) and their defa
 
 ## Local Bot API (optional)
 
-The official API reads media into memory and uploads it, with a 50MB per-file limit (this project uses 49MB). Deploying a local Bot API server with `file://` zero-copy raises the physical limit to 2GB; videos are still gated by `MAX_VIDEO_PUSH_MB` (default 100).
+Media uploads are streamed from the local file as multipart (read in chunks; constant heap memory, no whole-file buffering). The official API has a 50MB per-file limit (this project uses 49MB). Deploying a local Bot API server raises the limit to 2GB; standard sends still use streaming multipart, while rich-message photo/video attachments can be read by the server via `file://` (document attachments stay on multipart bytes to keep their file name). Videos are still gated by `MAX_VIDEO_PUSH_MB` (default 100).
 
 | Mode | Trigger | Transport | Per-file cap |
 |---|---|---|---|
-| `memory` (official API) | `BOT_API_URL` empty | read into memory, upload | 49MB |
-| `file://` (local zero-copy) | `BOT_API_URL` set and `BOT_API_MEDIA_DIR` non-empty | direct local path read | 2GB |
+| Official API | `BOT_API_URL` empty | client-side streaming multipart | 49MB |
+| Local Bot API | `BOT_API_URL` set and `BOT_API_MEDIA_DIR` non-empty | client-side streaming multipart; rich photo/video attachments may use server-side `file://` | 2GB |
 
-Both containers must mount the same host media directory. Only the zero-copy-related settings are shown:
+Rich-message `file://` attachments require both containers to mount the same host media directory; standard sends read the bot's own `MEDIA_DIR` and do not require the bot container to see `BOT_API_MEDIA_DIR`. Only the relevant settings are shown:
 
 ```yaml
 # telegram-bot-api
@@ -455,7 +455,7 @@ services:
       - ../telegram-bot-api/media:/app/media
 ```
 
-`BOT_API_MEDIA_DIR` defaults to `/var/lib/telegram-bot-api-media`; override it only if the bot-api container uses a different path. Because the default is non-empty, **zero-copy is effectively controlled by whether `BOT_API_URL` is set**.
+`BOT_API_MEDIA_DIR` defaults to `/var/lib/telegram-bot-api-media`; override it only if the bot-api container uses a different path. Because the default is non-empty, **local Bot API mode (2GB cap) is controlled by whether `BOT_API_URL` is set**.
 
 ## Notifications
 
