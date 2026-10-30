@@ -213,14 +213,40 @@ async fn main() -> anyhow::Result<()> {
                 .branch(dptree::endpoint(handle_my_chat_member_update)),
         );
 
-    Dispatcher::builder(bot, handler)
+    let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
-        .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
+        .build();
 
-    // Dispatcher returns on Ctrl-C (or a fatal update-stream error). The
+    // Graceful shutdown for both SIGINT (Ctrl-C) and SIGTERM (`docker stop`,
+    // systemd). As container PID 1 the process would otherwise ignore SIGTERM
+    // and Docker would SIGKILL it after its 10s grace period. Driving the
+    // dispatcher shutdown token lets worker tasks and in-flight handlers
+    // finish before the scheduler is stopped.
+    let shutdown_token = dispatcher.shutdown_token();
+    let dispatch = dispatcher.dispatch();
+    tokio::pin!(dispatch);
+    tokio::select! {
+        _ = &mut dispatch => {} // update listener ended on its own
+        signal = wait_for_shutdown_signal() => {
+            info!(signal, "shutdown signal received, stopping dispatcher");
+            loop {
+                match shutdown_token.shutdown() {
+                    Ok(done) => {
+                        tokio::join!(done, &mut dispatch);
+                        break;
+                    }
+                    // Dispatcher is still starting up (its get_me call) or
+                    // already idle: wait for it to start or finish, then retry.
+                    Err(_) => tokio::select! {
+                        _ = &mut dispatch => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                    },
+                }
+            }
+        }
+    }
+
+    // Dispatcher returns on shutdown or a fatal update-stream error. The
     // JobScheduler's ticker is an independent task and keeps firing cron jobs
     // (fetch/outbox notifications included) unless explicitly shut down, so
     // stop it before exiting rather than relying on process teardown.
@@ -230,6 +256,35 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolves when the process is asked to stop, returning which signal arrived.
+///
+/// SIGTERM is not covered by teloxide's built-in Ctrl-C handler, and the kernel
+/// does not apply the default terminate action to PID 1 (the container init),
+/// so without an explicit handler `docker stop` would wait out the grace period
+/// and SIGKILL the process.
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler, only Ctrl-C will stop the bot");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
 }
 
 /// Message handler: pending multi-step ops first, then commands; ignore the rest.
