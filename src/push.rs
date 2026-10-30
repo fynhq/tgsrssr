@@ -1170,6 +1170,31 @@ pub struct PushCtx<'a> {
     pub meta: Option<&'a crate::entrymeta::EntryMeta>,
 }
 
+/// Split the non-album documents into the ones that can travel inside the
+/// rich message and the ones that must follow as separate messages.
+///
+/// Only image documents (oversized / long / format-converted images) are
+/// valid rich attachments. Audio and file attachments stay out: Telegram
+/// classifies an uploaded mp3 as audio, and an audio attachment referenced by
+/// a `<tg-document>` block is rejected with `RICH_MESSAGE_DOCUMENT_INVALID` —
+/// one such item would fail the whole rich message and force the entry back to
+/// the standard path. They are sent afterwards as document messages quoting
+/// the main message instead.
+fn split_rich_docs<'a>(
+    docs: &[&'a MediaItem],
+) -> (Vec<&'a MediaItem>, Vec<&'a MediaItem>) {
+    let mut rich = Vec::new();
+    let mut follow = Vec::new();
+    for item in docs {
+        if item.kind == MediaKind::Image {
+            rich.push(*item);
+        } else {
+            follow.push(*item);
+        }
+    }
+    (rich, follow)
+}
+
 /// Send an entry with prepared media. Strategy:
 /// - images ≤10MB (normal aspect) → sendPhoto / sendMediaGroup
 /// - images >10MB (photo hard limit) → sendDocument
@@ -1319,22 +1344,26 @@ pub async fn send_entry_with_media(
     let mut rich_delivered = false;
 
     // Automatic enhancement: only posts that would overflow the existing
-    // caption/album limits take the rich path. The count includes documents
-    // (converted images, audio/files) but still excludes GIFs and retweet
-    // images; those keep their existing follow-up messages.
+    // caption/album limits take the rich path. The count covers exactly the
+    // media that enter the rich message (album + image documents); audio/file
+    // attachments are follow-up messages and neither trigger nor widen the
+    // rich payload (see split_rich_docs). GIFs and retweet images also keep
+    // their existing follow-up messages.
     let album_media: Vec<&MediaItem> = videos
         .iter()
         .copied()
         .chain(photos.iter().copied())
         .collect();
-    let rich_media_count = album_media.len() + docs.len();
+    let (rich_docs, follow_docs) = split_rich_docs(&docs);
+    let rich_media_count = album_media.len() + rich_docs.len();
     let full_text_len = visible_len(&full_caption);
     tracing::debug!(
         chat_id = chat_id,
         entry_id = %fetcher::entry_id(entry),
         text_len = full_text_len,
         media_count = rich_media_count,
-        document_count = docs.len(),
+        document_count = rich_docs.len(),
+        follow_up_documents = follow_docs.len(),
         gif_count = gifs.len(),
         retweet_images = rt_photos.len(),
         allow_rich = opts.allow_rich,
@@ -1349,7 +1378,7 @@ pub async fn send_entry_with_media(
             &full_caption,
             caption_above,
             &album_media,
-            &docs,
+            &rich_docs,
             transport,
         )
         .await
@@ -1363,7 +1392,8 @@ pub async fn send_entry_with_media(
                     entry_id = %fetcher::entry_id(entry),
                     text_len = full_text_len,
                     media_count = rich_media_count,
-                    document_count = docs.len(),
+                    document_count = rich_docs.len(),
+                    follow_up_documents = follow_docs.len(),
                     "rich media enhancement sent"
                 );
             }
@@ -1373,7 +1403,8 @@ pub async fn send_entry_with_media(
                     entry_id = %fetcher::entry_id(entry),
                     text_len = full_text_len,
                     media_count = rich_media_count,
-                    document_count = docs.len(),
+                    document_count = rich_docs.len(),
+                    follow_up_documents = follow_docs.len(),
                     error = %e,
                     "rich media send failed, falling back to standard path"
                 );
@@ -1538,18 +1569,20 @@ pub async fn send_entry_with_media(
     // already delivered with the main message); it only sets media_failed
     // and relies on the admin notification as the safety net.
     let mut first_doc_msg: Option<Message> = None;
-    // Documents already traveled inside the rich message; do not send them
-    // again. A rich failure leaves rich_delivered=false and keeps the normal
-    // document-group path below.
-    if !rich_delivered && !docs.is_empty() {
+    // Documents already traveled inside the rich message; only the follow-up
+    // audio/file attachments are sent here, quoting it. A rich failure leaves
+    // rich_delivered=false and keeps the normal document-group path with every
+    // document in its original order.
+    let docs_to_send: &[&MediaItem] = if rich_delivered { &follow_docs } else { &docs };
+    if !docs_to_send.is_empty() {
         let reply_to = anchor.as_ref().map(|m| m.id);
         let cap = if anchor.is_none() { caption.as_str() } else { "" };
-        match send_doc_group(bot, db, chat_id, &docs, cap, reply_to).await {
+        match send_doc_group(bot, db, chat_id, docs_to_send, cap, reply_to).await {
             Ok(msgs) => {
                 first_doc_msg = msgs.into_iter().next();
             }
             Err((delivered, e)) => {
-                tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %e, delivered = delivered.len(), "doc group send failed, falling back to one-by-one");
+                tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %e, delivered = delivered.len(), total_docs = docs_to_send.len(), "doc group send failed, falling back to one-by-one");
                 // Fall back to one-by-one sending: skip the part already
                 // delivered as a group (in multi-group scenarios, when group
                 // 2 fails, group 1 is already delivered and must not be
@@ -1565,7 +1598,7 @@ pub async fn send_entry_with_media(
                         chain_id = Some(first.id);
                     }
                 }
-                for (i, d) in docs.iter().enumerate().skip(delivered.len()) {
+                for (i, d) in docs_to_send.iter().enumerate().skip(delivered.len()) {
                     let cap = if i == 0 && anchor.is_none() { caption.as_str() } else { "" };
                     match send_doc_msg(bot, db, chat_id, d, cap, chain_id).await {
                         Ok(m) => {
@@ -2980,10 +3013,10 @@ mod tests {
     fn rich_media_html_appends_document_blocks_after_album() {
         let photo = mk_item("p0", MediaKind::Image, false);
         let doc_image = mk_item("d0", MediaKind::Image, false);
-        let doc_file = mk_item("d1", MediaKind::Other, false);
+        let doc_image2 = mk_item("d1", MediaKind::Image, false);
 
         assert_eq!(
-            rich_media_html(&[&photo], &[&doc_image, &doc_file]),
+            rich_media_html(&[&photo], &[&doc_image, &doc_image2]),
             "<img src=\"tg://photo?id=m0\"/>\
              <tg-document src=\"tg://document?id=m1\"></tg-document>\
              <tg-document src=\"tg://document?id=m2\"></tg-document>"
@@ -2991,10 +3024,30 @@ mod tests {
 
         // Documents-only entries start their ids at m0.
         assert_eq!(
-            rich_media_html(&[], &[&doc_image, &doc_file]),
+            rich_media_html(&[], &[&doc_image, &doc_image2]),
             "<tg-document src=\"tg://document?id=m0\"></tg-document>\
              <tg-document src=\"tg://document?id=m1\"></tg-document>"
         );
+    }
+
+    #[test]
+    fn split_rich_docs_keeps_audio_and_files_out_of_the_rich_payload() {
+        // Only image documents are valid rich attachments. Audio/file
+        // attachments must follow as separate messages: an mp3 referenced as
+        // a <tg-document> block is rejected by Telegram
+        // (RICH_MESSAGE_DOCUMENT_INVALID) and would drop the whole rich
+        // message back to the standard path.
+        let doc_image = mk_item("d0", MediaKind::Image, false);
+        let audio = mk_item("d1", MediaKind::Other, false);
+        let file = mk_item("d2", MediaKind::Other, false);
+
+        let (rich, follow) = split_rich_docs(&[&doc_image, &audio, &file]);
+
+        assert_eq!(rich.len(), 1);
+        assert_eq!(rich[0].content_hash, "d0");
+        assert_eq!(follow.len(), 2);
+        assert_eq!(follow[0].content_hash, "d1");
+        assert_eq!(follow[1].content_hash, "d2");
     }
 
     #[test]
