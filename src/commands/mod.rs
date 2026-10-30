@@ -504,12 +504,21 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
 /// new message so the result is never permanently hidden behind the
 /// "正在抓取…" progress text that would otherwise stay frozen.
 async fn test_report(bot: &Bot, chat: teloxide::types::ChatId, progress_id: teloxide::types::MessageId, text: String) {
-    if bot.edit_message_text(chat, progress_id, text.clone()).await.is_err() {
-        // Degrade to a fresh message when the edit fails (message too old /
-        // flood), so the result is never stuck invisible behind the
-        // "fetching…" progress line. link_preview disabled to match the
-        // progress message (pure-text result; avoids link-preview spam).
-        bot.send_message(chat, text).link_preview_options(no_preview()).await.ok();
+    match bot.edit_message_text(chat, progress_id, text.clone()).await {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::info!(
+                chat_id = chat.0, message_id = progress_id.0, error = %e,
+                "/test: result edit failed, sending a new message"
+            );
+            // Degrade to a fresh message when the edit fails (message too old /
+            // flood), so the result is never stuck invisible behind the
+            // "fetching…" progress line. link_preview disabled to match the
+            // progress message (pure-text result; avoids link-preview spam).
+            if let Err(e) = bot.send_message(chat, text).link_preview_options(no_preview()).await {
+                tracing::warn!(chat_id = chat.0, error = %e, "/test: result fallback send failed");
+            }
+        }
     }
 }
 
@@ -539,8 +548,8 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(state, &chat_id).await);
 
     // Second token is the full feed URL.
-    let feed_url = rest[0].to_string();
-    if !feed_url.starts_with("http://") && !feed_url.starts_with("https://") {
+    let raw_feed_url = rest[0].to_string();
+    if !raw_feed_url.starts_with("http://") && !raw_feed_url.starts_with("https://") {
         bot.send_message(msg.chat.id, i18n::t(lang, "test_bad_url")).await?;
         return Ok(());
     }
@@ -550,7 +559,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     // miss an existing subscription (e.g. t.me/Foo/... vs t.me/foo), silently
     // falling back to default config instead of that source's override — so the
     // test result would not reflect what the real push actually does.
-    let feed_url = fetcher::normalize_feed_url(&feed_url);
+    let feed_url = fetcher::normalize_feed_url(&raw_feed_url);
     // Platform sources (Weibo/X) require an admin-configured global cookie to work; intercept when not configured.
     if let Some(p) = crate::platforms::platform_for_url(&feed_url) {
         if p.needs_cookie && state.get_cookie(p.id).await.is_none() {
@@ -584,6 +593,10 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         entry_index = entry_index, target_chat = %chat_id,
         "/test: start"
     );
+    // /test is a manual diagnostic command, so the full chain is logged at
+    // info level (target `tgsrssr::test`). Shared push/media decision logs are
+    // debug; enable them with RUST_LOG=info,tgsrssr::push=debug,tgsrssr::media=debug.
+    let test_started = std::time::Instant::now();
 
     // Send a progress message; we'll EDIT it with the final result.
     // #33: the progress message contains the source URL; disable link preview to avoid generating a preview card.
@@ -592,6 +605,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         .await?;
     let progress_id = progress_msg.id;
 
+    let fetch_started = std::time::Instant::now();
     let fr = match fetcher::fetch_feed(state, &feed_url, None, None, None, lang).await {
         Ok(fr) => fr,
         Err(e) => {
@@ -600,11 +614,23 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
             return Ok(());
         }
     };
+    let fetch_elapsed_ms = fetch_started.elapsed().as_millis() as u64;
 
     tracing::info!(
         feed_url = %feed_url, entries = fr.entries.len(),
         feed_title = ?fr.feed_title,
         "/test: fetch ok"
+    );
+    tracing::info!(
+        target: "tgsrssr::test",
+        raw_feed_url = %raw_feed_url, feed_url = %feed_url,
+        platform = crate::platforms::platform_for_url(&feed_url).map(|p| p.id).unwrap_or("rss"),
+        elapsed_ms = fetch_elapsed_ms,
+        entries = fr.entries.len(), feed_title = ?fr.feed_title,
+        not_modified = fr.not_modified, metas = fr.metas.len(),
+        http_etag = fr.http_etag.is_some(),
+        http_last_modified = fr.http_last_modified.is_some(),
+        "/test: fetch details"
     );
 
     let entry = match fr.entries.get(entry_index) {
@@ -630,6 +656,21 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         has_poll = has_poll, rt_img_count = rt_img_count,
         prerendered = meta.map(|m| m.prerendered_html).unwrap_or(false),
         "/test: entry selected"
+    );
+    tracing::info!(
+        target: "tgsrssr::test",
+        entry_index = entry_index,
+        entry_id = %entry.id,
+        entry_link = ?fetcher::entry_link(entry),
+        entry_title = ?entry.title.as_ref().map(|t| t.content.as_str()),
+        published = ?entry.published, updated = ?entry.updated,
+        author = ?fetcher::entry_author(entry),
+        authors = entry.authors.len(), links = entry.links.len(),
+        content_type = content_type_str, body_len = body_len,
+        has_poll = has_poll, poll_options = meta.and_then(|m| m.poll.as_ref()).map(|p| p.options.len()),
+        rt_img_count = rt_img_count,
+        prerendered = meta.map(|m| m.prerendered_html).unwrap_or(false),
+        "/test: entry details"
     );
 
     // If this feed is subscribed in the channel, use its title + effective
@@ -705,6 +746,25 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         caption_above_media = caption_above_media, subscribed = sub.is_some(),
         "/test: effective config"
     );
+    tracing::info!(
+        target: "tgsrssr::test",
+        subscribed = sub.is_some(),
+        sub_id = ?sub.map(|s| s.id),
+        title_overridden = ?sub.map(|s| s.title_overridden),
+        config_source = if eff.is_some() { "effective" } else { "defaults" },
+        content_mode_raw = ?eff.as_ref().map(|e| e.content_mode.as_str()),
+        source_display_raw = ?eff.as_ref().map(|e| e.source_display.as_str()),
+        link_preview_raw = eff.as_ref().map(|e| e.link_preview),
+        caption_above_media_raw = eff.as_ref().map(|e| e.caption_above_media),
+        resolved_mode = ?opts.mode,
+        resolved_source = ?opts.source,
+        resolved_link_preview = opts.link_preview,
+        resolved_caption_above_media = caption_above_media,
+        allow_rich = opts.allow_rich,
+        feed_title = ?feed_title,
+        config_warnings = config_warnings.len(),
+        "/test: config details"
+    );
 
     // chat_id is guaranteed parseable by resolve_chat_id; if it still fails to parse, report an
     // explicit error instead of silently falling back to the current private chat (otherwise the
@@ -719,6 +779,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 
     // Media pipeline for test pushes too (download + rich send + text fallback).
     // Title+link / title-only modes: never fetch media (consistent with scheduled pushes).
+    let media_started = std::time::Instant::now();
     let transport = crate::media::MediaTransport::new(&state.config);
     let prepared = if opts.mode.skip_media() {
         tracing::info!("/test: skip_media=true, no media fetch");
@@ -740,6 +801,39 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         oversized_videos = prepared.oversized_videos.len(),
         "/test: media prepared"
     );
+    tracing::info!(
+        target: "tgsrssr::test",
+        elapsed_ms = media_started.elapsed().as_millis() as u64,
+        skip_media = opts.mode.skip_media(),
+        single_media = opts.mode.single_media(),
+        items = prepared.items.len(),
+        warnings = prepared.warnings.len(),
+        oversized_videos = prepared.oversized_videos.len(),
+        setup_failed = prepared.setup_failed,
+        "/test: media details"
+    );
+    for (index, item) in prepared.items.iter().enumerate() {
+        tracing::info!(
+            target: "tgsrssr::test",
+            index = index,
+            kind = ?item.kind,
+            width = item.width,
+            height = item.height,
+            size = item.size,
+            gif = item.is_gif,
+            retweet = item.is_retweet,
+            has_thumbnail = item.thumb_path.is_some(),
+            duration_secs = ?item.duration_secs,
+            path = %item.path.display(),
+            "/test: media item"
+        );
+    }
+    for (index, warning) in prepared.warnings.iter().enumerate() {
+        tracing::info!(target: "tgsrssr::test", index = index, warning = %warning, "/test: media warning");
+    }
+    for (index, oversized) in prepared.oversized_videos.iter().enumerate() {
+        tracing::info!(target: "tgsrssr::test", index = index, size = ?oversized.size, "/test: oversized video");
+    }
 
     // Media storage could not even be created: do not pretend this entry has
     // no media (that would silently hide the environment failure).
@@ -757,72 +851,78 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     }
 
     let author = fetcher::entry_author(entry);
-    let result = if prepared.items.is_empty() {
+    // Text and media sends both go through send_entry_with_media: with an
+    // empty media set it delegates to send_text_only, so /test exercises the
+    // same standard/rich chain as the scheduler (including long-text rich
+    // messages) instead of keeping a second text-only path here.
+    if prepared.items.is_empty() {
         tracing::info!("/test: text-only path (no media items)");
-        match push::format_entry_parts(entry, &feed_title, author.as_deref(), opts, meta) {
-            Some((body, footer)) => {
-                tracing::info!(body_len = body.len(), footer_len = footer.len(), "/test: formatted parts");
-                match push::send_entry_msg(bot, target_chat, &body, &footer, opts.link_preview).await {
-                    Ok(m) => {
-                        tracing::info!(msg_id = m.id.0, "/test: text sent");
-                        // Poll: reuse the shared follow-up helper (the same one
-                        // used by the scheduled plain-text path) while keeping
-                        // /test's detailed diagnostics.
-                        let poll = push::extract_poll(meta);
-                        if let Some((question, options, is_multi)) = &poll {
-                            tracing::info!(
-                                question = %question, options = options.len(),
-                                is_multi = is_multi,
-                                "/test: poll extracted, sending"
-                            );
-                        } else {
-                            tracing::info!("/test: no poll in entry");
-                        }
-                        let poll_failed = push::try_send_poll(bot, target_chat, Some(m.id), meta).await;
-                        if poll_failed {
-                            tracing::warn!(chat_id = target_chat, "/test: poll send FAILED");
-                        } else if poll.is_some() {
-                            tracing::info!("/test: poll sent ok");
-                        }
-                        Ok(push::SendOutcome {
-                            delivered_tg_link: push::tg_message_link(&m),
-                            entry_link: fetcher::entry_link(entry),
-                            media_failed: poll_failed,
-                            text_only: true,
-                            ..Default::default()
-                        })
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            None => {
-                tracing::info!("/test: format_entry_parts returned None (nothing to send)");
-                Ok(push::SendOutcome::default())
-            }
+        if let Some((question, options, is_multi)) = push::extract_poll(meta) {
+            tracing::info!(
+                question = %question, options = options.len(),
+                is_multi = is_multi,
+                "/test: poll extracted, sending"
+            );
+        } else {
+            tracing::info!("/test: no poll in entry");
         }
     } else {
         tracing::info!(media_count = prepared.items.len(), "/test: rich media path");
-        push::send_entry_with_media(
-            bot,
-            &state.db,
-            target_chat,
-            push::PushCtx {
-                entry,
-                feed_title: &feed_title,
-                author: author.as_deref(),
-                opts,
-                caption_above_media,
-                aspect_threshold: state.config.long_image_aspect_ratio,
-                media: &prepared.items,
-                meta,
-            },
-            &transport,
-        )
-        .await
-    };
+    }
+    let send_started = std::time::Instant::now();
+    tracing::info!(
+        target: "tgsrssr::test",
+        target_chat = target_chat,
+        path = if prepared.items.is_empty() { "text" } else { "media" },
+        media_count = prepared.items.len(),
+        allow_rich = opts.allow_rich,
+        caption_above_media = caption_above_media,
+        aspect_threshold = state.config.long_image_aspect_ratio,
+        "/test: send start"
+    );
+    let result = push::send_entry_with_media(
+        bot,
+        &state.db,
+        target_chat,
+        push::PushCtx {
+            entry,
+            feed_title: &feed_title,
+            author: author.as_deref(),
+            opts,
+            caption_above_media,
+            aspect_threshold: state.config.long_image_aspect_ratio,
+            media: &prepared.items,
+            meta,
+        },
+        &transport,
+    )
+    .await;
 
     match result {
         Ok(outcome) => {
+            tracing::info!(
+                target: "tgsrssr::test",
+                elapsed_ms = send_started.elapsed().as_millis() as u64,
+                delivered = ?outcome.delivered_tg_link,
+                delivered_message_id = ?outcome.delivered_message_id,
+                entry_link = ?outcome.entry_link,
+                media_failed = outcome.media_failed,
+                text_only = outcome.text_only,
+                "/test: send outcome"
+            );
+            if prepared.items.is_empty() {
+                match outcome.delivered_message_id {
+                    Some(id) => tracing::info!(msg_id = id, "/test: text sent"),
+                    None => tracing::info!("/test: nothing to send (format_entry_parts returned None)"),
+                }
+                if push::extract_poll(meta).is_some() {
+                    if outcome.media_failed {
+                        tracing::warn!(chat_id = target_chat, "/test: poll send FAILED");
+                    } else {
+                        tracing::info!("/test: poll sent ok");
+                    }
+                }
+            }
             tracing::info!(
                 delivered = ?outcome.delivered_tg_link, media_failed = outcome.media_failed,
                 "/test: done ok"
@@ -837,10 +937,21 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
             test_report(bot, msg.chat.id, progress_id, text).await;
         }
         Err(e) => {
+            tracing::info!(
+                target: "tgsrssr::test",
+                elapsed_ms = send_started.elapsed().as_millis() as u64,
+                error = %e,
+                "/test: send error"
+            );
             tracing::warn!(chat_id = target_chat, feed_url = %feed_url, error = %e, "/test: push FAILED");
             test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_push_failed").replace("{:#}", &format!("{:#}", e))).await;
         }
     }
+    tracing::info!(
+        target: "tgsrssr::test",
+        elapsed_ms = test_started.elapsed().as_millis() as u64,
+        "/test: complete"
+    );
     Ok(())
 }
 

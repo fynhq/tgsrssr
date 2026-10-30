@@ -272,6 +272,14 @@ pub async fn send_text_only(
     // so a 4095-char body with no footer correctly triggers the rich path
     // instead of being split by the standard one.
     let text_len = standard_text_len(&body, &footer);
+    tracing::debug!(
+        chat_id = chat_id,
+        entry_id = %fetcher::entry_id(entry),
+        text_len = text_len,
+        allow_rich = opts.allow_rich,
+        rich_eligible = opts.allow_rich && should_try_rich_text(text_len),
+        "/push: text path decision"
+    );
     let mut rich_msg: Option<Message> = None;
     if opts.allow_rich && should_try_rich_text(text_len) {
         match try_send_rich_text(bot, chat_id, &body, &footer).await {
@@ -1321,6 +1329,18 @@ pub async fn send_entry_with_media(
         .collect();
     let rich_media_count = album_media.len() + docs.len();
     let full_text_len = visible_len(&full_caption);
+    tracing::debug!(
+        chat_id = chat_id,
+        entry_id = %fetcher::entry_id(entry),
+        text_len = full_text_len,
+        media_count = rich_media_count,
+        document_count = docs.len(),
+        gif_count = gifs.len(),
+        retweet_images = rt_photos.len(),
+        allow_rich = opts.allow_rich,
+        rich_eligible = opts.allow_rich && should_try_rich_media(full_text_len, rich_media_count),
+        "/push: media path decision"
+    );
     if opts.allow_rich && should_try_rich_media(full_text_len, rich_media_count) {
         match try_send_rich_media(
             bot,
