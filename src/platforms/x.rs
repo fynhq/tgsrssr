@@ -13,7 +13,7 @@
 //! embedded as `<img>`/`<video>` tags in the content body, so the existing
 //! media extraction / rendering pipeline works unchanged.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -674,6 +674,10 @@ async fn fetch_user_tweets(
     // Pages actually fetched this round (drives the inter-page pause so the
     // first page — and a fully cached short timeline — stays request-cheap).
     let mut pages_fetched = 0usize;
+    // Instruction types this parser does not understand, aggregated across
+    // pages. They may carry tweets (e.g. a future module instruction); a warn
+    // makes such a shape change visible instead of silently returning empty.
+    let mut unhandled_instructions: BTreeMap<String, usize> = BTreeMap::new();
 
     for _page in 0..MAX_TIMELINE_PAGES {
         if pages_fetched > 0 {
@@ -728,6 +732,9 @@ async fn fetch_user_tweets(
         }
 
         let page = extract_timeline_page(instructions);
+        for (kind, count) in &page.unhandled_instructions {
+            *unhandled_instructions.entry(kind.clone()).or_default() += count;
+        }
         total_non_cursor_entries += page.non_cursor_entries;
         let page_tweet_count = page.tweets.len();
         tweets.extend(page.tweets);
@@ -747,6 +754,16 @@ async fn fetch_user_tweets(
             break;
         }
         cursor = Some(next);
+    }
+
+    if !unhandled_instructions.is_empty() {
+        let item_count: usize = unhandled_instructions.values().copied().sum();
+        tracing::warn!(
+            screen_name = screen_name,
+            instruction_types = ?unhandled_instructions,
+            item_count = item_count,
+            "X timeline contains unhandled instruction types; some tweets may be skipped"
+        );
     }
 
     // instructions existed and non-cursor entries exist, yet not a single
@@ -776,6 +793,10 @@ struct TimelinePage {
     tweets: Vec<Value>,
     non_cursor_entries: usize,
     bottom_cursor: Option<String>,
+    /// Instruction types this parser does not understand, with the number of
+    /// entries/module items they carried. `fetch_user_tweets` aggregates these
+    /// and warns once per round so a timeline redesign is not silent.
+    unhandled_instructions: Vec<(String, usize)>,
 }
 
 /// Extract tweet objects and the pagination cursor from GraphQL timeline
@@ -784,6 +805,7 @@ fn extract_timeline_page(instructions: &Value) -> TimelinePage {
     let mut tweets = Vec::new();
     let mut non_cursor_entries = 0usize;
     let mut bottom_cursor: Option<String> = None;
+    let mut unhandled_instructions: Vec<(String, usize)> = Vec::new();
     let empty_instructions = Vec::new();
     for instr in instructions.as_array().unwrap_or(&empty_instructions) {
         let instr_type = instr["type"].as_str().unwrap_or("");
@@ -832,12 +854,30 @@ fn extract_timeline_page(instructions: &Value) -> TimelinePage {
                     collect_tweet_results(entry, &mut tweets);
                 }
             }
+            continue;
+        }
+        // Unhandled instruction type. `TimelineClearCache` is a harmless
+        // cache hint and pinned entries are deliberately ignored (above), so
+        // neither is reported. Any other type carrying entries/module items
+        // could hide tweets after an X timeline redesign; record it so
+        // fetch_user_tweets can warn instead of silently returning empty.
+        if !matches!(
+            instr_type,
+            "TimelineClearCache" | "TimelinePinEntry" | "TimelinePinnedEntry"
+        ) {
+            let count = instr["entries"].as_array().map_or(0, Vec::len)
+                + usize::from(instr["entry"].is_object())
+                + instr["moduleItems"].as_array().map_or(0, Vec::len);
+            if count > 0 {
+                unhandled_instructions.push((instr_type.to_string(), count));
+            }
         }
     }
     TimelinePage {
         tweets,
         non_cursor_entries,
         bottom_cursor,
+        unhandled_instructions,
     }
 }
 
@@ -1650,6 +1690,38 @@ mod tests {
     }
 
     #[test]
+    fn extract_timeline_page_reports_unhandled_instruction_types() {
+        // A future timeline redesign may move tweets into a new instruction
+        // type. Known ones (AddEntries/AddEntry/SuggestCursor) are parsed and
+        // pin/cache instructions are deliberately ignored; anything else that
+        // carries entries or module items must be surfaced via the warn path.
+        let instructions = serde_json::json!([
+            {"type": "TimelineAddEntries", "entries": [
+                {"entryId": "tweet-1", "content": {"itemContent": {"tweet_results": {"result":
+                    {"rest_id": "1", "legacy": {"id_str": "1"}}}}}}
+            ]},
+            {"type": "TimelineAddToModule", "moduleItems": [{"item": {}}]},
+            {"type": "TimelineReplaceEntry", "entry": {"entryId": "tweet-2"}},
+            {"type": "TimelinePinEntry", "entry": {
+                "entryId": "pin-1",
+                "content": {"itemContent": {"tweet_results": {"result":
+                    {"rest_id": "2", "legacy": {"id_str": "2"}}}}}
+            }},
+            {"type": "TimelineClearCache"}
+        ]);
+        let page = extract_timeline_page(&instructions);
+        assert_eq!(page.tweets.len(), 1);
+        assert_eq!(page.non_cursor_entries, 1);
+        assert_eq!(
+            page.unhandled_instructions,
+            vec![
+                ("TimelineAddToModule".to_string(), 1),
+                ("TimelineReplaceEntry".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
     fn tweet_to_entry_classifies_reply_as_expected_skip() {
         // Replies must NOT be reported as conversion failures (dropped):
         // they are an expected skip counted separately.
@@ -1868,6 +1940,140 @@ mod tests {
             body.contains(r#"<a href="https://x.com/note_mention">@note_mention</a>"#),
             "note-tweet mention not linked: {body}"
         );
+    }
+
+    #[test]
+    fn tweet_to_entry_links_note_tweet_mentions() {
+        // Main-tweet path of the note-tweet mention fix (the regression above
+        // covers the RT path).
+        let legacy_text = "x".repeat(300);
+        let note_text = format!("{legacy_text} cc @note_mention here.");
+        let tweet: Value = serde_json::json!({
+            "rest_id": "1002",
+            "legacy": {
+                "id_str": "1002",
+                "full_text": legacy_text,
+                "entities": {
+                    "user_mentions": [],
+                    "media": []
+                }
+            },
+            "note_tweet": {
+                "note_tweet_results": {
+                    "result": {
+                        "text": note_text,
+                        "entity_set": {
+                            "urls": [],
+                            "user_mentions": [{"screen_name": "note_mention"}]
+                        }
+                    }
+                }
+            },
+            "core": {
+                "user_results": {
+                    "result": {
+                        "core": { "screen_name": "note_author" }
+                    }
+                }
+            }
+        });
+        let ConvertOutcome::Ok(entry) =
+            tweet_to_entry(&tweet, "note_author", "Note Author", Lang::En)
+        else {
+            panic!("note tweet should convert");
+        };
+        let body = entry
+            .content
+            .as_ref()
+            .and_then(|c| c.body.as_deref())
+            .unwrap_or_default();
+        assert!(
+            body.contains(r#"<a href="https://x.com/note_mention">@note_mention</a>"#),
+            "note-tweet mention not linked: {body}"
+        );
+    }
+
+    #[test]
+    fn tweet_to_entry_renders_top_level_quoted_tweet() {
+        // Current X shape: the quoted tweet lives at tweet.quoted_status_result,
+        // not under legacy. Locks in the top-level path used by tweet_to_entry.
+        let tweet: Value = serde_json::json!({
+            "rest_id": "2001",
+            "legacy": {
+                "id_str": "2001",
+                "full_text": "my comment",
+                "entities": {
+                    "user_mentions": [],
+                    "media": []
+                },
+                "is_quote_status": true,
+                "quoted_status_id_str": "2002"
+            },
+            "quoted_status_result": {
+                "result": {
+                    "__typename": "Tweet",
+                    "rest_id": "2002",
+                    "legacy": {
+                        "id_str": "2002",
+                        "full_text": "quoted text",
+                        "entities": {
+                            "user_mentions": [],
+                            "media": []
+                        }
+                    },
+                    "core": {
+                        "user_results": {
+                            "result": {
+                                "__typename": "User",
+                                "core": { "screen_name": "quoted_user" }
+                            }
+                        }
+                    }
+                }
+            },
+            "core": {
+                "user_results": {
+                    "result": {
+                        "core": { "screen_name": "outer_user" }
+                    }
+                }
+            }
+        });
+        let ConvertOutcome::Ok(entry) = tweet_to_entry(&tweet, "outer_user", "Outer", Lang::En)
+        else {
+            panic!("quote tweet should convert");
+        };
+        let body = entry
+            .content
+            .as_ref()
+            .and_then(|c| c.body.as_deref())
+            .unwrap_or_default();
+        assert!(body.contains("<blockquote>QT "), "quote block missing: {body}");
+        assert!(
+            body.contains(
+                r#"<a href="https://x.com/quoted_user/status/2002">@quoted_user</a>"#
+            ),
+            "quote author link missing: {body}"
+        );
+        assert!(body.contains("quoted text"), "quoted text missing: {body}");
+    }
+
+    #[test]
+    fn extract_screen_name_reads_core_user_results_core_path() {
+        // Current X shape: core.screen_name is absent; the author handle is at
+        // core.user_results.result.core.screen_name.
+        let tweet: Value = serde_json::json!({
+            "core": {
+                "user_results": {
+                    "result": {
+                        "__typename": "User",
+                        "core": { "screen_name": "alice" }
+                    }
+                }
+            },
+            "legacy": {}
+        });
+        assert_eq!(extract_screen_name(&tweet), "alice");
     }
 
     #[test]
