@@ -1008,7 +1008,9 @@ fn append_media_tags(body: &mut String, legacy: &Value) {
 // ---------------------------------------------------------------------------
 
 /// Extract @mention screen names from a tweet's entities.
-/// Checks both legacy.entities.user_mentions and note_tweet entity_set.mentions.
+/// Checks both legacy.entities.user_mentions and the note-tweet entity_set.
+/// X names the note-tweet list `user_mentions` (same key as legacy entities);
+/// `mentions` is accepted as a defensive alias for alternate response shapes.
 fn extract_mention_names(result: &Value) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     // legacy.entities.user_mentions
@@ -1021,8 +1023,15 @@ fn extract_mention_names(result: &Value) -> Vec<String> {
             }
         }
     }
-    // note_tweet entity_set.mentions (may have additional mentions)
-    if let Some(arr) = result["note_tweet"]["note_tweet_results"]["result"]["entity_set"]["mentions"].as_array() {
+    // note_tweet entity_set.user_mentions (may have additional mentions).
+    // Note tweets truncate legacy.full_text/entities, so mentions beyond the
+    // truncated prefix only exist here; reading a non-existent `mentions` key
+    // dropped every @link in long tweets.
+    let note_entities = &result["note_tweet"]["note_tweet_results"]["result"]["entity_set"];
+    let note_mentions = note_entities["user_mentions"]
+        .as_array()
+        .or_else(|| note_entities["mentions"].as_array());
+    if let Some(arr) = note_mentions {
         for m in arr {
             if let Some(s) = m["screen_name"].as_str() {
                 if !s.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(s)) {
@@ -1786,7 +1795,7 @@ mod tests {
                 "note_tweet_results": {
                     "result": {
                         "entity_set": {
-                            "mentions": [
+                            "user_mentions": [
                                 {"screen_name": "Alice"},
                                 {"screen_name": "carol"}
                             ]
@@ -1798,6 +1807,67 @@ mod tests {
         let names = extract_mention_names(&json);
         // "Alice" is a case-insensitive duplicate of "alice" and must not be added.
         assert_eq!(names, vec!["alice".to_string(), "carol".to_string()]);
+    }
+
+    #[test]
+    fn extract_mention_names_note_tweet_mentions_alias() {
+        // Defensive fallback for an alternate note-tweet entity shape.
+        let json: Value = serde_json::json!({
+            "note_tweet": {
+                "note_tweet_results": {
+                    "result": {
+                        "entity_set": {
+                            "mentions": [{"screen_name": "dave"}]
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(extract_mention_names(&json), vec!["dave".to_string()]);
+    }
+
+    #[test]
+    fn append_quote_block_links_note_tweet_mentions() {
+        // Regression: a retweeted note tweet keeps legacy.full_text truncated
+        // and legacy mentions empty; the mention only exists in the note
+        // entity_set.user_mentions list and must still be hyperlinked.
+        let legacy_text = "x".repeat(300);
+        let note_text = format!("{legacy_text} cc @note_mention here.");
+        let tweet: Value = serde_json::json!({
+            "rest_id": "1001",
+            "legacy": {
+                "id_str": "1001",
+                "full_text": legacy_text,
+                "entities": {
+                    "user_mentions": [],
+                    "media": []
+                }
+            },
+            "note_tweet": {
+                "note_tweet_results": {
+                    "result": {
+                        "text": note_text,
+                        "entity_set": {
+                            "urls": [],
+                            "user_mentions": [{"screen_name": "note_mention"}]
+                        }
+                    }
+                }
+            },
+            "core": {
+                "user_results": {
+                    "result": {
+                        "legacy": { "screen_name": "note_author" }
+                    }
+                }
+            }
+        });
+        let mut body = String::new();
+        append_quote_block(&mut body, &tweet, "RT");
+        assert!(
+            body.contains(r#"<a href="https://x.com/note_mention">@note_mention</a>"#),
+            "note-tweet mention not linked: {body}"
+        );
     }
 
     #[test]
