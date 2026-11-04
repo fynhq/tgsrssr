@@ -1,0 +1,262 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# Least privilege: default the GITHUB_TOKEN to read-only repo contents so jobs
+# that only build/test cannot write back to the repo. Jobs needing more scope
+# (release creation, image push) grant it explicitly at the job level below.
+permissions:
+  contents: read
+
+jobs:
+  # ===== CI gate (clippy + test) — blocks all downstream jobs =====
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag_ver="${GITHUB_REF_NAME#v}"
+          cargo_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$tag_ver" != "$cargo_ver" ]; then
+            echo "::error::Tag v${tag_ver} does not match Cargo.toml version ${cargo_ver}"
+            exit 1
+          fi
+
+      # Public-surface guard: the tree and the tag message must stay clean,
+      # and commit messages since the previous release tag are re-scanned so a
+      # tag pushed without its branch cannot bypass the branch-time check.
+      - name: Check public surface
+        shell: bash
+        run: |
+          set -eu
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            python3 .github/scripts/check_public_surface.py --tree --tag "$GITHUB_REF_NAME"
+            prev=$(git tag -l 'v*' --sort=-v:refname | sed -n '2p')
+          else
+            python3 .github/scripts/check_public_surface.py --tree
+            prev=$(git tag -l 'v*' --sort=-v:refname | sed -n '1p')
+          fi
+          if [ -n "$prev" ]; then
+            python3 .github/scripts/check_public_surface.py --range "$prev..$GITHUB_SHA"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
+  # ===== Create GitHub Release (title + notes from annotated tag message) =====
+  release:
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Extract tag message as release notes
+        id: notes
+        run: |
+          git fetch origin tag "${{ github.ref_name }}" --no-tags --force
+          {
+            echo "body<<RELEASE_EOF"
+            git tag -l --format='%(contents)' "${{ github.ref_name }}"
+            echo "RELEASE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: "tgsrssr ${{ github.ref_name }}"
+          body: ${{ steps.notes.outputs.body }}
+
+  # ===== Docker multi-arch image (linux/amd64 + linux/arm64) =====
+  docker:
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "ver=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            VERSION=${{ steps.version.outputs.ver }}
+
+  # ===== Static binaries (no Docker required for end users) =====
+  binary:
+    needs: [check, release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64-linux-musl
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64-linux-musl
+            cross: true
+          # Termux (Android 7+/API 24). Not a regular Android app.
+          - target: aarch64-linux-android
+            arch: aarch64-android
+            android: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl-tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
+
+      - name: Install cross (aarch64)
+        if: matrix.cross
+        run: cargo install cross
+
+      - name: Install cargo-ndk (android)
+        if: matrix.android
+        run: cargo install cargo-ndk --locked --version 4.1.2
+
+      # GitHub-hosted Ubuntu images ship the Android NDK; use the newest
+      # installed one instead of downloading ~700MB per run.
+      - name: Locate Android NDK
+        if: matrix.android
+        run: |
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          ndk="$(ls -d "$sdk"/ndk/* | sort -V | tail -n1)"
+          test -n "$ndk"
+          echo "Using NDK $ndk"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          if [ "${{ matrix.android }}" = "true" ]; then
+            # API 24 = Android 7 (Termux minimum); align LOAD segments for
+            # devices using 16 KB memory pages.
+            export RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+            cargo ndk -t arm64-v8a -P 24 build --release --locked
+          elif [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf tgsrssr-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz tgsrssr
+          echo "ASSET=tgsrssr-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz" >> "$GITHUB_ENV"
+
+      # Reject local user paths and verification trailers inside the packaged
+      # binary before it can reach the Release.
+      - name: Scan package surface
+        run: |
+          cd target/${{ matrix.target }}/release
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check_public_surface.py" --assets "$ASSET"
+
+      # Each leg only records its own checksum line; the checksums job merges
+      # them into one SHA256SUMS asset. The recorded path is the bare archive
+      # name, matching the Release asset.
+      - name: Generate checksum
+        run: |
+          cd target/${{ matrix.target }}/release
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          cat "$ASSET.sha256"
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: checksum-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/${{ env.ASSET }}.sha256
+          if-no-files-found: error
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: target/${{ matrix.target }}/release/${{ env.ASSET }}
+
+  # ===== Single SHA256SUMS asset merged from per-arch checksums =====
+  checksums:
+    needs: binary
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: checksum-*
+          path: checksums
+          merge-multiple: true
+
+      - name: Merge into SHA256SUMS
+        run: |
+          cd checksums
+          cat *.sha256 | LC_ALL=C sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload SHA256SUMS to Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: checksums/SHA256SUMS

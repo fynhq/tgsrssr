@@ -1,0 +1,9 @@
+.git
+target/*
+!target/release/
+target/release/*
+!target/release/tgsrssr
+data/
+media/
+logs/
+.env

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+
+# Least privilege: default the GITHUB_TOKEN to read-only repo contents.
+# No job here needs to write anything back to the repository.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # No tracked file is meant to be executable; a stray 100755 mode usually
+      # comes from copying files through a Windows/WSL filesystem.
+      - name: Check tracked file modes
+        run: |
+          bad=$(git ls-files -s | awk '$1 == "100755" { print $4 }')
+          if [ -n "$bad" ]; then
+            echo "::error::Tracked files must not have the executable bit:"
+            echo "$bad"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
+  # ---------------------------------------------------------------------------
+  # Public-surface guard: reject private-document references, local environment
+  # narration, verification trailers, and local paths in new commit messages
+  # and tracked files. It scans only the new range, so historical leaks do not
+  # make every push fail.
+  # ---------------------------------------------------------------------------
+  public-surface:
+    name: Public surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check public surface
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            before="${{ github.event.pull_request.base.sha }}"
+            after="${{ github.event.pull_request.head.sha }}"
+          else
+            before="${{ github.event.before }}"
+            after="${{ github.sha }}"
+          fi
+          if ! git cat-file -e "$before" 2>/dev/null; then
+            if git cat-file -e "$after^" 2>/dev/null; then
+              before="$after^"
+            else
+              before="$after"
+            fi
+          fi
+          python3 .github/scripts/check_public_surface.py --range "$before..$after" --tree

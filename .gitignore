@@ -1,0 +1,12 @@
+/target
+/data
+/media
+/logs
+# Local fast-rebuild helpers: kept on disk for local deployments, not published.
+/Dockerfile.base
+/Dockerfile.prebuilt
+# compose.yaml holds secrets (token); see compose.example.yaml for the template
+compose.yaml
+*.db
+*.db-wal
+*.db-shm
