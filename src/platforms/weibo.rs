@@ -20,7 +20,7 @@ use anyhow::Context;
 use chrono::{DateTime, Datelike, Utc};
 use feed_rs::model::Entry;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::i18n::{self, Lang};
 use crate::state::AppState;
@@ -411,9 +411,19 @@ fn patch_pics(mblog: &mut Value, detail: &Value) {
 /// Shared request skeleton for weibo JSON APIs (M4 fix: fetch_vote_object
 /// and fetch_status_show each used to write the request → status check →
 /// JSON parse → warn template once, ~30 lines matched line by line).
-/// Returns the parsed JSON Value; any failure returns None and leaves a warn log.
+/// Returns the parsed JSON Value; any failure returns None and leaves a log
+/// (warn when `warn_on_failure`, debug otherwise — used by best-effort tiers
+/// that have a fallback attempt following).
 /// `ua` distinguishes desktop (BROWSER_UA) from mobile (MOBILE_BROWSER_UA).
-async fn get_weibo_json(state: &AppState, api: &str, cookies: &str, referer: &str, ua: &str, ctx: &str) -> Option<Value> {
+async fn get_weibo_json(
+    state: &AppState,
+    api: &str,
+    cookies: &str,
+    referer: &str,
+    ua: &str,
+    ctx: &str,
+    warn_on_failure: bool,
+) -> Option<Value> {
     // Manual redirects (≤5) with per-hop SSRF checks; credentials are dropped
     // if the hop crosses to another host:port (api_get enforces both).
     let resp = match crate::platforms::api_get(
@@ -431,18 +441,30 @@ async fn get_weibo_json(state: &AppState, api: &str, cookies: &str, referer: &st
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(ctx = ctx, error = %e, "weibo json request failed");
+            if warn_on_failure {
+                warn!(ctx = ctx, error = %e, "weibo json request failed");
+            } else {
+                debug!(ctx = ctx, error = %e, "weibo json request failed");
+            }
             return None;
         }
     };
     if !resp.status().is_success() {
-        warn!(ctx = ctx, status = %resp.status(), "weibo json non-success HTTP status");
+        if warn_on_failure {
+            warn!(ctx = ctx, status = %resp.status(), "weibo json non-success HTTP status");
+        } else {
+            debug!(ctx = ctx, status = %resp.status(), "weibo json non-success HTTP status");
+        }
         return None;
     }
     match crate::fetcher::read_json_capped(resp, ctx).await {
         Ok(j) => Some(j),
         Err(e) => {
-            warn!(ctx = ctx, error = %e, "weibo json parse failed");
+            if warn_on_failure {
+                warn!(ctx = ctx, error = %e, "weibo json parse failed");
+            } else {
+                debug!(ctx = ctx, error = %e, "weibo json parse failed");
+            }
             None
         }
     }
@@ -451,8 +473,10 @@ async fn get_weibo_json(state: &AppState, api: &str, cookies: &str, referer: &st
 /// Fetch vote details for a status via the desktop ajax API.
 /// The mobile getIndex API only carries `is_vote: 1`; the full vote object
 /// (question, options, multi-select flag, expiry) lives in the desktop
-/// endpoint's `page_info.card_info.vote_object`. Returns None on failure
-/// (the entry is still pushed as text, just without a poll).
+/// endpoint's `page_info.card_info.vote_object`. Two tiers, matching the HD
+/// playback lookup's cookie strategy: the cached visitor identity first (no
+/// login-state exposure), then the configured user cookie. Returns None when
+/// both tiers fail (the entry is still pushed as text, just without a poll).
 /// A weibo status mid is always alphanumeric; anything else (empty, or a
 /// value carrying URL/query punctuation) would corrupt the `?id={mid}` query
 /// it is spliced into, so both detail fetchers reject it up front. Mirrors the
@@ -468,33 +492,75 @@ async fn fetch_vote_object(state: &AppState, cookies: &str, mid: &str) -> Option
         return None;
     }
     let api = format!("https://weibo.com/ajax/statuses/show?id={}", mid);
-    let ctx = format!("fetch_vote_object mid={}", mid);
-    let json = get_weibo_json(state, &api, cookies, "https://weibo.com/", crate::state::BROWSER_UA, &ctx).await?;
-    let vo = json["page_info"]["card_info"]["vote_object"].clone();
-    if vo.is_null() {
-        warn!(mid = %mid, "fetch_vote_object: vote_object not found in response (page_info.card_info.vote_object is null)");
-        return None;
+
+    // Visitor attempts are best-effort (debug logs on failure); the user
+    // cookie attempt is the final tier and keeps the warn-level diagnostics.
+    let visitor = crate::media::weibo_visitor_cookie(state).await;
+    let mut attempts: Vec<(&str, &str, bool)> = Vec::new();
+    if let Some(visitor) = visitor.as_deref() {
+        attempts.push(("visitor", visitor, false));
     }
-    // At least a question and 2 valid options are needed to justify converting to a poll
-    let has_question = vo["content"].as_str().map(|s| !s.is_empty()).unwrap_or(false);
-    let option_count = vo["vote_list"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter(|v| v["content"].as_str().map(|s| !s.is_empty()).unwrap_or(false))
-                .count()
-        })
-        .unwrap_or(0);
-    if !has_question || option_count < 2 {
-        warn!(
-            mid = %mid,
-            has_question = has_question,
-            option_count = option_count,
-            "fetch_vote_object: vote_object incomplete (missing question or <2 options)"
-        );
-        return None;
+    if !cookies.trim().is_empty() {
+        attempts.push(("user", cookies, true));
     }
-    Some(vo)
+
+    for (tier, cookie, warn_on_failure) in attempts {
+        let ctx = format!("fetch_vote_object mid={} via={}", mid, tier);
+        let Some(json) = get_weibo_json(
+            state,
+            &api,
+            cookie,
+            "https://weibo.com/",
+            crate::state::BROWSER_UA,
+            &ctx,
+            warn_on_failure,
+        )
+        .await
+        else {
+            continue;
+        };
+        let vo = json["page_info"]["card_info"]["vote_object"].clone();
+        if vo.is_null() {
+            if warn_on_failure {
+                warn!(mid = %mid, via = tier, "fetch_vote_object: vote_object not found in response (page_info.card_info.vote_object is null)");
+            } else {
+                debug!(mid = %mid, via = tier, "fetch_vote_object: no vote_object in visitor response, trying user cookie");
+            }
+            continue;
+        }
+        // At least a question and 2 valid options are needed to justify converting to a poll
+        let has_question = vo["content"].as_str().map(|s| !s.is_empty()).unwrap_or(false);
+        let option_count = vo["vote_list"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|v| v["content"].as_str().map(|s| !s.is_empty()).unwrap_or(false))
+                    .count()
+            })
+            .unwrap_or(0);
+        if !has_question || option_count < 2 {
+            if warn_on_failure {
+                warn!(
+                    mid = %mid,
+                    via = tier,
+                    has_question = has_question,
+                    option_count = option_count,
+                    "fetch_vote_object: vote_object incomplete (missing question or <2 options)"
+                );
+            } else {
+                debug!(
+                    mid = %mid,
+                    via = tier,
+                    has_question = has_question,
+                    option_count = option_count,
+                    "fetch_vote_object: vote_object incomplete in visitor response, trying user cookie"
+                );
+            }
+            continue;
+        }
+        return Some(vo);
+    }
+    None
 }
 
 /// Fetch one status's full data via statuses/show API (used for long text
@@ -511,7 +577,16 @@ async fn fetch_status_show(state: &AppState, cookies: &str, mid: &str) -> Option
     }
     let api = format!("https://m.weibo.cn/statuses/show?id={}", mid);
     let ctx = format!("statuses/show mid={}", mid);
-    let json = get_weibo_json(state, &api, cookies, "https://m.weibo.cn/", crate::state::MOBILE_BROWSER_UA, &ctx).await?;
+    let json = get_weibo_json(
+        state,
+        &api,
+        cookies,
+        "https://m.weibo.cn/",
+        crate::state::MOBILE_BROWSER_UA,
+        &ctx,
+        true,
+    )
+    .await?;
     if json.get("ok").and_then(|v| v.as_i64()) != Some(1) {
         warn!(mid = %mid, msg = %json["msg"].as_str().unwrap_or(""), "statuses/show ok!=1, falling back to list data");
         return None;

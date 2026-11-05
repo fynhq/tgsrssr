@@ -399,8 +399,9 @@ async fn upgrade_weibo_video_hd(
     url.to_string()
 }
 
-/// Weibo visitor cookie (genvisitor/incarnate self-issued guest identity),
-/// used to fetch playback_list from the desktop video API without login.
+/// Weibo visitor cookie (genvisitor/incarnate self-issued guest identity).
+/// Used to query the desktop API without login: HD playback_list and vote
+/// details (`page_info.card_info.vote_object`).
 /// Same mechanism as yt-dlp WeiboBaseIE._update_visitor_cookies:
 ///   1) POST passport.weibo.com/visitor/genvisitor with a browser fingerprint
 ///      → get a tid;
@@ -410,7 +411,7 @@ async fn upgrade_weibo_video_hd(
 /// In-memory cache with 1h TTL (the visitor identity's validity far exceeds
 /// 1h, but refresh conservatively to avoid risk control).
 /// Returns None on failure (silent; does not affect the main flow).
-async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
+pub(crate) async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
     const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
     // Cache hit
