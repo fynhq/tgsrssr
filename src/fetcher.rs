@@ -35,6 +35,24 @@ static RE_SOURCE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?is)<source\b[^>]*>").unwrap());
 static RE_VIDEO_FALLBACK_TEXT: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"视频无法显示[，,]?\s*请前往.*?观看[。.]?").unwrap());
+/// Non-rendered elements whose text is source code, not content: `<style>`
+/// CSS and `<script>` JS. Some feeds (e.g. Bear Blog) inline per-post style
+/// blocks; plain tag stripping used to leave the CSS in the visible message
+/// and in the 140-char summary.
+/// A complete block is removed as a whole; an unterminated block is removed to
+/// the end of the input (mirroring HTML parsing), because `entry_summary` cuts
+/// the raw body at 256KB and can drop the closing tag. The open-tag tail
+/// excludes a trailing `/` so a self-closing `<style/>` falls through to the
+/// ordinary tag strip instead of swallowing the rest of the body.
+static RE_NON_RENDERED_BLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"(?is)<style\b[^>]*>.*?</style\s*>",
+        r"|<script\b[^>]*>.*?</script\s*>",
+        r"|<style\b(?:[^>]*[^/])?\s*>.*",
+        r"|<script\b(?:[^>]*[^/])?\s*>.*",
+    ))
+    .unwrap()
+});
 static RE_WEIBO_VIDEO_CARD_TEXT: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[\w\u4e00-\u9fff]+的微博视频").unwrap());
 pub static RE_BR: LazyLock<regex::Regex> =
@@ -628,9 +646,13 @@ pub(crate) fn entry_body_html_from_source(
     crate::htmltext::escape_html(&truncate_text(plain.trim(), max))
 }
 
-/// Strip all HTML tags.
+/// Strip all HTML tags, dropping non-rendered element contents first
+/// (`<style>` CSS, `<script>` JS). Visible-length checks, plain-text
+/// fallbacks and title/label extraction all funnel through here, so that
+/// source text never reaches the message.
 pub fn strip_tags(s: &str) -> String {
-    RE_TAG.replace_all(s, "").to_string()
+    let s = RE_NON_RENDERED_BLOCK.replace_all(s, "");
+    RE_TAG.replace_all(&s, "").to_string()
 }
 
 /// Collapse runs of 3+ newlines down to 2.
@@ -945,6 +967,59 @@ mod tests {
         assert_eq!(title, "Head Body");
         let cells = html_to_plain("<table><tr><td>A</td><td>B</td></tr></table>");
         assert_eq!(cells, "A B");
+    }
+
+    #[test]
+    fn non_rendered_style_and_script_blocks_do_not_leak_source() {
+        // Bear Blog inlines a dark-mode <style> block before each image group.
+        // Only the tags used to be stripped, so the CSS stayed in the visible
+        // text and filled the latter part of the 140-char summary.
+        let html = concat!(
+            "<p>第一段正文。</p>",
+            "<style>\n",
+            "    @media (prefers-color-scheme: dark) {\n",
+            "        .#img-group-x .desc-text { color: rgba(255, 255, 255, 0.7); }\n",
+            "    }\n",
+            "</style>",
+            "<p>第二段正文。</p>",
+            "<script>var x = 1 < 2;</script>",
+            "<p>第三段正文。</p>",
+        );
+        let out = html_to_telegram_html(html);
+        assert!(out.contains("第一段正文。"), "out: {out}");
+        assert!(out.contains("第二段正文。"), "out: {out}");
+        assert!(out.contains("第三段正文。"), "out: {out}");
+        assert!(!out.contains("@media"), "css leaked: {out}");
+        assert!(!out.contains("prefers-color-scheme"), "css leaked: {out}");
+        assert!(!out.contains("rgba("), "css leaked: {out}");
+        assert!(!out.contains("var x"), "js leaked: {out}");
+    }
+
+    #[test]
+    fn non_rendered_blocks_match_case_and_attributes() {
+        let html = r#"<STYLE type="text/css">.a{color:red}</STYLE><p>正文</p><script defer src="x.js">init()</script>"#;
+        let out = html_to_telegram_html(html);
+        assert_eq!(out, "正文");
+        assert_eq!(html_to_plain(html), "正文");
+    }
+
+    #[test]
+    fn unterminated_style_block_drops_to_end() {
+        // The summary path cuts the raw body at 256KB, which can remove the
+        // closing tag; the leftover CSS must still be dropped like HTML
+        // parsing does, not shown as body text.
+        let html = "<p>正文</p><style>@media (prefers-color-scheme: dark) { .x { color: red; } }";
+        let out = html_to_telegram_html(html);
+        assert_eq!(out, "正文");
+        assert_eq!(html_to_plain(html), "正文");
+    }
+
+    #[test]
+    fn self_closing_style_tag_does_not_swallow_body() {
+        let html = "<style/><p>正文</p><script src=\"x.js\"/><p>结尾</p>";
+        let out = html_to_telegram_html(html);
+        assert!(out.contains("正文"), "body lost: {out}");
+        assert!(out.contains("结尾"), "tail lost: {out}");
     }
 
     #[test]

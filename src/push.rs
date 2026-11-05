@@ -2753,6 +2753,31 @@ mod tests {
     }
 
     #[test]
+    fn entry_summary_skips_inline_style_source() {
+        // Bear Blog shape (blog.solazy.me): two short paragraphs, then an
+        // inline dark-mode <style> block before the image group. The CSS used
+        // to start around the 79th visible character, so it filled the latter
+        // part of the 140-char summary as apparent source code.
+        let body = concat!(
+            "<p>这周又来长沙出差了。新的工作应该会经常来长沙。巧的是，长沙确实是我非常喜欢的城市。</p>\n",
+            "<p>周一上午落地后第一顿就吃了衡东菜，虽说一人食，但也是点了三个菜。</p>\n",
+            "<style>\n",
+            "    @media (prefers-color-scheme: dark) {\n",
+            "        .#img-group-hesq8 .desc-text { color: rgba(255, 255, 255, 0.7) !important; }\n",
+            "    }\n",
+            "    .dark-preview-mode .#img-group-hesq8 .desc-text { color: rgba(255, 255, 255, 0.7) !important; }\n",
+            "</style>\n",
+            "<div id=\"img-group-hesq8\"><img src=\"https://example.com/a.jpg\"><p>▲ 图片说明</p></div>",
+        );
+        let summary = entry_summary(&rss_entry_with_body(body), 140, None);
+        assert!(!summary.contains("@media"), "css leaked into summary: {summary}");
+        assert!(!summary.contains("prefers-color-scheme"), "css leaked into summary: {summary}");
+        assert!(!summary.contains("rgba("), "css leaked into summary: {summary}");
+        assert!(summary.contains("这周又来长沙出差了"), "lead lost: {summary}");
+        assert!(summary.contains("衡东菜"), "second paragraph lost: {summary}");
+    }
+
+    #[test]
     fn entry_summary_closes_anchor_when_cut_inside_link() {
         // Truncation inside the anchor text must re-close <a> so the summary
         // stays valid Telegram HTML, with the ellipsis outside the link.
