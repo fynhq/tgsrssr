@@ -15,6 +15,20 @@ pub mod unsub;
 /// Items per page for the channel list and the per-channel source list.
 const PAGE_SIZE: usize = 10;
 
+/// Telegram callback-query toasts are limited to 200 characters; a long
+/// database error chain would otherwise make the toast itself fail and leave
+/// the user with no feedback at all.
+fn toast_text(text: String) -> String {
+    const MAX: usize = 200;
+    if crate::htmltext::utf16_len(&text) <= MAX {
+        return text;
+    }
+    format!(
+        "{}…",
+        crate::htmltext::take_utf16_prefix(&text, MAX.saturating_sub(1))
+    )
+}
+
 /// Resolve a user's language for a callback flow: explicit DB preference
 /// first, then the Telegram client `language_code`, then English. Shared by
 /// every callback entry point so fallback behaviour matches the command path
@@ -343,7 +357,23 @@ pub async fn handle_callback(
         }
     };
     if let Some(gcid) = &guard_chat_id {
-        let allowed = db::can_manage_chat(&state.db, user_id, gcid).await.unwrap_or(false);
+        let allowed = match db::can_manage_chat(&state.db, user_id, gcid).await {
+            Ok(v) => v,
+            Err(e) => {
+                // A DB failure is not a permission denial: keep the failure
+                // closed, but leave the error chain in the log and tell the
+                // user to retry instead of claiming they lack permission.
+                tracing::warn!(
+                    user_id = user_id,
+                    op = %parts.get(1).copied().unwrap_or("?"),
+                    target_chat = %gcid,
+                    error = %e,
+                    "ownership guard: permission lookup failed, rejecting (fail-closed)"
+                );
+                bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed_retry")).await.ok();
+                return Ok(());
+            }
+        };
         if !allowed {
             // callback data comes from the client and chat_id/sub_id can be enumerated and forged;
             // rejection events are a key signal for security auditing and must be logged.
@@ -582,7 +612,7 @@ pub async fn handle_callback(
                         render_channel_page(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
                     }
                     Err(e) => {
-                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                        bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "op_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
                     }
                 }
             }
@@ -637,13 +667,24 @@ pub async fn handle_callback(
                 let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
                 let active = parts[1] == "srcresume";
-                match db::set_subscription_active(&state.db, id, active).await {
-                    Ok(_) => {
+                // Fail closed when the guard could not resolve an owner (the
+                // subscription did not exist at guard time). The update also
+                // carries chat_id, so an id recreated between the guard SELECT
+                // and this UPDATE cannot be toggled.
+                let Some(expected_chat) = guard_chat_id.as_deref() else {
+                    bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "sub_not_found")).await.ok();
+                    return Ok(());
+                };
+                match db::set_subscription_active(&state.db, id, expected_chat, active).await {
+                    Ok(true) => {
                         info!(sub_id = id, active = active, "subscription active toggled");
                         render_feed_page_impl(&bot, PageTarget::Edit(&q), id, &state, ch_page, chlist_page, lang).await?;
                     }
+                    Ok(false) => {
+                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "sub_not_found")).await.ok();
+                    }
                     Err(e) => {
-                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                        bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "op_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
                     }
                 }
             }
@@ -1030,7 +1071,7 @@ pub(super) async fn fetch_sub_or_toast(
             None
         }
         Err(e) => {
-            bot.answer_callback_query(qid).text(i18n::t(lang, "op_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+            bot.answer_callback_query(qid).text(toast_text(i18n::t(lang, "op_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
             None
         }
     }
@@ -1055,27 +1096,23 @@ async fn start_pending_op(
     if html {
         req = req.parse_mode(ParseMode::Html);
     }
-    // Hold the pending_ops lock across the send so "send prompt + register op"
-    // is atomic. Otherwise a user who replies extremely fast (between the send
-    // completing and the map insert) would have their reply treated as an
-    // ordinary message, and the NEXT unrelated message would then be wrongly
-    // consumed as the pending op (rename/cookie). A concurrent reply now either
-    // runs before we acquire the lock (prompt not yet sent — correctly handled
-    // as a normal message) or after the insert (correctly consumed).
-    //
-    // Cross-user impact assessment: teloxide 0.17's Dispatcher uses the default
-    // distribution function `|upd| upd.chat().map(|c| c.id)`, and
-    // `Update::chat()` for `CallbackQuery` returns `q.message.chat()`. Same
-    // private chat → same worker queue → the user's callback and the user's
-    // reply are always handled sequentially by a single spawned task. So the
-    // race this lock protects against is already covered by same-chat
-    // serialization; the global lock's cross-await hold only ever briefly
-    // delays OTHER chats' handlers by one API roundtrip (send_message), never
-    // creates a correctness hazard. Acceptable tradeoff; documented rather
-    // than restructured (sharding the lock is out of scope: `pending_ops`
-    // lives in state.rs, off-limits to this change).
+    // Send the prompt BEFORE taking the global pending_ops lock. The lock must
+    // never be held across a network await: the Bot API client timeout is
+    // 600s, so one stalled send would freeze message handling for every chat.
+    // The "send + register" race is already covered by teloxide's same-chat
+    // serialization: a reply in this private chat cannot be dispatched until
+    // this callback handler returns. A reply therefore either arrives before
+    // the prompt exists (treated as a normal message) or after the insert
+    // (consumed correctly).
+    let prompt = match req.await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(chat_id = chat.0, user_id, error = %e, "pending-op prompt send failed");
+            bot.send_message(chat, i18n::t(lang, "op_failed_retry")).await.ok();
+            return Err(e);
+        }
+    };
     let mut ops = state.pending_ops.lock().await;
-    let prompt = req.await?;
     let old = ops.insert((chat.0, user_id), make_op(prompt.id.0));
     drop(ops);
     if let Some(old) = old {
@@ -1387,7 +1424,13 @@ async fn render_feed_page_impl(
         return Ok(());
     };
 
-    let cfg = db::get_effective_config(&state.db, &sub.chat_id, &sub.feed_url).await.ok();
+    let cfg = match db::get_effective_config(&state.db, &sub.chat_id, &sub.feed_url).await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(sub_id, error = %e, "feed page config read failed");
+            return deliver_error_page(bot, &target, lang, &format!("{:#}", e)).await;
+        }
+    };
 
     let name = sub.feed_title.as_deref().unwrap_or(&sub.feed_url);
     let status = if sub.active == 1 { i18n::t(lang, "feed_active") } else { i18n::t(lang, "feed_paused") };
@@ -1475,7 +1518,13 @@ async fn render_feed_page_impl(
 
     // Content filter button (shows status when active)
     {
-        let fc = db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await.unwrap_or_default();
+        let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await {
+            Ok(fc) => fc,
+            Err(e) => {
+                tracing::warn!(sub_id, error = %e, "feed filter read failed");
+                return deliver_error_page(bot, &target, lang, &format!("{:#}", e)).await;
+            }
+        };
         let label = if fc.is_active() {
             let mode_label = if fc.mode == "whitelist" { i18n::t(lang, "whitelist") } else { i18n::t(lang, "blacklist") };
             let kw_count = fc.keyword_list().len().to_string();

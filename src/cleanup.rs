@@ -214,9 +214,12 @@ pub async fn enforce_media_quota(
     // Protect recently written files: media files from a fetch cycle that is
     // still running have not entered the outbox yet (in-flight); quota
     // cleanup deletes oldest-first by mtime and could delete a file that was
-    // just downloaded and about to be sent. Skipping files modified within
-    // the last hour avoids this race.
-    let recent_cutoff = SystemTime::now() - Duration::from_secs(3600);
+    // just downloaded and about to be sent. The grace window should cover
+    // only the download→send handoff (outbox paths are protected separately),
+    // not an hour of unconstrained writes. 30 minutes covers the 600s Bot API
+    // timeout plus queueing for a large local-API upload; the pre-download
+    // byte budget is what actually prevents a full disk.
+    let recent_cutoff = SystemTime::now() - Duration::from_secs(1800);
 
     for _pass in 0..QUOTA_MAX_PASSES {
         if remaining <= max_bytes {

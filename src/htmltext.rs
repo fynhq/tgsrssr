@@ -77,10 +77,13 @@ fn find_balanced_close(
 // Length measurement (Telegram counts in UTF-16 code units)
 // ---------------------------------------------------------------------------
 
-/// Visible length of HTML text (tags stripped), in UTF-16 code units.
+/// Visible length of HTML text (tags stripped, entities decoded), in UTF-16
+/// code units. Telegram measures text after entities parsing, so `&amp;` is
+/// one unit, not five; using the decoded form keeps split/truncate/footer
+/// budgets on the same scale as the API limit.
 pub fn visible_len(html: &str) -> usize {
     let plain = RE_TAG.replace_all(html, "");
-    utf16_len(&plain)
+    utf16_len(&decode_entities(&plain))
 }
 
 /// Length in UTF-16 code units. Telegram measures message/caption limits
@@ -162,7 +165,15 @@ pub fn truncate_html_keep_links(html: &str, max_visible: usize) -> (String, bool
                 } else {
                     // Non-anchor markup, or an anchor nested inside a link:
                     // flatten to a space (never emit an unbalanced open).
+                    // The space is visible output, so it must consume budget;
+                    // otherwise the caller's max_visible guarantee is off by
+                    // one per flattened tag.
+                    if visible >= max_visible {
+                        truncated = has_visible_content(&rest[gt + 1..]);
+                        break;
+                    }
                     out.push(' ');
+                    visible += 1;
                 }
                 let after = gt + 1;
                 i += after;
@@ -1316,6 +1327,16 @@ mod tests {
         assert_eq!(visible_len("<b>hello</b>"), 5);
         assert_eq!(visible_len(r#"<a href="https://example.com">链接</a>"#), 2);
         assert_eq!(visible_len("😎"), 2);
+    }
+
+    #[test]
+    fn visible_len_decodes_entities_like_telegram() {
+        // Telegram counts the parsed text: an entity reference is one unit.
+        assert_eq!(visible_len("a &amp; b"), 5);
+        assert_eq!(visible_len("&amp;"), 1);
+        assert_eq!(visible_len("&#39;"), 1);
+        assert_eq!(visible_len("&nbsp;"), 1);
+        assert_eq!(visible_len("&amp;lt;"), 4);
     }
 
     // ===== escape_html =====

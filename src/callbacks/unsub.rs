@@ -7,7 +7,7 @@ use teloxide::prelude::*;
 use teloxide::types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use tracing::{info, warn};
 
-use super::{deliver, deliver_error_page, fetch_sub_or_toast, nav_row, paginate, PageTarget};
+use super::{deliver, deliver_error_page, fetch_sub_or_toast, nav_row, paginate, toast_text, PageTarget};
 use crate::push::no_preview;
 use crate::db;
 use crate::i18n::{self, Lang};
@@ -41,7 +41,7 @@ pub(super) async fn handle_unsub_callback(
     let chat_id = sub.chat_id.clone();
 
     if let Err(e) = db::delete_subscription(&state.db, sub_id).await {
-        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1)).await.ok();
+        bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1))).await.ok();
         return Ok(());
     }
 
@@ -198,6 +198,24 @@ pub(super) async fn render_unsub_all_confirm(
     Ok(())
 }
 
+/// In-memory per-message lock for the unsub-all confirmation. Unlike the old
+/// message-text lock, it does not survive a process restart, so a click after
+/// a crash can still complete the operation.
+struct UnsubAllGuard<'a> {
+    state: &'a AppState,
+    key: (i64, i32),
+}
+
+impl Drop for UnsubAllGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .unsuball_inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.key);
+    }
+}
+
 /// Handle unsub_all callback: delete every subscription, then send a text
 /// notice (the former OPML file backup was removed by product decision).
 #[allow(clippy::too_many_arguments)]
@@ -216,7 +234,7 @@ pub(super) async fn handle_unsub_all_callback(
     let subs = match db::get_subscriptions(&state.db, chat_id).await {
         Ok(s) => s,
         Err(e) => {
-            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1)).await.ok();
+            bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1))).await.ok();
             return Ok(());
         }
     };
@@ -226,36 +244,37 @@ pub(super) async fn handle_unsub_all_callback(
         return Ok(());
     }
 
-    // Idempotency protection: when the confirm button is double-tapped quickly, two callbacks
-    // run concurrently and would delete/send the result twice.
-    // On entry, edit the confirmation message to "Processing…" — Telegram rejects an edit whose
-    // text is unchanged, so the second callback's edit inevitably fails (message is not modified),
-    // which acts as the preemption.
-    // Placed after the subscription query: ensures early-exit paths like "no subscriptions" don't
-    // leave the message stuck at "Processing…".
+    // Idempotency protection: the in-memory (chat, message) guard rejects a
+    // concurrent double-tap. The message edit below is only cosmetic feedback;
+    // a failure (message too old, network error, or already "Processing…" from
+    // a previous crashed run) must not abort the deletion.
+    let key = q
+        .message
+        .as_ref()
+        .map(|m| (m.chat().id.0, m.id().0))
+        .unwrap_or((0, 0));
+    let duplicate = {
+        let mut inflight = state
+            .unsuball_inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        !inflight.insert(key)
+    };
+    if duplicate {
+        bot.answer_callback_query(qid.clone())
+            .text(i18n::t(lang, "unsuball_dup"))
+            .await
+            .ok();
+        return Ok(());
+    }
+    let _inflight_guard = UnsubAllGuard { state, key };
+
     if let Some(m) = q.message.as_ref() {
-        match bot
+        if let Err(e) = bot
             .edit_message_text(m.chat().id, m.id(), i18n::t(lang, "unsuball_processing"))
             .await
         {
-            Ok(_) => {}
-            Err(e) => {
-                // Only a genuine "message is not modified" means another
-                // callback already preempted this one (double-tap). A transient
-                // network / Bot API error must NOT be mistaken for a duplicate —
-                // otherwise the unsuball silently aborts (neither unsubscribing
-                // nor restoring the page). On transient errors, propagate so the
-                // dispatcher can retry rather than reporting "already processing".
-                let is_not_modified = matches!(
-                    e,
-                    teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)
-                ) || e.to_string().contains("not modified");
-                if is_not_modified {
-                    bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "unsuball_dup")).await.ok();
-                    return Ok(());
-                }
-                return Err(e);
-            }
+            warn!(chat_id = %m.chat().id, error = %e, "unsuball: processing edit failed; continuing with deletion");
         }
     }
 
@@ -281,10 +300,16 @@ pub(super) async fn handle_unsub_all_callback(
                 error = format!("{:#}", e),
                 "failed to delete all subscriptions (transaction rolled back)"
             );
-            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1)).await.ok();
-            // Restore the confirmation page (the idempotency lock already
-            // changed the message to "Processing…").
-            render_unsub_all_confirm(bot, PageTarget::Edit(q), chat_id, state, page, ch_page, chlist_page, lang).await?;
+            bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1))).await.ok();
+            // Restore the confirmation page when possible. A failed restore
+            // must still leave the user with actionable feedback instead of a
+            // silent "Processing…" panel.
+            if let Err(render_err) =
+                render_unsub_all_confirm(bot, PageTarget::Edit(q), chat_id, state, page, ch_page, chlist_page, lang).await
+            {
+                warn!(chat_id = chat_id, error = %render_err, "unsuball: failed to restore confirmation page");
+                bot.send_message(target_chat, i18n::t(lang, "op_failed_retry")).await.ok();
+            }
             return Ok(());
         }
     };

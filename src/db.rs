@@ -1,7 +1,6 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -38,9 +37,19 @@ pub mod setting_key {
     pub fn platform_streak(platform: &str) -> String {
         format!("platform_streak:{}", platform)
     }
-    /// Media-only mode download-failure retry counter: `media_dl_fail:<chat_id>:<feed_url>:<entry_id>`
+    /// Media-only mode download-failure retry counter:
+    /// `media_dl_fail:<chat_id>:<feed_url_chars>:<feed_url>:<entry_id>`.
+    /// The length prefix prevents one source's prefix cleanup from deleting
+    /// another source's counter when one URL is a prefix of the other
+    /// (e.g. `http://h` vs `http://h:1200/x`).
     pub fn media_dl_fail(chat_id: &str, feed_url: &str, entry_id: &str) -> String {
-        format!("media_dl_fail:{}:{}:{}", chat_id, feed_url, entry_id)
+        format!(
+            "media_dl_fail:{}:{}:{}:{}",
+            chat_id,
+            feed_url.chars().count(),
+            feed_url,
+            entry_id
+        )
     }
     /// Per-feed auto-disable notification flag: `auto_disable_notified:<chat_id>:<feed_url>`
     /// Used for edge deduplication — when the same feed is disabled, later
@@ -175,6 +184,31 @@ pub(crate) fn restrict_permissions(path: &Path, is_dir: bool) {
     }
 }
 
+/// Normalize legacy Telegram entry ids (`<channel>/<msgid>`) to the new stable
+/// `<msgid>` form in the dedup/outbox tables. Idempotent; no schema change.
+/// Without this, upgrading would make every visible post look new and re-push
+/// the current window. Rows that collide with an existing new id are deleted.
+pub async fn normalize_telegram_entry_ids(db: &Db) -> anyhow::Result<u64> {
+    let mut moved = 0u64;
+    for table in ["sent_entries", "outbox", "sent_messages"] {
+        let update = format!(
+            "UPDATE OR IGNORE {table}
+             SET entry_id = substr(entry_id, instr(entry_id, '/') + 1)
+             WHERE (feed_url LIKE 'https://t.me/%' OR feed_url LIKE 'http://t.me/%')
+               AND instr(entry_id, '/') > 0"
+        );
+        let res = sqlx::query(sqlx::AssertSqlSafe(update)).execute(db).await?;
+        moved += res.rows_affected();
+        let cleanup = format!(
+            "DELETE FROM {table}
+             WHERE (feed_url LIKE 'https://t.me/%' OR feed_url LIKE 'http://t.me/%')
+               AND instr(entry_id, '/') > 0"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(cleanup)).execute(db).await?;
+    }
+    Ok(moved)
+}
+
 pub async fn connect(db_path: &Path) -> anyhow::Result<Db> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -182,7 +216,8 @@ pub async fn connect(db_path: &Path) -> anyhow::Result<Db> {
         restrict_permissions(parent, true);
     }
 
-    let options = SqliteConnectOptions::from_str(&db_path.to_string_lossy())?
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
@@ -705,7 +740,7 @@ pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
     // LIKE would treat them as wildcards and wrongly delete keys of adjacent
     // sources.
     sqlx::query(
-        "DELETE FROM settings WHERE instr(key, (SELECT 'media_dl_fail:' || chat_id || ':' || feed_url || ':' FROM subscriptions WHERE id = ?)) = 1",
+        "DELETE FROM settings WHERE instr(key, (SELECT 'media_dl_fail:' || chat_id || ':' || length(feed_url) || ':' || feed_url || ':' FROM subscriptions WHERE id = ?)) = 1",
     )
     .bind(sub_id)
     .execute(&mut *tx)
@@ -920,34 +955,53 @@ pub async fn get_effective_config(db: &Db, chat_id: &str, feed_url: &str) -> any
 /// failure could immediately re-trigger auto-disable — and because the
 /// notified flag was still set, that re-disable was silent (the user perceives
 /// the resume button as "not working"). Pausing leaves the counters untouched.
-pub async fn set_subscription_active(db: &Db, sub_id: i64, active: bool) -> anyhow::Result<()> {
+/// Returns false when the (id, chat_id) pair no longer exists. The chat_id
+/// condition closes the TOCTOU window between the callback ownership guard and
+/// this update: an id recreated for another chat can never be toggled here.
+pub async fn set_subscription_active(
+    db: &Db,
+    sub_id: i64,
+    chat_id: &str,
+    active: bool,
+) -> anyhow::Result<bool> {
     let mut tx = db.begin().await?;
     if active {
-        sqlx::query(
-            "UPDATE subscriptions SET active = 1, auto_disabled = 0, disabled_at = NULL, error_count = 0, last_error = NULL WHERE id = ?",
+        let res = sqlx::query(
+            "UPDATE subscriptions SET active = 1, auto_disabled = 0, disabled_at = NULL, error_count = 0, last_error = NULL WHERE id = ? AND chat_id = ?",
         )
         .bind(sub_id)
+        .bind(chat_id)
         .execute(&mut *tx)
         .await?;
+        if res.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
         // Clear the per-feed auto-disable notification dedup flag (exact key
         // match, same shape as the unsubscribe cascade) so the next genuine
         // disable can notify again.
         sqlx::query(
-            "DELETE FROM settings WHERE key = (SELECT 'auto_disable_notified:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
+            "DELETE FROM settings WHERE key = (SELECT 'auto_disable_notified:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ? AND chat_id = ?)",
         )
         .bind(sub_id)
+        .bind(chat_id)
         .execute(&mut *tx)
         .await?;
     } else {
-        sqlx::query(
-            "UPDATE subscriptions SET active = 0, auto_disabled = 0, disabled_at = NULL WHERE id = ?",
+        let res = sqlx::query(
+            "UPDATE subscriptions SET active = 0, auto_disabled = 0, disabled_at = NULL WHERE id = ? AND chat_id = ?",
         )
         .bind(sub_id)
+        .bind(chat_id)
         .execute(&mut *tx)
         .await?;
+        if res.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
     }
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// System auto-disable (consecutive failures reached the threshold): sets
@@ -1796,6 +1850,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_subscription_active_requires_matching_chat() {
+        let pool = test_pool().await;
+        let res = sqlx::query(
+            "INSERT INTO subscriptions (chat_id, feed_url, active, auto_disabled) VALUES ('1', 'https://example.com/feed', 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let sub_id = res.last_insert_rowid();
+
+        // The callback ownership guard may have raced with a deleted/recreated
+        // row: a different chat must never toggle this id.
+        assert!(!set_subscription_active(&pool, sub_id, "2", true)
+            .await
+            .unwrap());
+        let state: (i64, i64) = sqlx::query_as(
+            "SELECT active, auto_disabled FROM subscriptions WHERE id = ?",
+        )
+        .bind(sub_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, (0, 1));
+
+        assert!(set_subscription_active(&pool, sub_id, "1", true)
+            .await
+            .unwrap());
+        let state: (i64, i64) = sqlx::query_as(
+            "SELECT active, auto_disabled FROM subscriptions WHERE id = ?",
+        )
+        .bind(sub_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, (1, 0));
+    }
+
+    #[tokio::test]
+    async fn normalize_telegram_entry_ids_strips_channel_prefix() {
+        let pool = test_pool().await;
+        let feed = "https://t.me/chan";
+        sqlx::query(
+            "INSERT INTO sent_entries (chat_id, feed_url, entry_id) VALUES ('1', ?, 'chan/9')",
+        )
+        .bind(feed)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO outbox (chat_id, feed_url, entry_id, entry_json, next_retry_at, created_at)
+             VALUES ('1', ?, 'chan/10', '{}', 0, 0)",
+        )
+        .bind(feed)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sent_messages (chat_id, message_id, feed_url, entry_id) VALUES ('1', 5, ?, 'chan/11')",
+        )
+        .bind(feed)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(normalize_telegram_entry_ids(&pool).await.unwrap(), 3);
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT entry_id FROM sent_entries UNION ALL SELECT entry_id FROM outbox UNION ALL SELECT entry_id FROM sent_messages ORDER BY entry_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ids, vec!["10", "11", "9"]);
+        // Idempotent: a second startup must not touch anything.
+        assert_eq!(normalize_telegram_entry_ids(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn effective_config_keeps_feed_override_without_chat_row() {
         let pool = test_pool().await;
         sqlx::query(
@@ -2119,7 +2250,7 @@ mod tests {
         for key in [
             format!("auto_disable_notified:{}:{}", old, feed),
             format!("stale_zero:{}:{}", old, feed),
-            format!("media_dl_fail:{}:{}:e4", old, feed),
+            setting_key::media_dl_fail(old, feed, "e4"),
         ] {
             set_setting(&pool, &key, "1").await.unwrap();
         }
@@ -2177,7 +2308,7 @@ mod tests {
             settings,
             vec![
                 format!("auto_disable_notified:{}:{}", new, feed),
-                format!("media_dl_fail:{}:{}:e4", new, feed),
+                setting_key::media_dl_fail(new, feed, "e4"),
                 format!("stale_zero:{}:{}", new, feed),
             ]
         );

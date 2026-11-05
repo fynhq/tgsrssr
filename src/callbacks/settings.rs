@@ -442,7 +442,13 @@ pub(super) async fn render_feed_filter_impl(
     let Some(sub) = load_sub_or_deliver(bot, &target, &state.db, sub_id, lang).await? else {
         return Ok(());
     };
-    let fc = db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await.unwrap_or_default();
+    let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await {
+        Ok(fc) => fc,
+        Err(e) => {
+            tracing::warn!(sub_id, error = %e, "filter page read failed");
+            return deliver_error_page(bot, &target, lang, &format!("{:#}", e)).await;
+        }
+    };
 
     let status = if fc.is_active() {
         i18n::t(lang, "filter_on")

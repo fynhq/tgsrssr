@@ -536,6 +536,12 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "media_dl_empty") => "Media download failed ({}, empty response)",
         (Lang::Zh, "media_dl_failed") => "媒体下载失败（{}）",
         (Lang::En, "media_dl_failed") => "Media download failed ({})",
+        (Lang::Zh, "media_invalid_content") => "媒体内容无效或类型不符（{}）",
+        (Lang::En, "media_invalid_content") => "Media content invalid or type mismatch ({})",
+        (Lang::Zh, "media_entry_cap_skip") => "条目的媒体总量超过上限，已跳过剩余媒体",
+        (Lang::En, "media_entry_cap_skip") => "Media skipped: per-entry byte limit reached",
+        (Lang::Zh, "media_quota_skip") => "存储配额不足，已跳过媒体",
+        (Lang::En, "media_quota_skip") => "Media skipped: storage quota reached",
         (Lang::Zh, "notif_media_storage") => "媒体存储不可用，本轮已跳过源「{}」，恢复后会自动重试。请检查媒体目录与磁盘空间。",
         (Lang::En, "notif_media_storage") => "Media storage is unavailable; source \"{}\" was deferred this round and will retry automatically. Check the media directory and disk space.",
 

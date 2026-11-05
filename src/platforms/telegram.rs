@@ -337,8 +337,11 @@ fn extract_channel_title(html: &str) -> Option<String> {
 /// Convert one message block into a feed-rs Entry.
 /// `data_post` has the form `<channel>/<msg_id>`.
 fn message_to_entry(data_post: &str, block: &str, feed_title: &str, lang: Lang) -> Option<Entry> {
-    // data_post must be in channel/msgid form.
-    if !data_post.contains('/') {
+    // data_post must be in channel/msgid form. The message id alone is the
+    // stable entry id: a channel rename changes the username part, which used
+    // to change every id in the visible window and re-push the whole page.
+    let (_, msg_id) = data_post.rsplit_once('/')?;
+    if msg_id.is_empty() {
         return None;
     }
 
@@ -404,7 +407,7 @@ fn message_to_entry(data_post: &str, block: &str, feed_title: &str, lang: Lang) 
 
 
 
-    Some(crate::platforms::make_entry(data_post.to_string(), title, feed_title.to_string(), body, "text/html", link, published))
+    Some(crate::platforms::make_entry(msg_id.to_string(), title, feed_title.to_string(), body, "text/html", link, published))
 }
 
 /// Extract a reply/quoted block and render it as a `<blockquote>`.
@@ -713,6 +716,18 @@ mod tests {
         let block = r#"<div class="tgme_widget_message" data-post="chan/9"><div class="tgme_widget_message_text js-message_text" dir="auto">A<div class="quote">B</div>C</div><div class="after">ignored</div></div>"#;
         let html = extract_main_text_html(block, "chan/9");
         assert_eq!(html, "A<div class=\"quote\">B</div>C");
+    }
+
+    #[test]
+    fn entry_id_is_stable_msgid_not_channel_username() {
+        let block = r#"<div class="tgme_widget_message" data-post="old_name/9"><div class="tgme_widget_message_text js-message_text" dir="auto">hello</div></div>"#;
+        let entry = message_to_entry("old_name/9", block, "Feed", Lang::En)
+            .expect("message should produce an entry");
+        assert_eq!(entry.id, "9");
+        assert_eq!(
+            entry.links.first().map(|l| l.href.as_str()),
+            Some("https://t.me/old_name/9")
+        );
     }
 
     #[test]

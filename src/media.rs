@@ -91,6 +91,162 @@ pub const MAX_VIDEO_OFFICIAL_BYTES: u64 = 49 * 1024 * 1024;
 /// standard sends stream multipart, rich attachments may use file://).
 pub const MAX_VIDEO_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_MEDIA_PER_ENTRY: usize = 30; // At most 3 groups (≤10 each, Telegram mediaGroup cap)
+/// Per-entry downloaded-media byte budget. A malicious entry with 30 large
+/// videos could otherwise write several GB before the next quota pass; the
+/// count cap alone does not bound disk usage.
+const MAX_MEDIA_BYTES_PER_ENTRY: u64 = 200 * 1024 * 1024;
+/// Refuse to start a download when less than this remains in the media
+/// budget; a sub-megabyte remainder is not worth a partial upload.
+const MIN_MEDIA_FREE_BYTES: u64 = 1024 * 1024;
+/// Re-scan the media directory at most this often when the budget is over.
+const MEDIA_BUDGET_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Shared media byte budget. `used` is the last scanned directory size (plus
+/// successful downloads); `reserved` covers in-flight downloads so concurrent
+/// workers cannot all pass the same free-space check.
+pub struct MediaBudget {
+    used: std::sync::atomic::AtomicU64,
+    reserved: std::sync::atomic::AtomicU64,
+    initialized: std::sync::atomic::AtomicBool,
+    refresh_lock: tokio::sync::Mutex<()>,
+    last_refresh: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl MediaBudget {
+    pub fn new() -> Self {
+        Self {
+            used: std::sync::atomic::AtomicU64::new(0),
+            reserved: std::sync::atomic::AtomicU64::new(0),
+            initialized: std::sync::atomic::AtomicBool::new(false),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            last_refresh: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Force the next reservation to re-scan the media directory (cleanup may
+    /// have freed space since the last scan).
+    pub fn invalidate(&self) {
+        self.initialized
+            .store(false, std::sync::atomic::Ordering::Release);
+        *self.last_refresh.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    fn release_reserved(&self, units: u64) {
+        let _ = self.reserved.try_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |v| Some(v.saturating_sub(units)),
+        );
+    }
+
+    /// Reserve up to `want` bytes from the global media cap. Returns a guard
+    /// granting `granted()` bytes; callers must use that as the download cap.
+    pub async fn reserve(
+        &self,
+        media_dir: &Path,
+        cap: u64,
+        want: u64,
+    ) -> Option<MediaReservation<'_>> {
+        if want == 0 {
+            return None;
+        }
+        let _guard = self.refresh_lock.lock().await;
+        let need_refresh = !self
+            .initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .used
+                .load(std::sync::atomic::Ordering::Acquire)
+                .saturating_add(
+                    self.reserved.load(std::sync::atomic::Ordering::Acquire),
+                )
+                .saturating_add(want)
+                > cap;
+        if need_refresh {
+            let stale = self
+                .last_refresh
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .map(|t| t.elapsed() >= MEDIA_BUDGET_REFRESH)
+                .unwrap_or(true);
+            if stale
+                || !self
+                    .initialized
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                match crate::cleanup::dir_size(media_dir).await {
+                    Ok(size) => self
+                        .used
+                        .store(size, std::sync::atomic::Ordering::Release),
+                    Err(e) => {
+                        warn!(
+                            media_dir = %media_dir.display(),
+                            error = %e,
+                            "media budget: directory scan failed; failing closed for new downloads"
+                        );
+                        // Unknown usage must not authorize more writes; a
+                        // transient scan failure would otherwise bypass the
+                        // disk guard entirely. The next stale-interval scan
+                        // restores the real value.
+                        self.used.store(cap, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                self.initialized
+                    .store(true, std::sync::atomic::Ordering::Release);
+                *self.last_refresh.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(std::time::Instant::now());
+            }
+        }
+        let used = self.used.load(std::sync::atomic::Ordering::Acquire);
+        let reserved = self.reserved.load(std::sync::atomic::Ordering::Acquire);
+        let free = cap.saturating_sub(used.saturating_add(reserved));
+        if free < MIN_MEDIA_FREE_BYTES {
+            debug!(used, reserved, cap, "media budget exhausted, skipping download");
+            return None;
+        }
+        let granted = want.min(free);
+        if granted < MIN_MEDIA_FREE_BYTES {
+            return None;
+        }
+        self.reserved
+            .fetch_add(granted, std::sync::atomic::Ordering::AcqRel);
+        Some(MediaReservation {
+            budget: self,
+            granted,
+            committed: false,
+        })
+    }
+}
+
+/// RAII reservation: dropping without `commit` releases the reserved bytes.
+pub struct MediaReservation<'a> {
+    budget: &'a MediaBudget,
+    granted: u64,
+    committed: bool,
+}
+
+impl MediaReservation<'_> {
+    pub fn granted(&self) -> u64 {
+        self.granted
+    }
+
+    pub fn commit(&mut self, actual: u64) {
+        self.budget.release_reserved(self.granted);
+        self.budget
+            .used
+            .fetch_add(actual, std::sync::atomic::Ordering::AcqRel);
+        self.committed = true;
+    }
+}
+
+impl Drop for MediaReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.budget.release_reserved(self.granted);
+        }
+    }
+}
+
 /// On-disk suffix appended to every downloaded media/thumbnail file. It keeps
 /// extension-based media indexers away from the outbound directory; the
 /// upload layer strips it from the multipart filename, so Telegram still sees
@@ -219,12 +375,17 @@ impl MediaKind {
 /// has no actual cover photo.
 fn is_placeholder_image(url: &str) -> bool {
     let lower = url.to_lowercase();
-    // Huxiu default article placeholder
-    lower.contains("article_default_picpath")
-        // Generic placeholder patterns
-        || lower.contains("placeholder")
-        || lower.contains("default_pic")
-        || lower.contains("default_cover")
+    if lower.contains("article_default_picpath") {
+        return true;
+    }
+    // Match marker tokens in the file name only. A substring match on the
+    // whole URL killed legitimate images whose path merely mentioned
+    // "placeholder" (e.g. a blog post slug).
+    let path_part = lower.split('?').next().unwrap_or(&lower);
+    let file = path_part.rsplit('/').next().unwrap_or(path_part);
+    ["placeholder", "default_pic", "default_cover"]
+        .iter()
+        .any(|prefix| file.starts_with(prefix))
 }
 
 /// True for Weibo/Sina image hosts that enforce Referer-based hotlink
@@ -563,6 +724,74 @@ fn detect_image_ext(head: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Accept only recognizable video containers before handing the file to
+/// ffmpeg/ffprobe. Content sniffing matters because ffmpeg detects formats by
+/// bytes, not by URL suffix: an HLS playlist served at `x.mp4` would otherwise
+/// let ffmpeg fetch arbitrary http/file URIs behind the SSRF guard.
+fn detect_video_container(head: &[u8]) -> Option<&'static str> {
+    // ISO BMFF (MP4/MOV/M4V/3GP): [size][ftyp]... Older/streamed files may
+    // start with moov/mdat/wide/free/skip instead of ftyp.
+    if head.len() >= 8 {
+        let box_type = &head[4..8];
+        if box_type == b"ftyp"
+            || box_type == b"moov"
+            || box_type == b"mdat"
+            || box_type == b"wide"
+            || box_type == b"free"
+            || box_type == b"skip"
+        {
+            return Some("mp4");
+        }
+    }
+    // Matroska/WebM.
+    if head.starts_with(b"\x1A\x45\xDF\xA3") {
+        return Some("mkv");
+    }
+    // AVI: RIFF....AVI .
+    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"AVI " {
+        return Some("avi");
+    }
+    // FLV.
+    if head.starts_with(b"FLV") {
+        return Some("flv");
+    }
+    // MPEG program stream.
+    if head.starts_with(&[0x00, 0x00, 0x01, 0xBA]) {
+        return Some("mpeg");
+    }
+    // Ogg (Theora/Vorbis); rare as a feed <video>, but a valid container.
+    if head.starts_with(b"OggS") {
+        return Some("ogg");
+    }
+    // MPEG-TS: 188-byte packets with 0x47 sync bytes.
+    if head.len() >= 189 && head[0] == 0x47 && head[188] == 0x47 {
+        return Some("ts");
+    }
+    None
+}
+
+/// Read the first 512 bytes of a downloaded file and validate its video
+/// container. A read error or an unrecognized header returns None.
+fn sniff_video_container(path: &std::path::Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            debug!(path = %path.display(), error = %e, "video sniff: open failed");
+            return None;
+        }
+    };
+    let mut head = [0u8; 512];
+    let n = match f.read(&mut head) {
+        Ok(n) => n,
+        Err(e) => {
+            debug!(path = %path.display(), error = %e, "video sniff: read failed");
+            return None;
+        }
+    };
+    detect_video_container(&head[..n])
+}
+
 /// Read the first 512 bytes of a downloaded file and detect its image format.
 /// A read error yields None (the URL/MIME extension remains in use).
 fn sniff_image_ext(path: &std::path::Path) -> Option<&'static str> {
@@ -763,6 +992,11 @@ enum DownloadOutcome {
     Oversized { size: Option<u64> },
     /// Zero-byte response.
     Empty,
+    /// Bytes do not match the claimed image/video container (e.g. an HTML
+    /// challenge page served with a .jpg URL, or an HLS playlist named .mp4).
+    InvalidContent,
+    /// The shared media budget has no room for this download.
+    QuotaSkipped,
 }
 
 /// Raw result of one download attempt (before file rename / probing).
@@ -975,21 +1209,39 @@ async fn download_cover_fallback(
     poster_map: &std::collections::HashMap<String, String>,
     raw_url: &str,
     outbound: &std::path::Path,
-    transport: &MediaTransport,
     allow_trusted_private: bool,
+    max_bytes: u64,
     out: &mut PreparedMedia,
-) {
+) -> Option<u64> {
     let Some(cover) = poster_map.get(raw_url).cloned() else {
         // The video was already dropped and the source exposed no cover URL:
         // the entry loses its visual element with no download attempt to fail,
         // so without this line the missing cover is invisible at info level.
         warn!(video_url = %raw_url, "no poster for failed video, entry stays text-only");
-        return;
+        return None;
     };
     let cover_resolved = fetcher::resolve_url(state, &upgrade_weibo_size(&cover));
-    match download_one(state, &cover_resolved, &MediaKind::Image, "image/unknown", outbound, transport, allow_trusted_private).await {
+    match download_one(
+        state,
+        &cover_resolved,
+        &MediaKind::Image,
+        "image/unknown",
+        outbound,
+        allow_trusted_private,
+        max_bytes,
+    )
+    .await
+    {
         Ok(DownloadOutcome::Item(item)) => {
+            let size = item.size;
             out.items.push(item);
+            return Some(size);
+        }
+        Ok(DownloadOutcome::InvalidContent) => {
+            warn!(cover_url = %cover, "cover image content invalid, entry stays text-only");
+        }
+        Ok(DownloadOutcome::QuotaSkipped) => {
+            debug!(cover_url = %cover, "cover image skipped: media budget exhausted");
         }
         Err(e) => {
             // Promoted from debug to warn: the cover fallback only runs after a
@@ -1006,6 +1258,7 @@ async fn download_cover_fallback(
             warn!(cover_url = %cover, "cover image download failed (empty/oversized), entry stays text-only");
         }
     }
+    None
 }
 
 /// Download an entry's media into media/outbound/<date>/ and probe image sizes.
@@ -1059,6 +1312,10 @@ pub async fn prepare_entry_media(
         }
     };
 
+    let base_cap = transport
+        .max_download_bytes()
+        .min(state.config.max_media_download_mb * 1024 * 1024);
+    let mut entry_bytes: u64 = 0;
     for (raw_url, kind, mime, is_retweet, owner_mid) in candidates {
         // title_summary single-media mode: skip candidates that can never be
         // sent (audio/documents, detectable GIFs) so they are neither fetched
@@ -1080,6 +1337,14 @@ pub async fn prepare_entry_media(
         let url = fetcher::resolve_url(state, &url);
         let via_relay = url != direct_url;
 
+        let entry_remaining = MAX_MEDIA_BYTES_PER_ENTRY.saturating_sub(entry_bytes);
+        if entry_remaining < MIN_MEDIA_FREE_BYTES {
+            warn!(entry_id = %fetcher::entry_id(entry), "per-entry media byte cap reached, skipping remaining candidates");
+            out.warnings.push(crate::i18n::t(lang, "media_entry_cap_skip").to_string());
+            break;
+        }
+        let download_cap = base_cap.min(entry_remaining);
+
         let _permit = match state.download_semaphore.acquire().await {
             Ok(p) => p,
             Err(_) => break,
@@ -1092,14 +1357,14 @@ pub async fn prepare_entry_media(
         // (previously the relay/direct result handling was duplicated
         // verbatim and the cover-fallback call was copied in 4 places —
         // high risk of fixing one and missing another).
-        let (result, relay_err) = match download_one(state, &url, &kind, &mime, &outbound, transport, allow_trusted_private).await {
+        let (result, relay_err) = match download_one(state, &url, &kind, &mime, &outbound, allow_trusted_private, download_cap).await {
             // A relay 200 with an empty body is a relay failure, not evidence
             // that the origin has no media. The direct URL may still work;
             // previously only Err triggered the fallback and the media was
             // dropped with a misleading "empty response" warning.
             Ok(DownloadOutcome::Empty) if via_relay => {
                 warn!(relay_url = %url, direct_url = %direct_url, "relay returned an empty response, retrying direct");
-                let r = download_one(state, &direct_url, &kind, &mime, &outbound, transport, allow_trusted_private).await;
+                let r = download_one(state, &direct_url, &kind, &mime, &outbound, allow_trusted_private, download_cap).await;
                 (r, Some("relay returned an empty response".to_string()))
             }
             Err(e) if via_relay => {
@@ -1113,7 +1378,7 @@ pub async fn prepare_entry_media(
                 // root cause (Worker 502 / connect / SOCKS layer) is visible,
                 // not just the outer "error sending request for url (...)" wrapper.
                 warn!(relay_url = %url, direct_url = %direct_url, error = format!("{:#}", e), "relay download failed, retrying direct");
-                let r = download_one(state, &direct_url, &kind, &mime, &outbound, transport, allow_trusted_private).await;
+                let r = download_one(state, &direct_url, &kind, &mime, &outbound, allow_trusted_private, download_cap).await;
                 (r, Some(format!("{:#}", e)))
             }
             other => (other, None),
@@ -1136,6 +1401,7 @@ pub async fn prepare_entry_media(
                     continue;
                 }
                 item.is_retweet = is_retweet;
+                entry_bytes = entry_bytes.saturating_add(item.size);
                 out.items.push(item);
                 // Single-media mode: a direct candidate success completes the
                 // message's media, so earlier candidate failures are no longer
@@ -1170,6 +1436,23 @@ pub async fn prepare_entry_media(
                     video_needs_cover = true;
                 }
             }
+            Ok(DownloadOutcome::InvalidContent) => {
+                let msg = crate::i18n::t(lang, "media_invalid_content")
+                    .replacen("{}", kind_label(lang, &kind), 1);
+                out.warnings.push(msg);
+                // A soft-404/challenge page can be transient; retry the entry
+                // like other download failures instead of silently dropping
+                // media on the first response.
+                out.download_failed = true;
+                if kind == MediaKind::Video {
+                    video_needs_cover = true;
+                }
+            }
+            Ok(DownloadOutcome::QuotaSkipped) => {
+                warn!(entry_id = %fetcher::entry_id(entry), "media byte budget exhausted, skipping media");
+                out.warnings.push(crate::i18n::t(lang, "media_quota_skip").to_string());
+                break;
+            }
             Err(e) => {
                 let msg = crate::i18n::t(lang, "media_dl_failed").replacen("{}", kind_label(lang, &kind), 1);
                 if let Some(re) = &relay_err {
@@ -1185,7 +1468,20 @@ pub async fn prepare_entry_media(
             }
         }
         if video_needs_cover {
-            download_cover_fallback(state, &poster_map, &raw_url, &outbound, transport, allow_trusted_private, &mut out).await;
+            let cover_cap = base_cap.min(MAX_MEDIA_BYTES_PER_ENTRY.saturating_sub(entry_bytes));
+            if let Some(size) = download_cover_fallback(
+                state,
+                &poster_map,
+                &raw_url,
+                &outbound,
+                allow_trusted_private,
+                cover_cap,
+                &mut out,
+            )
+            .await
+            {
+                entry_bytes = entry_bytes.saturating_add(size);
+            }
         }
         // title_summary single-media mode: the first image/video (or a video
         // cover fallback) is all this mode ever sends—stop fetching. Failure
@@ -1241,8 +1537,8 @@ async fn download_one(
     kind: &MediaKind,
     mime: &str,
     outbound: &std::path::Path,
-    transport: &MediaTransport,
     allow_trusted_private: bool,
+    download_cap: u64,
 ) -> anyhow::Result<DownloadOutcome> {
     // Per-host concurrency limit: prevents opening too many connections to a
     // single CDN at once, which would trigger rate limiting / risk control.
@@ -1254,10 +1550,17 @@ async fn download_one(
         Err(_) => anyhow::bail!("host download semaphore closed"),
     };
 
-    // All media types (images/videos/files) are uniformly bounded by
-    // MAX_MEDIA_DOWNLOAD_MB (default 100MB) and the transport cap (49MB via
-    // official API, 2GB via local Bot API): prevents oversized uploads.
-    let cap = transport.max_download_bytes().min(state.config.max_media_download_mb * 1024 * 1024);
+    // The caller combines MAX_MEDIA_DOWNLOAD_MB, the transport cap and the
+    // entry byte budget; the shared budget may grant less than requested.
+    let mut reservation = match state
+        .media_budget
+        .reserve(&state.config.media_dir, state.config.media_max_bytes(), download_cap)
+        .await
+    {
+        Some(r) => r,
+        None => return Ok(DownloadOutcome::QuotaSkipped),
+    };
+    let cap = reservation.granted();
 
     // Occasional jitter on the proxy link (connection cut off, response body
     // transfer interrupted, etc.) can cause a single download to fail; here
@@ -1417,25 +1720,42 @@ async fn download_one(
     let mut ext = kind.ext(mime, url);
     // Extensionless CDN images carry no reliable type in the URL/MIME hints;
     // sniff the actual bytes so AVIF/SVG/HEIC/TIFF are not mislabeled as JPEG
-    // and sent through sendPhoto (a deterministic 400).
+    // and sent through sendPhoto (a deterministic 400). Unknown bytes are
+    // rejected here: an HTML error/challenge page must not be uploaded as an
+    // image or handed to ffmpeg.
     if *kind == MediaKind::Image {
-        if let Some(detected) = sniff_image_ext(&tmp_path) {
-            if detected != ext.as_str() {
-                tracing::debug!(
-                    url = %url,
-                    url_ext = %ext,
-                    sniffed_ext = detected,
-                    "image extension overridden by magic-byte sniff"
-                );
-            }
-            ext = detected.to_string();
+        let Some(detected) = sniff_image_ext(&tmp_path) else {
+            warn!(url = %url, "image content is not a recognized image format, dropping");
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Ok(DownloadOutcome::InvalidContent);
+        };
+        if detected != ext.as_str() {
+            tracing::debug!(
+                url = %url,
+                url_ext = %ext,
+                sniffed_ext = detected,
+                "image extension overridden by magic-byte sniff"
+            );
         }
+        ext = detected.to_string();
+    } else if *kind == MediaKind::Video && sniff_video_container(&tmp_path).is_none() {
+        // ffmpeg detects formats by content, not suffix. Reject HLS playlists,
+        // HTML pages and other non-container bytes before any ffmpeg/ffprobe
+        // invocation; this also keeps a `.mp4`-named playlist from making
+        // ffmpeg fetch arbitrary internal URIs.
+        warn!(url = %url, "video content is not a recognized container, dropping");
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Ok(DownloadOutcome::InvalidContent);
     }
     // Keep the original extension and append the storage-only suffix, e.g.
     // `123456_uuid.jpg.tgsr`. path_input() strips it when uploading.
     let name = format!("{}_{}.{}{}", chrono::Utc::now().format("%H%M%S%f"), uuid::Uuid::new_v4(), ext, STORAGE_SUFFIX);
     let path = outbound.join(&name);
-    std::fs::rename(&tmp_path, &path)?;
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(e.into());
+    }
+    reservation.commit(size);
 
     let (width, height) = if *kind == MediaKind::Image {
         match imagesize::size(&path) {
@@ -1447,13 +1767,11 @@ async fn download_one(
     };
 
     // GIF detection: only sendAnimation gives correct animated display.
-    // The MIME hint from body-<img> extraction is always "image/unknown",
-    // and some CDNs serve GIFs at suffix-free URLs (/img/<hash>), so
-    // extension checks alone miss them. Read the 6-byte magic header from the
-    // downloaded file as a definitive fallback ("GIF87a"/"GIF89a").
-    // The cheap mime/extension part is shared with the pre-download check
-    // (`looks_like_gif`) so the two detection sites cannot drift.
-    let is_gif = *kind == MediaKind::Image && (looks_like_gif(mime, url) || sniff_gif(&path));
+    // After download the magic header is authoritative: a `.gif` URL (or a
+    // stale `image/gif` MIME hint) that actually served a JPEG/PNG must not be
+    // routed to sendAnimation. The cheap MIME/URL check is only used before
+    // download by title_summary's skip logic.
+    let is_gif = *kind == MediaKind::Image && sniff_gif(&path);
 
     // #21: ffmpeg/ffprobe probing moved to prepare_entry_media, running
     // after the semaphore is released, to avoid occupying a download
@@ -1597,7 +1915,13 @@ async fn grab_thumb(path: &std::path::Path, ss: Option<&str>, thumb: &std::path:
     ];
     for (scale, quality) in ATTEMPTS {
         let mut cmd = tokio::process::Command::new("ffmpeg");
-        cmd.arg("-y");
+        cmd.arg("-y")
+            // Input is attacker-controlled bytes: keep ffmpeg from opening
+            // network protocols or reading stdin. `file,pipe` still permits
+            // the local file we pass with `-i` (and stdio), but blocks the
+            // HLS/concat remote-URI path that bypasses the SSRF guard.
+            .args(["-nostdin", "-v", "error"])
+            .args(["-protocol_whitelist", "file,pipe"]);
         if let Some(s) = ss {
             cmd.args(["-ss", s]);
         }
@@ -1643,7 +1967,9 @@ async fn probe_video_meta(path: &std::path::Path) -> (Option<PathBuf>, Option<u3
     // Duration
     let mut probe_cmd = tokio::process::Command::new("ffprobe");
     probe_cmd
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+        .args(["-v", "error"])
+        .args(["-protocol_whitelist", "file,pipe"])
+        .args(["-show_entries", "format=duration", "-of", "csv=p=0"])
         .arg(path);
     let duration_secs = run_tool_with_timeout("ffprobe", probe_cmd)
         .await
@@ -2051,6 +2377,84 @@ mod tests {
         assert_eq!(detect_image_ext(b"RIFF\0\0\0\0WEBPVP8 "), Some("webp"));
         // Unknown bytes: no override (URL/MIME fallback remains).
         assert_eq!(detect_image_ext(b"not an image"), None);
+    }
+
+    #[test]
+    fn detect_video_container_accepts_common_formats_and_rejects_hls() {
+        assert_eq!(
+            detect_video_container(b"\0\0\0\x18ftypisom\0\0\0\0"),
+            Some("mp4")
+        );
+        assert_eq!(
+            detect_video_container(b"\x1a\x45\xdf\xa3rest"),
+            Some("mkv")
+        );
+        assert_eq!(
+            detect_video_container(b"RIFF\0\0\0\0AVI LIST"),
+            Some("avi")
+        );
+        assert_eq!(detect_video_container(b"FLV\x01rest"), Some("flv"));
+        assert_eq!(
+            detect_video_container(b"\x00\x00\x01\xBArest"),
+            Some("mpeg")
+        );
+        assert_eq!(detect_video_container(b"OggS\0\0"), Some("ogg"));
+
+        let mut ts = vec![0u8; 400];
+        ts[0] = 0x47;
+        ts[188] = 0x47;
+        assert_eq!(detect_video_container(&ts), Some("ts"));
+
+        // The bytes that must never reach ffmpeg as a "video".
+        assert_eq!(detect_video_container(b"#EXTM3U\n#EXT-X-VERSION:3\n"), None);
+        assert_eq!(detect_video_container(b"<html>blocked</html>"), None);
+        assert_eq!(detect_video_container(b"not a container"), None);
+    }
+
+    #[tokio::test]
+    async fn media_budget_reserves_and_commits_against_scanned_usage() {
+        let dir = std::env::temp_dir().join(format!(
+            "tgsrssr_budget_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        const MB: u64 = 1024 * 1024;
+        std::fs::write(dir.join("existing.bin"), vec![0u8; MB as usize]).unwrap();
+
+        let budget = MediaBudget::new();
+        let mut first = budget
+            .reserve(&dir, 10 * MB, 5 * MB)
+            .await
+            .expect("5 MB should fit");
+        assert_eq!(first.granted(), 5 * MB);
+        first.commit(3 * MB);
+        // Simulate the downloaded file landing on disk.
+        std::fs::write(dir.join("committed.bin"), vec![0u8; 3 * MB as usize]).unwrap();
+
+        // used = 1 MB existing + 3 MB committed = 4 MB; free = 6 MB.
+        let second = budget
+            .reserve(&dir, 10 * MB, 7 * MB)
+            .await
+            .expect("remaining 6 MB should be granted");
+        assert_eq!(second.granted(), 6 * MB);
+
+        // While 6 MB are reserved, only 0 MB remains.
+        let exhausted = budget.reserve(&dir, 10 * MB, MB).await;
+        assert!(exhausted.is_none());
+        drop(second);
+
+        // Remove the pre-existing file and rescan: only the 3 MB committed
+        // file remains, leaving 7 MB for a new reservation.
+        std::fs::remove_file(dir.join("existing.bin")).unwrap();
+        budget.invalidate();
+        let after_release = budget
+            .reserve(&dir, 10 * MB, 9 * MB)
+            .await
+            .expect("after rescan only the committed 3 MB remains");
+        assert_eq!(after_release.granted(), 7 * MB);
+        drop(after_release);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

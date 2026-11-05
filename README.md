@@ -197,7 +197,7 @@ SSRF 防护默认拒绝私网/回环地址。RSSHub 与 bot 同机/同网时，�
 
 ## 本地 Bot API（可选）
 
-媒体上传统一由本进程从本地文件流式 multipart 上传（按块读取，堆内存常量，不整文件读入）。官方 API 的单文件上限为 50MB（本项目取 49MB）；部署本地 Bot API 后上限提高到 2GB，标准发送仍是流式 multipart，富消息的图片/视频附件可由 bot-api 服务器通过 `file://` 直读（文档附件仍走 multipart bytes 以保留文件名）。实际视频仍受 `MAX_MEDIA_DOWNLOAD_MB`（默认 100，限制所有媒体类型的单文件下载）约束。
+媒体上传统一由本进程从本地文件流式 multipart 上传（按块读取，堆内存常量，不整文件读入）。官方 API 的单文件上限为 50MB（本项目取 49MB）；部署本地 Bot API 后上限提高到 2GB，标准发送仍是流式 multipart，富消息的图片/视频附件可由 bot-api 服务器通过 `file://` 直读（文档附件仍走 multipart bytes 以保留文件名）。实际视频仍受 `MAX_MEDIA_DOWNLOAD_MB`（默认 100，限制所有媒体类型的单文件下载）约束。单条目媒体总量另上限 200MB；下载后按 magic/容器头校验，HTML 错误页与 HLS 清单不会作为图片/视频发送。
 
 | 模式 | 触发条件 | 传输方式 | 单文件上限 |
 |---|---|---|---|
@@ -455,7 +455,7 @@ The full set of tunables (cleanup, backup, cache retention, etc.) and their defa
 
 ## Local Bot API (optional)
 
-Media uploads are streamed from the local file as multipart (read in chunks; constant heap memory, no whole-file buffering). The official API has a 50MB per-file limit (this project uses 49MB). Deploying a local Bot API server raises the limit to 2GB; standard sends still use streaming multipart, while rich-message photo/video attachments can be read by the server via `file://` (document attachments stay on multipart bytes to keep their file name). All media types are still gated by `MAX_MEDIA_DOWNLOAD_MB` (default 100).
+Media uploads are streamed from the local file as multipart (read in chunks; constant heap memory, no whole-file buffering). The official API has a 50MB per-file limit (this project uses 49MB). Deploying a local Bot API server raises the limit to 2GB; standard sends still use streaming multipart, while rich-message photo/video attachments can be read by the server via `file://` (document attachments stay on multipart bytes to keep their file name). All media types are still gated by `MAX_MEDIA_DOWNLOAD_MB` (default 100). A single entry is also capped at 200MB of media, and downloads are validated by magic bytes/container header, so HTML error pages and HLS manifests are never sent as photos/videos.
 
 | Mode | Trigger | Transport | Per-file cap |
 |---|---|---|---|

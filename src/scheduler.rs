@@ -1393,7 +1393,7 @@ async fn process_feed(
                             crate::push::escape_attr(&sub.feed_url),
                             crate::push::escape_html(t)
                         ))
-                        .unwrap_or_else(|| sub.feed_url.clone());
+                        .unwrap_or_else(|| crate::push::escape_html(&sub.feed_url));
                     notify_owner_html(
                         bot,
                         state,

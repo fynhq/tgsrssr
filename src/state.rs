@@ -183,6 +183,8 @@ pub struct AppState {
     pub fetch_semaphore: Arc<Semaphore>,
     /// Limits concurrent media downloads.
     pub download_semaphore: Arc<Semaphore>,
+    /// Shared media byte budget (global quota + in-flight reservations).
+    pub media_budget: Arc<crate::media::MediaBudget>,
     /// Per-host download concurrency limit: prevents opening too many
     /// simultaneous connections to a single CDN (e.g. weibocdn rate-limiting
     /// / anti-crawl). Keyed by lowercase hostname; created lazily.
@@ -201,6 +203,10 @@ pub struct AppState {
     pub cleanup_active: Arc<AtomicBool>,
     /// In-flight multi-step flows keyed by (chat_id, user_id).
     pub pending_ops: Arc<Mutex<HashMap<(i64, i64), PendingOp>>>,
+    /// Unsub-all confirmation messages currently being processed, keyed by
+    /// (chat_id, message_id). An in-memory lock (not message text) makes
+    /// double-taps idempotent and lets a post-restart click proceed.
+    pub unsuball_inflight: Arc<std::sync::Mutex<std::collections::HashSet<(i64, i32)>>>,
     /// Runtime-mutable platform login cookies, keyed by platform id.
     /// Global: admin configures once, all users share the same cookie.
     /// Persisted in the `settings` table (key = "cookie:<platform>").
@@ -285,6 +291,7 @@ impl AppState {
         Ok(Self {
             fetch_semaphore: Arc::new(Semaphore::new(config.fetch_concurrency)),
             download_semaphore: Arc::new(Semaphore::new(config.download_concurrency)),
+            media_budget: Arc::new(crate::media::MediaBudget::new()),
             host_download_semaphores: Arc::new(Mutex::new(HashMap::new())),
             fetch_cycle_active: Arc::new(AtomicBool::new(false)),
             outbox_retry_active: Arc::new(AtomicBool::new(false)),
@@ -305,6 +312,7 @@ impl AppState {
             command_rate_limiter: Arc::new(crate::limits::CommandRateLimiter::new()),
             user_sub_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_ops: Arc::new(Mutex::new(HashMap::new())),
+            unsuball_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         })
     }
 

@@ -39,6 +39,13 @@ pub use crate::htmltext::{
 /// (see send_entry_msg), so staying within this limit keeps the combined
 /// text under 4096.
 const SAFE_LIMIT: usize = 4096;
+/// Smallest split budget we allow for an entry body. Without a floor, a
+/// footer close to the message limit drives `split_html` down to one visible
+/// character per message, producing a flood of tiny messages.
+const MIN_TEXT_CHUNK: usize = 512;
+/// Display cap for feed titles/authors in the source footer. The stored value
+/// stays untouched; this only bounds what the public channel sees.
+const SOURCE_DISPLAY_MAX: usize = 200;
 /// Telegram caption limit for media messages.
 const CAPTION_LIMIT: usize = 1024;
 /// Bot API rich message hard limits (10.x): rich text and media attachments.
@@ -874,6 +881,15 @@ async fn try_send_rich_media(
     send_rich_once(bot, chat_id, html, media).await
 }
 
+/// Truncate display text to at most `max_units` UTF-16 units (Telegram's
+/// measure), appending an ellipsis when content was dropped.
+fn truncate_display_text(s: &str, max_units: usize) -> String {
+    if utf16_len(s) <= max_units {
+        return s.to_string();
+    }
+    format!("{}…", take_utf16_prefix(s, max_units.saturating_sub(1)))
+}
+
 /// Source footer line, or empty string.
 fn source_line(entry: &Entry, feed_title: &str, author: Option<&str>, sd: SourceDisplay) -> String {
     match sd {
@@ -881,17 +897,21 @@ fn source_line(entry: &Entry, feed_title: &str, author: Option<&str>, sd: Source
             if feed_title.is_empty() {
                 return String::new();
             }
+            let title = truncate_display_text(feed_title, SOURCE_DISPLAY_MAX);
             match fetcher::entry_link(entry) {
                 Some(url) => format!(
                     "<i>via <a href=\"{}\">{}</a></i>",
                     escape_attr(&url),
-                    escape_html(feed_title)
+                    escape_html(&title)
                 ),
-                None => format!("<i>via {}</i>", escape_html(feed_title)),
+                None => format!("<i>via {}</i>", escape_html(&title)),
             }
         }
         SourceDisplay::Author => match author {
-            Some(a) if !a.is_empty() => format!("<i>author: {}</i>", escape_html(a)),
+            Some(a) if !a.is_empty() => format!(
+                "<i>author: {}</i>",
+                escape_html(&truncate_display_text(a, SOURCE_DISPLAY_MAX))
+            ),
             _ => String::new(),
         },
         SourceDisplay::None => String::new(),
@@ -2409,15 +2429,61 @@ async fn build_group_inputs(
     Ok(group)
 }
 
+/// Plan the body chunks and the normalized footer for one entry.
+///
+/// The last chunk carries the footer, so its budget is reserved up front. The
+/// footer itself is capped to leave at least `MIN_TEXT_CHUNK` visible units
+/// for the body; this is what prevents a near-4096 footer from degenerating
+/// into one-character chunks and a final message that exceeds Telegram's
+/// limit. `visible_len` and `truncate_html_keep_links` now share the same
+/// entity-decoded unit, so the reserve matches the truncation budget.
+fn plan_text_chunks(html_text: &str, footer: &str) -> (String, Vec<String>) {
+    let body_len = visible_len(html_text);
+    // An empty body still needs one unit of room so the "\n\n" separator does
+    // not eat the footer budget; a non-empty body gets the full floor.
+    let min_body = if body_len == 0 { 1 } else { MIN_TEXT_CHUNK };
+    let footer_limit = SAFE_LIMIT.saturating_sub(2 + min_body);
+    let footer = if visible_len(footer) > footer_limit {
+        // HTML-aware: a raw UTF-16 cut can split an <a>/<i> tag or entity.
+        let (cut, _) = truncate_html_keep_links(footer, footer_limit.saturating_sub(1));
+        format!("{cut}…")
+    } else {
+        footer.to_string()
+    };
+    let footer_reserve = visible_len(&footer) + 2;
+    let limit = SAFE_LIMIT
+        .saturating_sub(footer_reserve)
+        .max(MIN_TEXT_CHUNK);
+    let mut chunks = split_html(html_text, limit);
+    if chunks.is_empty() {
+        chunks.push(html_text.to_string());
+    }
+
+    // Defensive check: the budget math above should make this unreachable, but
+    // never hand Telegram an over-limit last chunk (it would 400 and enter the
+    // outbox retry loop).
+    let last_budget = SAFE_LIMIT.saturating_sub(footer_reserve);
+    if let Some(last) = chunks.last_mut() {
+        if visible_len(last) > last_budget {
+            tracing::warn!(
+                chunk_units = visible_len(last),
+                budget = last_budget,
+                "last text chunk exceeds the footer-adjusted budget; truncating"
+            );
+            let (cut, _) = truncate_html_keep_links(last, last_budget.saturating_sub(1));
+            *last = format!("{cut}…");
+        }
+    }
+    (footer, chunks)
+}
+
 /// Send an entry and return the FIRST sent message (used to build the
 /// Telegram message link for owner failure notices).
 /// When split into multiple messages, each subsequent message replies to the
 /// previous one for easy navigation. The footer is placed on the last message.
 ///
-/// Resume-aware retry: if a chunk fails, only that chunk is retried (bounded
-/// backoff) — earlier chunks are already delivered and are never re-sent.
-/// This mirrors the media path's op-level resume and prevents the scheduler's
-/// coarse whole-entry retry from duplicating already-sent chunks.
+/// Chunk-level retry is bounded within this call. A whole-entry outbox retry
+/// re-runs this function from chunk zero; chunk progress is not persisted.
 pub async fn send_entry_msg(
     bot: &Bot,
     chat_id: i64,
@@ -2425,34 +2491,7 @@ pub async fn send_entry_msg(
     footer: &str,
     link_preview: bool,
 ) -> anyhow::Result<Message> {
-    // The last chunk gets the footer (source line) appended, so reserve the
-    // footer's visible length in the split budget up front, to avoid the
-    // combined text exceeding Telegram's 4096 limit and failing to send.
-    // +2 accounts for the "\n\n" separator (visible chars) used when
-    // joining, preventing an extreme edge case from going over 4096.
-    // No longer capped at 500: with very long source titles an insufficient
-    // reserve would make last-chunk+footer deterministically exceed 4096.
-    // If the footer itself exceeds SAFE_LIMIT it is truncated (cannot happen
-    // in practice; purely defensive).
-    let footer: String = if visible_len(footer) > SAFE_LIMIT - 2 {
-        // HTML-aware: a raw UTF-16 cut can split an <a>/<i> tag or entity.
-        let (cut, _) = truncate_html_keep_links(footer, SAFE_LIMIT - 3);
-        format!("{cut}…")
-    } else {
-        footer.to_string()
-    };
-    let footer_reserve = visible_len(&footer) + 2;
-    let chunks = split_html(html_text, SAFE_LIMIT.saturating_sub(footer_reserve).max(1));
-    // Defensive: split_html does not contractually guarantee a non-empty Vec
-    // (a pathological input whose visible_len>limit but whose every \n\n
-    // segment is empty could yield none). Guard against the `len()-1` underflow
-    // and the `expect("at least one chunk")` panic below by sending a single
-    // message instead — never silently drop the entry.
-    let chunks = if chunks.is_empty() {
-        vec![html_text.to_string()]
-    } else {
-        chunks
-    };
+    let (footer, chunks) = plan_text_chunks(html_text, footer);
     let mut first_msg: Option<Message> = None;
     let last_idx = chunks.len() - 1;
     for (i, chunk) in chunks.iter().enumerate() {
@@ -3129,5 +3168,64 @@ mod tests {
         assert_eq!(ContentMode::from_str("content_only"), ContentMode::ContentOnly);
         assert_eq!(ContentMode::from_str("MediaOnly"), ContentMode::MediaOnly);
         assert_eq!(ContentMode::from_str("unknown"), ContentMode::TitleLink);
+    }
+
+    // ===== footer / split planning =====
+
+    #[test]
+    fn plan_text_chunks_keeps_last_chunk_plus_footer_within_limit() {
+        let body = "正文".repeat(500);
+        let footer = format!("<i>via {}</i>", "长".repeat(4090));
+        let (footer, chunks) = plan_text_chunks(&body, &footer);
+
+        assert!(visible_len(&footer) <= SAFE_LIMIT - 2 - MIN_TEXT_CHUNK);
+        assert!(chunks.iter().all(|c| visible_len(c) <= MIN_TEXT_CHUNK));
+        let last = format!("{}\n\n{}", chunks.last().unwrap(), footer);
+        assert!(visible_len(&last) <= SAFE_LIMIT);
+    }
+
+    #[test]
+    fn plan_text_chunks_entity_heavy_footer_does_not_degrade_to_one_char() {
+        let body = "x".repeat(100);
+        let footer = format!("<i>via {}</i>", "&amp;".repeat(820));
+        let (footer, chunks) = plan_text_chunks(&body, &footer);
+
+        assert!(visible_len(&footer) <= SAFE_LIMIT - 2 - MIN_TEXT_CHUNK);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(visible_len(&chunks[0]), 100);
+        let last = format!("{}\n\n{}", chunks[0], footer);
+        assert!(visible_len(&last) <= SAFE_LIMIT);
+    }
+
+    #[test]
+    fn plan_text_chunks_empty_body_allows_long_footer_but_fits() {
+        let footer = format!("<i>via {}</i>", "y".repeat(4090));
+        let (footer, chunks) = plan_text_chunks("", &footer);
+
+        assert_eq!(chunks.len(), 1);
+        let last = format!("\n\n{}", footer);
+        assert!(visible_len(&last) <= SAFE_LIMIT);
+    }
+
+    #[test]
+    fn plan_text_chunks_keeps_4094_body_in_one_message() {
+        let body = "x".repeat(SAFE_LIMIT - 2);
+        let (footer, chunks) = plan_text_chunks(&body, "");
+
+        assert!(footer.is_empty());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(visible_len(&chunks[0]), SAFE_LIMIT - 2);
+    }
+
+    #[test]
+    fn source_line_caps_display_title_and_author() {
+        let entry = rss_entry_with_body("");
+        let long = "标".repeat(300);
+
+        let line = source_line(&entry, &long, None, SourceDisplay::Source);
+        assert_eq!(visible_len(&line), 4 + SOURCE_DISPLAY_MAX);
+
+        let line = source_line(&entry, "t", Some(&long), SourceDisplay::Author);
+        assert_eq!(visible_len(&line), 8 + SOURCE_DISPLAY_MAX);
     }
 }

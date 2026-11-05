@@ -48,13 +48,17 @@ impl CommandRateLimiter {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if map.len() >= MAX_TRACKED_USERS {
             // Drop queues whose calls have all left the window. If every
-            // tracked user is still active, keep the map as-is: rejecting new
-            // tracking would silently disable the rate limit.
+            // tracked user is still active, fail closed for a new user instead
+            // of growing the map past the cap; silently exceeding the bound
+            // defeats the purpose of MAX_TRACKED_USERS.
             map.retain(|_, q| {
                 q.back()
                     .map(|t| now.duration_since(*t) < COMMAND_WINDOW)
                     .unwrap_or(false)
             });
+            if map.len() >= MAX_TRACKED_USERS && !map.contains_key(&user_id) {
+                return false;
+            }
         }
         let q = map.entry(user_id).or_default();
         while q
@@ -155,6 +159,27 @@ mod tests {
         assert!(limiter.allow_at(99_999, later), "new user should be tracked after pruning stale queues");
         let map = limiter.inner.lock().unwrap();
         assert!(map.len() < MAX_TRACKED_USERS, "stale queues must be dropped at capacity");
+    }
+
+    #[test]
+    fn active_users_at_capacity_reject_new_tracking() {
+        let limiter = CommandRateLimiter::new();
+        let t0 = Instant::now();
+        {
+            let mut map = limiter.inner.lock().unwrap();
+            for uid in 0..MAX_TRACKED_USERS as i64 {
+                let mut q = VecDeque::new();
+                q.push_back(t0);
+                map.insert(uid, q);
+            }
+        }
+        assert!(
+            !limiter.allow_at(99_999, t0),
+            "a full map of active users must reject a new user"
+        );
+        let map = limiter.inner.lock().unwrap();
+        assert_eq!(map.len(), MAX_TRACKED_USERS);
+        assert!(!map.contains_key(&99_999));
     }
 
     #[test]

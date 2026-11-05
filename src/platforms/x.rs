@@ -54,6 +54,10 @@ const FEATURES_FEED: &str = r#"{"rweb_tipjar_consumption_enabled":true,"responsi
 /// entries from older pages are still filtered downstream by the
 /// scheduler's sent-entry dedup, so widening the window never re-pushes.
 const MAX_TIMELINE_PAGES: usize = 3;
+/// Consecutive empty pages tolerated before giving up. A module/composer-only
+/// page can legitimately yield zero tweets but still carry a bottom cursor;
+/// stopping on the first such page permanently hides older tweets behind it.
+const MAX_EMPTY_TIMELINE_PAGES: usize = 2;
 
 /// Pause between timeline pages: extra requests inside one round raise
 /// rate-limit / risk-control exposure; the cadence matches the send-side
@@ -678,6 +682,7 @@ async fn fetch_user_tweets(
     // Pages actually fetched this round (drives the inter-page pause so the
     // first page — and a fully cached short timeline — stays request-cheap).
     let mut pages_fetched = 0usize;
+    let mut empty_pages = 0usize;
     // Instruction types this parser does not understand, aggregated across
     // pages. They may carry tweets (e.g. a future module instruction); a warn
     // makes such a shape change visible instead of silently returning empty.
@@ -745,8 +750,10 @@ async fn fetch_user_tweets(
 
         // Stop conditions (none can loop forever): no bottom cursor, a cursor
         // identical to the one just used (X sometimes repeats it on an
-        // exhausted timeline), or a page that yielded no tweets at all
-        // (further pages cannot recover from an empty/redesigned page).
+        // exhausted timeline), or several consecutive pages with no tweets.
+        // A single zero-tweet page can be a module/composer page with a valid
+        // cursor; breaking immediately made all older tweets behind it
+        // permanently unreachable. MAX_TIMELINE_PAGES still bounds the loop.
         //
         // Do NOT stop just because every tweet on this page is already in
         // sent_entries: a failed/deferred entry on an older page (MediaOnly
@@ -754,8 +761,16 @@ async fn fetch_user_tweets(
         // for the next round. Stopping here would make that page unreachable
         // until the account posts again, silently dropping the pending entry.
         let Some(next) = page.bottom_cursor else { break };
-        if page_tweet_count == 0 || Some(&next) == cursor.as_ref() {
+        if Some(&next) == cursor.as_ref() {
             break;
+        }
+        if page_tweet_count == 0 {
+            empty_pages += 1;
+            if empty_pages >= MAX_EMPTY_TIMELINE_PAGES {
+                break;
+            }
+        } else {
+            empty_pages = 0;
         }
         cursor = Some(next);
     }

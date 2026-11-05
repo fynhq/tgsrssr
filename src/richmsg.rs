@@ -33,12 +33,18 @@ struct TelegramResponseParameters {
 async fn parse_response<T: for<'de> Deserialize<'de>>(
     response: reqwest_bot::Response,
 ) -> anyhow::Result<T> {
+    // Match the rest of the remote-read paths: a hijacked/misconfigured Bot
+    // API endpoint must not be able to make us buffer an unbounded response.
+    const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
     let status = response.status();
     let body = response
-        .text()
+        .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("rich message response read failed: {}", e.without_url()))?;
-    let parsed: TelegramResponse<T> = serde_json::from_str(&body).map_err(|e| {
+    if body.len() > MAX_RESPONSE_BYTES {
+        anyhow::bail!("rich message response too large: {} bytes", body.len());
+    }
+    let parsed: TelegramResponse<T> = serde_json::from_slice(&body).map_err(|e| {
         anyhow::anyhow!(
             "rich message response parse failed (HTTP {}): {}",
             status.as_u16(),
