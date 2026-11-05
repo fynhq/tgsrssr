@@ -31,6 +31,7 @@ reqwest = { version = "0.13.5", features = [
 # teloxide 0.17 pins reqwest 0.12; the bot client we inject must match it.
 reqwest_bot = { package = "reqwest", version = "0.12.28", default-features = false, features = [
     "rustls-tls",
+    "socks",
 ] }
 
 # Database

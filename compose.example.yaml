@@ -59,9 +59,15 @@ services:
       ## path.
       # BOT_API_MEDIA_DIR: "/var/lib/telegram-bot-api-media"
 
-      ## 默认空=官方 API；本地 bot-api 时设置
-      ## Empty = official API; set when using a local bot-api
+      ## 默认空=官方 API；本地 bot-api 时设置，此时 BOT_PROXY 被忽略
+      ## Empty = official API; set for a local bot-api, which makes BOT_PROXY ignored
       # BOT_API_URL: "http://127.0.0.1:8081"
+
+      ## Bot API 代理（http:// / socks5:// / socks5h://）；默认空=直连。
+      ## 仅 BOT_API_URL 为空时生效；RSS/平台/媒体仍走 RSS_PROXY。
+      ## Bot API proxy (http:// / socks5:// / socks5h://); empty = direct.
+      ## Only used when BOT_API_URL is empty; RSS/platform/media keep using RSS_PROXY.
+      # BOT_PROXY: "socks5h://127.0.0.1:1080"
 
       ## 默认空=直连
       ## Empty = direct connection

@@ -242,6 +242,10 @@ impl AppState {
             }
             if let Some(p) = proxy {
                 b = b.proxy(reqwest::Proxy::all(p)?);
+            } else {
+                // Proxy routing is explicit: ignore HTTP(S)_PROXY/ALL_PROXY
+                // environment variables so `*_direct` clients stay direct.
+                b = b.no_proxy();
             }
             // Android/Termux has no JVM app context, which reqwest 0.13's
             // default rustls verifier (rustls-platform-verifier) requires.

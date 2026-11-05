@@ -47,6 +47,22 @@ async fn main() -> anyhow::Result<()> {
             "RSS proxy enabled: SSRF veto allows a local DNS lookup failure to proceed via the proxy; platform APIs skip local DNS checks behind the proxy. Scope the proxy ACL accordingly."
         );
     }
+    // Bot API and RSS proxies are independent. A custom/local Bot API endpoint
+    // is contacted directly; its own connectivity to Telegram is out of scope
+    // for BOT_PROXY.
+    let bot_proxy = if cfg.bot_api_url.is_some() {
+        if cfg.bot_proxy.is_some() {
+            tracing::warn!(
+                "BOT_PROXY ignored because BOT_API_URL is set; the custom Bot API endpoint is contacted directly"
+            );
+        }
+        None
+    } else {
+        cfg.bot_proxy.clone()
+    };
+    if bot_proxy.is_some() {
+        info!("Bot API proxy enabled (BOT_PROXY); RSS traffic keeps using RSS_PROXY/RSS_NO_PROXY");
+    }
     if !cfg.rss_trusted_private_hosts.is_empty() {
         tracing::warn!(
             hosts = ?cfg.rss_trusted_private_hosts,
@@ -67,9 +83,7 @@ async fn main() -> anyhow::Result<()> {
     // local Bot API (proxy → Telegram) can take minutes; teloxide's default
     // 30s client timeout was cutting SendMediaGroup off mid-upload.
     // 10 minutes: gives large media a fair shot without hanging forever.
-    let http_client = reqwest_bot::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()?;
+    let http_client = build_bot_client(bot_proxy.as_deref(), std::time::Duration::from_secs(600))?;
     let mut bot = Bot::with_client(&cfg.token, http_client);
     if let Some(api_url) = &cfg.bot_api_url {
         let url = reqwest::Url::parse(api_url)?;
@@ -81,9 +95,7 @@ async fn main() -> anyhow::Result<()> {
     // Use a dedicated short-timeout client: the main client's 600s timeout
     // exists for large media uploads and would make a dead endpoint hang
     // startup for ten minutes per probe.
-    let probe_client = reqwest_bot::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
+    let probe_client = build_bot_client(bot_proxy.as_deref(), std::time::Duration::from_secs(15))?;
     let mut probe_bot = Bot::with_client(&cfg.token, probe_client);
     if let Some(api_url) = &cfg.bot_api_url {
         probe_bot = probe_bot.set_api_url(reqwest::Url::parse(api_url)?);
@@ -281,6 +293,31 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Builds a Bot API HTTP client with an explicit proxy decision.
+///
+/// BOT_PROXY is the only proxy setting for Bot API traffic: `None` disables
+/// system proxy environment variables, so an unset BOT_PROXY always means a
+/// direct connection. RSS clients apply the same explicit pattern in
+/// `AppState::new`.
+fn build_bot_client(
+    proxy: Option<&str>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<reqwest_bot::Client> {
+    let builder = reqwest_bot::Client::builder().timeout(timeout);
+    let builder = match proxy {
+        Some(p) => {
+            let proxy = reqwest_bot::Proxy::all(p).map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid BOT_PROXY (expected http://, socks5:// or socks5h://): {e}"
+                )
+            })?;
+            builder.proxy(proxy)
+        }
+        None => builder.no_proxy(),
+    };
+    Ok(builder.build()?)
 }
 
 /// Resolves when the process is asked to stop, returning which signal arrived.
@@ -677,5 +714,18 @@ mod tests {
         assert!(all_cmds.iter().any(|c| c.command == "/loget"));
         // loget sits between cookies and about; about stays last.
         assert_eq!(all_cmds.last().map(|c| c.command.as_str()), Some("/about"));
+    }
+
+    #[test]
+    fn bot_client_accepts_explicit_proxy_schemes() {
+        for proxy in [
+            "http://127.0.0.1:8080",
+            "socks5://127.0.0.1:1080",
+            "socks5h://127.0.0.1:1080",
+        ] {
+            let client = build_bot_client(Some(proxy), std::time::Duration::from_secs(1));
+            assert!(client.is_ok(), "BOT_PROXY {proxy} should be accepted");
+        }
+        assert!(build_bot_client(None, std::time::Duration::from_secs(1)).is_ok());
     }
 }

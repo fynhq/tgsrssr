@@ -15,6 +15,9 @@ pub struct Config {
     // Bot
     pub token: String,
     pub bot_api_url: Option<String>,
+    /// Bot API proxy (http/socks5/socks5h). Ignored when `bot_api_url` is set:
+    /// a custom/local Bot API endpoint is contacted directly.
+    pub bot_proxy: Option<String>,
     pub allowed_user_ids: Vec<i64>,
     /// The single admin user ID: can manage cookies, fetch logs, and receive
     /// platform health notifications. Exactly one is required.
@@ -106,6 +109,7 @@ impl Config {
             .map_err(|_| anyhow::anyhow!("TELOXIDE_TOKEN is required"))?;
 
         let bot_api_url = std::env::var("BOT_API_URL").ok().filter(|s| !s.is_empty());
+        let bot_proxy = std::env::var("BOT_PROXY").ok().filter(|s| !s.is_empty());
 
         let allowed_user_ids = parse_id_list("ALLOWED_USER_IDS");
         // Exactly one admin is required. Missing (unset/empty/all-invalid) or
@@ -140,6 +144,7 @@ impl Config {
         Ok(Self {
             token,
             bot_api_url,
+            bot_proxy,
             allowed_user_ids,
             admin_user_id,
             db_path,

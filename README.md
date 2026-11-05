@@ -164,9 +164,10 @@ SSRF 防护默认拒绝私网/回环地址。RSSHub 与 bot 同机/同网时，�
 | `TELOXIDE_TOKEN` | BotFather token（**必填**） | - |
 | `ADMIN_USER_IDS` | 管理员，**必须配置且只允许一个正整数**用户 ID；可用 /cookies、/loget，接收平台告警 | - |
 | `ALLOWED_USER_IDS` | 用户白名单 ID，逗号分隔（可选；管理员隐式放行） | 空 |
-| `BOT_API_URL` | 本地 Bot API 地址；空 = 官方 API | 空 |
+| `BOT_API_URL` | 本地 Bot API 地址；空 = 官方 API（设置后 `BOT_PROXY` 被忽略） | 空 |
+| `BOT_PROXY` | Bot API 代理（`http://`、`socks5://`、`socks5h://`）；空 = 直连 | 空 |
 | `BOT_API_MEDIA_DIR` | bot-api 容器内的共享媒体目录（富消息附件 file:// 直读；非空 + `BOT_API_URL` 启用 2GB 上限） | /var/lib/telegram-bot-api-media |
-| `RSS_PROXY` | 抓取 SOCKS5 代理（如 `socks5h://127.0.0.1:1080`） | 空 |
+| `RSS_PROXY` | RSS/平台抓取与媒体下载代理（如 `socks5h://127.0.0.1:1080`；含 t.me） | 空 |
 | `RSS_NO_PROXY` | 不走代理的域名（逗号分隔） | 空 |
 | `RSS_INSECURE_HOSTS` | 跳过 TLS 验证的域名 | 空 |
 | `RSS_TRUSTED_PRIVATE_HOSTS` | 受信私网源 allowlist，精确 `host:port`（如 `127.0.0.1:1200`、`rsshub:1200`）；仅管理员/受信用户可用，非通用白名单 | 空 |
@@ -189,6 +190,8 @@ SSRF 防护默认拒绝私网/回环地址。RSSHub 与 bot 同机/同网时，�
 | `MEDIA_DIR` | 媒体目录 | media |
 | `LOG_DIR` | 日志目录 | logs |
 | `RUST_LOG` | 日志级别（tracing EnvFilter） | info |
+
+代理只由 `RSS_PROXY`/`BOT_PROXY` 控制：程序不读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`。`BOT_PROXY` 仅覆盖 Bot API；t.me 频道抓取、feed 与媒体下载按 `RSS_PROXY`/`RSS_NO_PROXY` 路由。
 
 完整可调项（清理、备份、缓存保留期等）及默认值见 [compose.example.yaml](compose.example.yaml)。
 
@@ -225,6 +228,8 @@ services:
 ```
 
 `BOT_API_MEDIA_DIR` 默认即 `/var/lib/telegram-bot-api-media`，仅当 bot-api 容器内路径不同才需修改。由于该默认值非空，**是否启用本地 Bot API 模式（2GB 上限）只看 `BOT_API_URL` 是否设置**。
+
+本地/custom Bot API 模式下 `BOT_PROXY` 被忽略：bot 直接连接 `BOT_API_URL`，到 Telegram 的连通性由 bot-api 服务自己负责。
 
 ## 通知
 
@@ -417,9 +422,10 @@ Subscribe with `https://t.me/<channel>`. Public channels only, no login required
 | `TELOXIDE_TOKEN` | BotFather token (**required**) | - |
 | `ADMIN_USER_IDS` | Admin, **required, exactly one positive** user ID; can use /cookies and /loget, receives platform alerts | - |
 | `ALLOWED_USER_IDS` | Whitelisted user IDs, comma-separated (optional; admin is implicitly allowed) | empty |
-| `BOT_API_URL` | Local Bot API address; empty = official API | empty |
+| `BOT_API_URL` | Local Bot API address; empty = official API (`BOT_PROXY` is ignored when set) | empty |
+| `BOT_PROXY` | Bot API proxy (`http://`, `socks5://`, `socks5h://`); empty = direct | empty |
 | `BOT_API_MEDIA_DIR` | Shared media dir inside the bot-api container (rich-message file:// attachments; non-empty + `BOT_API_URL` enables the 2GB cap) | /var/lib/telegram-bot-api-media |
-| `RSS_PROXY` | Fetch SOCKS5 proxy (e.g. `socks5h://127.0.0.1:1080`) | empty |
+| `RSS_PROXY` | Proxy for RSS/platform fetches and media downloads (e.g. `socks5h://127.0.0.1:1080`; includes t.me) | empty |
 | `RSS_NO_PROXY` | Domains bypassing the proxy (comma-separated) | empty |
 | `RSS_INSECURE_HOSTS` | Domains skipping TLS verification | empty |
 | `RSS_TRUSTED_PRIVATE_HOSTS` | Trusted private-source allowlist, exact `host:port` (e.g. `127.0.0.1:1200`, `rsshub:1200`); admin/trusted users only, not a general allowlist | empty |
@@ -442,6 +448,8 @@ Subscribe with `https://t.me/<channel>`. Public channels only, no login required
 | `MEDIA_DIR` | Media directory | media |
 | `LOG_DIR` | Log directory | logs |
 | `RUST_LOG` | Log level (tracing EnvFilter) | info |
+
+Proxies are controlled only by `RSS_PROXY`/`BOT_PROXY`: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` are ignored. `BOT_PROXY` covers the Bot API only; t.me channel scraping, feeds, and media downloads follow `RSS_PROXY`/`RSS_NO_PROXY`.
 
 The full set of tunables (cleanup, backup, cache retention, etc.) and their defaults are in [compose.example.yaml](compose.example.yaml).
 
@@ -478,6 +486,8 @@ services:
 ```
 
 `BOT_API_MEDIA_DIR` defaults to `/var/lib/telegram-bot-api-media`; override it only if the bot-api container uses a different path. Because the default is non-empty, **local Bot API mode (2GB cap) is controlled by whether `BOT_API_URL` is set**.
+
+In local/custom Bot API mode, `BOT_PROXY` is ignored: the bot connects to `BOT_API_URL` directly, and the bot-api server is responsible for its own connectivity to Telegram.
 
 ## Notifications
 
