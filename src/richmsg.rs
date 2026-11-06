@@ -10,6 +10,7 @@
 //! photo/video/document attachments. Rich media is an enhancement; callers
 //! must fall back to the normal send path when this module returns an error.
 
+use anyhow::Context;
 use reqwest_bot::multipart::{Form, Part};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -35,14 +36,25 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
 ) -> anyhow::Result<T> {
     // Match the rest of the remote-read paths: a hijacked/misconfigured Bot
     // API endpoint must not be able to make us buffer an unbounded response.
+    // Read chunk by chunk and abort as soon as the cap is exceeded, so the
+    // limit actually bounds memory instead of only gating the later parse.
     const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
     let status = response.status();
-    let body = response
-        .bytes()
+    let mut response = response;
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| anyhow::anyhow!("rich message response read failed: {}", e.without_url()))?;
-    if body.len() > MAX_RESPONSE_BYTES {
-        anyhow::bail!("rich message response too large: {} bytes", body.len());
+        .map_err(|e| e.without_url())
+        .context("rich message response read failed")?
+    {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_RESPONSE_BYTES {
+            anyhow::bail!(
+                "rich message response too large (limit {} bytes)",
+                MAX_RESPONSE_BYTES
+            );
+        }
     }
     let parsed: TelegramResponse<T> = serde_json::from_slice(&body).map_err(|e| {
         anyhow::anyhow!(
@@ -276,7 +288,13 @@ pub async fn send_rich_message(
             .json(&payload)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("rich message request failed: {}", e.without_url()))?;
+            // Keep the reqwest error as the anyhow source chain: the A1
+            // ambiguity classification in push.rs matches on transport-level
+            // details (timeout / connection reset / closed) that only survive
+            // if the chain is attached, not Display-interpolated away.
+            // without_url() strips the bot token from the URL before logging.
+            .map_err(|e| e.without_url())
+            .context("rich message request failed")?;
         return parse_response::<Message>(response).await;
     }
 
@@ -300,7 +318,10 @@ pub async fn send_rich_message(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("rich message upload failed: {}", e.without_url()))?;
+        // Same chain-preserving wrap as the JSON path above; late-upload
+        // transport failures are exactly the ambiguous case A1 must catch.
+        .map_err(|e| e.without_url())
+        .context("rich message upload failed")?;
     parse_response::<Message>(response).await
 }
 

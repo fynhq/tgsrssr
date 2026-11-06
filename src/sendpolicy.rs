@@ -102,9 +102,15 @@ pub fn is_retryable_error(err_str: &str) -> bool {
 /// entry sent and asks the owner to confirm instead.
 ///
 /// - Explicitly undelivered (400/401/403/429, DNS, connect/refused):
-///   returns false — the caller may safely fall back.
+///   returns false — the caller may safely fall back. These are checked
+///   first, so a detailed error chain (richmsg attaches it via
+///   `.context(...)`) wins over the generic transport prefix below.
 /// - Ambiguous (timeout, connection reset/closed mid-request, interrupted
 ///   response body, 5xx / internal Server Error): returns true.
+/// - Bare "error sending request" with no further detail: also ambiguous.
+///   reqwest uses this prefix for every transport-phase failure; when no
+///   source detail is available the delivery state is genuinely unknown, and
+///   A1 prefers an uncertain-send notification over risking a duplicate.
 pub fn is_ambiguous_send_error(err_str: &str) -> bool {
     let explicit = err_str.contains("Too Many Requests")
         || err_str.contains("Retry after")
@@ -127,6 +133,8 @@ pub fn is_ambiguous_send_error(err_str: &str) -> bool {
         || err_str.contains("connection closed")
         || err_str.contains("incomplete")
         || err_str.contains("error decoding response body")
+        || err_str.contains("request or response body error")
+        || err_str.contains("error sending request")
         || err_str.contains("HTTP 5")
         || err_str.contains("internal Server Error")
         || err_str.contains("Internal Server Error")
@@ -214,10 +222,41 @@ mod tests {
             "connection reset by peer",
             "connection closed before message completed",
             "error decoding response body: incomplete message",
+            "request or response body error",
             "HTTP 500 Internal Server Error",
             "400: internal Server Error during file upload",
         ] {
             assert!(is_ambiguous_send_error(err), "{err}");
+        }
+    }
+
+    #[test]
+    fn rich_send_transport_failures_are_ambiguous() {
+        // richmsg wraps reqwest transport errors with .context(...); the
+        // classification sees the whole {:#} chain. A bare transport prefix
+        // with no source detail is genuinely uncertain, and a detailed chain
+        // must reach the matching ambiguous entry.
+        for err in [
+            "rich message request failed: error sending request",
+            "rich message upload failed: error sending request",
+            "rich message upload failed: error sending request: connection closed before message completed",
+            "rich message request failed: error sending request: operation timed out",
+            "rich message response read failed: request or response body error",
+        ] {
+            assert!(is_ambiguous_send_error(err), "{err}");
+        }
+    }
+
+    #[test]
+    fn explicit_detail_wins_over_transport_prefix() {
+        // The explicit-undelivered list is checked first, so a preserved
+        // connect-phase source chain still classifies as safely undelivered
+        // even though it carries the generic transport prefix.
+        for err in [
+            "rich message request failed: error sending request: tcp connect error: Connection refused (os error 111)",
+            "rich message request failed: error sending request: dns resolve failed",
+        ] {
+            assert!(!is_ambiguous_send_error(err), "{err}");
         }
     }
 }
