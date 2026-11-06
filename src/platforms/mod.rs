@@ -230,7 +230,7 @@ fn is_sensitive_header(name: &str) -> bool {
 
 /// GET with manual redirect handling for platform APIs.
 ///
-/// Platform API clients previously used the redirect-following `client_for_url`,
+/// Platform API clients previously used a redirect-following fetch client,
 /// which let an upstream response 302 to an intranet address and bypass the
 /// feed-entry SSRF pre-check. This helper:
 /// - follows at most `max_redirects` hops (0 = return the first response,
@@ -331,6 +331,28 @@ pub fn sort_entries_newest_first(entries: &mut [feed_rs::model::Entry]) {
         let tb = b.published.or(b.updated);
         tb.cmp(&ta)
     });
+}
+
+/// Batch-internal entry deduplication (the same post can appear at multiple
+/// positions in one API page). Pushes only entries with a non-empty id that
+/// was not seen before; returns whether the entry was pushed. Shared by the
+/// platform fetchers (weibo dedups on the raw mblog id before conversion and
+/// keeps its own set).
+///
+/// Convention for new platform fetchers: when the raw payload contained
+/// items but zero entries were produced, log a warn with the payload shape
+/// (the scheduler treats an empty result as success and resets the error
+/// count, so a silent structural break would look like a healthy empty feed).
+pub fn push_unique_entry(
+    entries: &mut Vec<feed_rs::model::Entry>,
+    seen: &mut std::collections::HashSet<String>,
+    entry: feed_rs::model::Entry,
+) -> bool {
+    if entry.id.is_empty() || !seen.insert(entry.id.clone()) {
+        return false;
+    }
+    entries.push(entry);
+    true
 }
 
 /// Build a display title from plain text: first 50 chars + "…" if truncated.

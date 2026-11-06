@@ -13,7 +13,6 @@ license = "MIT"
 # default-features disabled to avoid native-tls (openssl-sys); using rustls instead.
 teloxide = { version = "0.17.0", default-features = false, features = [
     "macros",
-    "ctrlc_handler",
     "rustls",
 ] }
 
@@ -39,7 +38,6 @@ sqlx = { version = "0.9.0", features = [
     "runtime-tokio",
     "sqlite",
     "macros",
-    "chrono",
     "migrate",
 ] }
 

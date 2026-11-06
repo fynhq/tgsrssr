@@ -260,9 +260,7 @@ pub async fn fetch_telegram_channel(
         if let Some(e) = message_to_entry(post, block, &feed_title, lang) {
             // Dedup by entry id within the batch, matching the Weibo/X
             // convention (fix for #8)
-            if !e.id.is_empty() && seen_ids.insert(e.id.clone()) {
-                entries.push(e);
-            }
+            crate::platforms::push_unique_entry(&mut entries, &mut seen_ids, e);
         }
     }
 
@@ -488,7 +486,8 @@ fn extract_published(block: &str) -> Option<DateTime<Utc>> {
     // anchor (truncated markup): exclude through end of block — a missing
     // timestamp is safer than the quoted message's wrong one.
     let reply_range = RE_REPLY_BLOCK.find(block).map(|reply| {
-        let end = balanced_close_start(block, reply.end(), &RE_ANCHOR_OPEN, &RE_ANCHOR_CLOSE, 1)
+        let end = crate::htmltext::find_balanced_close(block, reply.end(), &RE_ANCHOR_OPEN, &RE_ANCHOR_CLOSE)
+            .map(|(close_start, _)| close_start)
             .unwrap_or(block.len());
         (reply.start(), end)
     });
@@ -550,9 +549,10 @@ fn extract_main_text_html(block: &str, data_post: &str) -> String {
 /// (but excluding) the matching `</a>`. Handles nested `<a>` hyperlinks.
 /// Falls back to the rest of the string if no balanced close is found.
 fn extract_balanced_anchor_inner(html: &str, start: usize) -> String {
-    // We are already inside the reply <a>, hence depth 1.
-    match balanced_close_start(html, start, &RE_ANCHOR_OPEN, &RE_ANCHOR_CLOSE, 1) {
-        Some(pos) => html[start..pos].to_string(),
+    // We are already inside the reply <a>, hence the scanner starts at depth 1
+    // (the opening tag is before `start`).
+    match crate::htmltext::find_balanced_close(html, start, &RE_ANCHOR_OPEN, &RE_ANCHOR_CLOSE) {
+        Some((close_start, _)) => html[start..close_start].to_string(),
         None => html[start..].to_string(),
     }
 }
@@ -565,48 +565,12 @@ fn extract_balanced_anchor_inner(html: &str, start: usize) -> String {
 /// `true`; on an unbalanced region returns the remainder and `false` so
 /// callers can log a redesign warning.
 fn extract_balanced_div_inner(html: &str, start: usize) -> (String, bool) {
-    // We are already inside the text <div>, hence depth 1.
-    match balanced_close_start(html, start, &RE_DIV_OPEN, &RE_DIV_CLOSE, 1) {
-        Some(pos) => (html[start..pos].to_string(), true),
+    // We are already inside the text <div>, hence the scanner starts at
+    // depth 1 (the opening tag is before `start`).
+    match crate::htmltext::find_balanced_close(html, start, &RE_DIV_OPEN, &RE_DIV_CLOSE) {
+        Some((close_start, _)) => (html[start..close_start].to_string(), true),
         None => (html[start..].to_string(), false),
     }
-}
-
-/// Shared skeleton for the balanced-tag scanners above: collect open/close
-/// tag positions at or after `start`, walk them in order from `initial_depth`,
-/// and return the offset where depth returns to 0 (the matching close tag).
-/// `None` when the region never closes.
-fn balanced_close_start(
-    html: &str,
-    start: usize,
-    re_open: &regex::Regex,
-    re_close: &regex::Regex,
-    initial_depth: i32,
-) -> Option<usize> {
-    let mut events: Vec<(usize, bool)> = Vec::new(); // (pos, is_open)
-    for m in re_open.find_iter(html) {
-        if m.start() >= start {
-            events.push((m.start(), true));
-        }
-    }
-    for m in re_close.find_iter(html) {
-        if m.start() >= start {
-            events.push((m.start(), false));
-        }
-    }
-    events.sort_by_key(|e| e.0);
-    let mut depth = initial_depth;
-    for (pos, is_open) in events {
-        if is_open {
-            depth += 1;
-        } else {
-            depth -= 1;
-            if depth == 0 {
-                return Some(pos);
-            }
-        }
-    }
-    None
 }
 
 /// Append `<img>`/`<video>` tags for the message's media to the body.

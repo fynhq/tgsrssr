@@ -30,11 +30,16 @@ static RE_BQ_CLOSE_TAG: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)</blockquote\s*>").unwrap());
 static RE_PRE_CLOSE_TAG: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)</pre\s*>").unwrap());
+/// Generic `<pre ...>` open tag (any content). Distinct from the re-wrap
+/// helper's `<pre><code>` pair pattern used later in the splitter.
+static RE_PRE_TAG_OPEN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)<pre\b[^>]*>").unwrap());
 
 /// Find the matching close tag for a block opened just before `open_end`,
 /// counting nested opens. Returns the close tag's (start, end); None when the
-/// region never closes.
-fn find_balanced_close(
+/// region never closes. Shared with the Telegram channel parser's balanced
+/// anchor/div scanners (single depth-counting implementation).
+pub fn find_balanced_close(
     text: &str,
     open_end: usize,
     open_re: &regex::Regex,
@@ -579,13 +584,16 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
         if in_block {
             block_buf.push_str("\n\n");
             block_buf.push_str(para);
-            if para.contains("</blockquote>") || para.contains("</pre>") {
+            // Case-insensitive like the rest of the tag handling (the old
+            // literal `contains` missed an uppercase </BLOCKQUOTE>, so the
+            // block was not merged as an atomic segment).
+            if RE_BQ_CLOSE_TAG.is_match(para) || RE_PRE_CLOSE_TAG.is_match(para) {
                 in_block = false;
                 segments.push(block_buf.clone());
                 block_buf.clear();
             }
-        } else if (para.contains("<blockquote") && !para.contains("</blockquote>"))
-            || (para.contains("<pre") && !para.contains("</pre>"))
+        } else if (RE_BQ_OPEN_TAG.is_match(para) && !RE_BQ_CLOSE_TAG.is_match(para))
+            || (RE_PRE_TAG_OPEN.is_match(para) && !RE_PRE_CLOSE_TAG.is_match(para))
         {
             // Block element opens but doesn't close in this paragraph.
             in_block = true;

@@ -200,9 +200,7 @@ async fn fetch_x_user_with_ct0(
     for tweet in &tweets {
         match tweet_to_entry(tweet, screen_name, &display_name, lang) {
             ConvertOutcome::Ok(e) => {
-                if !e.id.is_empty() && seen_ids.insert(e.id.clone()) {
-                    entries.push(*e);
-                }
+                crate::platforms::push_unique_entry(&mut entries, &mut seen_ids, *e);
             }
             ConvertOutcome::SkippedReply => skipped_replies += 1,
             ConvertOutcome::Failed => dropped += 1,
@@ -1254,10 +1252,13 @@ fn linkify_hashtags_in_text(text: &str) -> String {
         if b != b'#' && b != b'$' {
             continue;
         }
-        // Boundary: char before must not be alnum/underscore.
+        // Boundary: char before must not be alnum/underscore, and must not be
+        // part of an HTML entity — either the sigil itself is entity syntax
+        // ("&#35;" → prev '&') or it follows an escaped entity source (user
+        // text "&#123;" renders as "&amp;#123;" → prev ';').
         if i > 0 {
             let prev = bytes[i - 1];
-            if prev.is_ascii_alphanumeric() || prev == b'_' {
+            if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b';' || prev == b'&' {
                 continue;
             }
         }
@@ -2188,6 +2189,11 @@ mod tests {
         assert_eq!(linkify_hashtags("foo#Tesla"), "foo#Tesla");
         // No match with an underscore prefix
         assert_eq!(linkify_hashtags("foo_#Tesla"), "foo_#Tesla");
+        // No match when preceded by an entity terminator: user text "&#123;"
+        // arrives HTML-escaped as "&amp;#123;", whose "#123" is entity
+        // source, not a hashtag.
+        assert_eq!(linkify_hashtags("&amp;#123;"), "&amp;#123;");
+        assert_eq!(linkify_hashtags("text;&#35;"), "text;&#35;");
         // Matches at line start
         assert!(linkify_hashtags("#Tesla is great").contains("<a href"));
         // Matches after an opening parenthesis
