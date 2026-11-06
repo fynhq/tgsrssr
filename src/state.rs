@@ -150,14 +150,6 @@ impl Drop for ActiveFlagGuard {
 pub struct AppState {
     pub config: Arc<Config>,
     pub db: Db,
-    /// HTTP client with proxy (for RSS fetching).
-    pub http: reqwest::Client,
-    /// HTTP client without proxy (for no_proxy targets).
-    pub http_direct: reqwest::Client,
-    /// HTTP client with proxy that skips TLS certificate verification, used
-    /// only for hosts listed in RSS_INSECURE_HOSTS (legacy/broken cert chains
-    /// that rustls rejects but browsers tolerate).
-    pub http_insecure: reqwest::Client,
     /// Media download client (via proxy, auto-redirect disabled — SSRF protection, see download_one).
     pub media: reqwest::Client,
     /// Media download client (direct connection, auto-redirect disabled).
@@ -271,13 +263,9 @@ impl AppState {
         let proxy = config.rss_proxy.as_deref();
         let has_proxy = proxy.is_some();
 
-        // RSS/platform fetch clients: follow redirects (common with feedburner etc.).
-        let http_direct = build_client(None, false, true, true)?;
-        let http = if has_proxy { build_client(proxy, false, true, false)? } else { http_direct.clone() };
-        // Insecure variant: same proxy routing, but TLS verification disabled.
-        // Only selected for whitelisted hosts (see client_for_url).
-        let http_insecure = build_client(proxy, true, true, !has_proxy)?;
-
+        // Every outbound request (feed fetch, platform API, media download)
+        // goes through the media client family below: auto-redirect disabled,
+        // manual hop-by-hop following in httpfollow.rs, per-hop target checks.
         // Media download clients: auto-redirect disabled (SSRF protection, see download_one).
         let media_direct = build_client(None, false, false, true)?;
         let media = if has_proxy { build_client(proxy, false, false, false)? } else { media_direct.clone() };
@@ -301,9 +289,6 @@ impl AppState {
             config: Arc::new(config),
             db,
             bot_username,
-            http,
-            http_direct,
-            http_insecure,
             media,
             media_direct,
             media_insecure,
@@ -457,18 +442,6 @@ impl AppState {
 
     /// Choose the appropriate HTTP client based on no_proxy rules and the
     /// insecure-host whitelist.
-    pub fn client_for_url(&self, url: &str) -> &reqwest::Client {
-        match self.route_kind(url).0 {
-            RouteKind::Insecure => &self.http_insecure,
-            RouteKind::Direct => &self.http_direct,
-            RouteKind::Proxy => &self.http,
-        }
-    }
-
-    /// Media-download specific client selection: same routing rules as
-    /// client_for_url (no_proxy / insecure whitelist), but returns a client
-    /// with auto-redirect disabled (SSRF protection: download_one follows
-    /// redirects manually hop by hop and re-runs the SSRF check on each hop).
     pub fn media_client_for_url(&self, url: &str) -> &reqwest::Client {
         self.media_route_for_url(url).0
     }

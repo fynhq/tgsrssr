@@ -246,7 +246,11 @@ pub async fn enforce_media_quota(
             // failure would over-report freed space and stop cleanup prematurely.
             match fs::remove_file(&path).await {
                 Ok(()) => {
-                    remaining -= size;
+                    // saturating_sub: `remaining` is a snapshot of the initial
+                    // total; concurrent rewrites can make the walked size
+                    // smaller than the accumulated deductions, and an
+                    // underflow would wrap and stop cleanup prematurely.
+                    remaining = remaining.saturating_sub(size);
                     freed += size;
                     deleted_files += 1;
                     progressed = true;
@@ -468,10 +472,38 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
 /// is also taken at startup (automatically skipped if one already exists for
 /// the day), without waiting for the hourly cleanup job.
 pub async fn run_startup_cleanup(config: &Config, db_pool: &Db) {
+    // Crash-orphaned media temp files: the normal flow renames or deletes
+    // `.tmp_*` after each attempt, but a crash can leave them behind. At
+    // startup nothing is downloading, so every such file under the media dir
+    // is stale and can be swept before size accounting runs.
+    sweep_media_tmp_files(&config.media_dir).await;
     run_cleanup_tasks(config, db_pool, "startup cleanup").await;
 }
 
-/// Recursive directory size.
+/// Remove crash-orphaned `.tmp_*` files under the media root. Only safe at
+/// startup (no in-flight downloads); the periodic cleanup must not call it.
+async fn sweep_media_tmp_files(root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = fs::read_dir(&dir).await else { continue };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(meta) = entry.metadata().await else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if entry.file_name().to_string_lossy().starts_with(".tmp_") {
+                match fs::remove_file(entry.path()).await {
+                    Ok(()) => info!(file = %entry.path().display(), "removed stale media tmp file"),
+                    Err(e) => warn!(file = %entry.path().display(), error = %e, "failed to remove stale media tmp file"),
+                }
+            }
+        }
+    }
+}
+
+/// Recursive directory size. In-progress download temp files (`.tmp_*`) are
+/// excluded: their bytes are already tracked by the MediaBudget reservation,
+/// so counting them again would double-book the same file (and a crash
+/// orphan would otherwise inflate the quota until the date-directory TTL).
 pub async fn dir_size(path: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
@@ -481,7 +513,7 @@ pub async fn dir_size(path: &Path) -> std::io::Result<u64> {
             let meta = entry.metadata().await?;
             if meta.is_dir() {
                 stack.push(entry.path());
-            } else {
+            } else if !entry.file_name().to_string_lossy().starts_with(".tmp_") {
                 total += meta.len();
             }
         }

@@ -385,65 +385,43 @@ pub async fn fetch_feed(
     //   failure is logged and the proxy is still attempted. This covers the
     //   case where the local resolver cannot resolve a domain that the proxy
     //   can (v1.10.14: avoid false blocks on CDN hostnames).
-    state.check_target(feed_url, allow_trusted_private, "feed").await?;
+    //
+    // The check runs on the entry URL and on every redirect hop, immediately
+    // before each request (inside the shared httpfollow helper below).
 
     // RSS feed fetching does NOT go through img-relay (that's only for media).
-    // Disable client auto-redirects (SSRF protection): follow manually hop by
-    // hop and re-run the target check on every hop, preventing a malicious
-    // source from 302-ing to an intranet address to bypass the entry check.
+    // Disable client auto-redirects (SSRF protection): the shared helper
+    // follows manually hop by hop and re-runs the target check on every hop,
+    // preventing a malicious source from 302-ing to an intranet address to
+    // bypass the entry check.
     const MAX_REDIRECTS: u32 = 5;
-    let mut cur_url = feed_url.to_string();
-    let resp;
-    let mut hops = 0u32;
-    loop {
-        let client = state.media_client_for_url_trusted(&cur_url, allow_trusted_private);
-        let mut req = client
-            .get(&cur_url)
-            .header("Accept", "application/rss+xml, application/atom+xml, application/xml, text/xml, */*");
-        if let Some(e) = etag {
-            req = req.header("If-None-Match", e);
-        }
-        if let Some(lm) = last_modified {
-            req = req.header("If-Modified-Since", lm);
-        }
-        let r = req
-            .send()
-            .await
-            .with_context(|| format!("request failed: {}", cur_url))?;
-        // 304 Not Modified is also a 3xx, so it must be checked before
-        // is_redirection() — otherwise it would be treated as a redirect, and
-        // a 304 without a Location header would falsely report
-        // "redirect without Location header" (v1.10.4 fix).
-        if r.status() == reqwest::StatusCode::NOT_MODIFIED {
-            resp = r;
-            break;
-        }
-        if r.status().is_redirection() {
-            hops += 1;
-            if hops > MAX_REDIRECTS {
-                anyhow::bail!("too many redirects (>{}): {}", MAX_REDIRECTS, feed_url);
+    let resp = crate::httpfollow::get_follow_redirects(
+        state,
+        feed_url,
+        allow_trusted_private,
+        "feed",
+        MAX_REDIRECTS,
+        |client, url, hop| {
+            let mut req = client.get(url).header(
+                "Accept",
+                "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+            );
+            // Conditional headers describe the *source* negotiation state and
+            // belong to the first hop only: re-sending them on a redirect hop
+            // lets an intermediate cache answer 304 from the source's etag,
+            // which would be mistaken for "source unchanged".
+            if hop == 0 {
+                if let Some(e) = etag {
+                    req = req.header("If-None-Match", e);
+                }
+                if let Some(lm) = last_modified {
+                    req = req.header("If-Modified-Since", lm);
+                }
             }
-            let loc = r.headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| anyhow::anyhow!("redirect without Location header"))?;
-            let next = url::Url::parse(&cur_url)
-                .and_then(|base| base.join(loc))
-                .map_err(|e| anyhow::anyhow!("bad redirect Location: {}", e))?;
-            let next_str = next.to_string();
-            // Re-run the full target policy on every hop (literal + direct
-            // DNS + proxy veto; trusted allowlist matches are exempt).
-            // Substring contract: "dns resolve failed" is matched by
-            // sendpolicy::is_net_error as a transient network error.
-            state
-                .check_target(&next_str, allow_trusted_private, "redirect")
-                .await?;
-            cur_url = next_str;
-            continue;
-        }
-        resp = r;
-        break;
-    }
+            req
+        },
+    )
+    .await?;
 
     // 304 Not Modified: the source has no updates
     if resp.status() == reqwest::StatusCode::NOT_MODIFIED {

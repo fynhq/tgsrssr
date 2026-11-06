@@ -8,6 +8,7 @@ mod errors;
 mod fetcher;
 mod htmlentities;
 mod htmltext;
+mod httpfollow;
 mod i18n;
 mod limits;
 mod logging;

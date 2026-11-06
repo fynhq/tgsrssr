@@ -523,16 +523,30 @@ async fn upgrade_weibo_video_hd(
 
     // Fall back to the mobile API (m.weibo.cn/statuses/show), at most 720p.
     let api = format!("https://m.weibo.cn/statuses/show?id={}", mid);
-    let client = state.client_for_url(&api);
-    let mut req = client
-        .get(&api)
-        .header("Referer", "https://m.weibo.cn/")
-        .header("User-Agent", crate::state::MOBILE_BROWSER_UA)
-        .header("Accept", "application/json, text/plain, */*");
-    if !user_cookies.is_empty() {
-        req = req.header("Cookie", user_cookies);
-    }
-    let Ok(resp) = req.send().await else {
+    // Fixed upstream host, but still follow redirects through the shared
+    // helper so per-hop target checks and client routing stay consistent
+    // with every other outbound request (trusted-private exemption is not
+    // applicable to a hardcoded public host).
+    let Ok(resp) = crate::httpfollow::get_follow_redirects(
+        state,
+        &api,
+        false,
+        "weibo",
+        5,
+        |client, cur_url, _hop| {
+            let mut req = client
+                .get(cur_url)
+                .header("Referer", "https://m.weibo.cn/")
+                .header("User-Agent", crate::state::MOBILE_BROWSER_UA)
+                .header("Accept", "application/json, text/plain, */*");
+            if !user_cookies.is_empty() {
+                req = req.header("Cookie", user_cookies.as_str());
+            }
+            req
+        },
+    )
+    .await
+    else {
         return url.to_string();
     };
     let Ok(json) = crate::fetcher::read_json_capped(resp, "weibo HD mobile API").await else {
@@ -570,34 +584,57 @@ async fn upgrade_weibo_video_hd(
 ///      Set-Cookie plants SUB/SUBP.
 ///
 /// In-memory cache with 1h TTL (the visitor identity's validity far exceeds
-/// 1h, but refresh conservatively to avoid risk control).
+/// 1h, but refresh conservatively to avoid risk control). Failed handshakes
+/// are cached negatively for a short window (empty-cookie marker) so a burst
+/// of videos during an outage / risk-control window does not replay the
+/// two-request handshake per entry.
 /// Returns None on failure (silent; does not affect the main flow).
 pub(crate) async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
     const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+    const NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-    // Cache hit
+    // Cache hit (positive or negative)
     {
         let guard = state.weibo_visitor_cookie.lock().await;
         if let Some((cookie, ts)) = guard.as_ref() {
-            if ts.elapsed() < TTL {
-                return Some(cookie.clone());
+            let ttl = if cookie.is_empty() { NEGATIVE_TTL } else { TTL };
+            if ts.elapsed() < ttl {
+                return if cookie.is_empty() { None } else { Some(cookie.clone()) };
             }
         }
     }
 
+    let cookie = fetch_visitor_cookie(state).await;
+    {
+        // Record the outcome for the TTL window (empty string = negative).
+        let mut guard = state.weibo_visitor_cookie.lock().await;
+        *guard = Some((cookie.clone().unwrap_or_default(), std::time::Instant::now()));
+    }
+    cookie
+}
+
+/// Perform the genvisitor + incarnate handshake. No caching here.
+async fn fetch_visitor_cookie(state: &AppState) -> Option<String> {
     // Step 1: genvisitor — submit a fabricated browser fingerprint, get a tid
     let gen_url = "https://passport.weibo.com/visitor/genvisitor";
-    let client = state.client_for_url(gen_url);
     let fp = r#"{"os":"1","browser":"Chrome130,0,0,0","fonts":"undefined","screenInfo":"1920*1080*24","plugins":""}"#;
     let body = format!("cb=gen_callback&fp={}", urlencoding(fp));
-    let resp = client
-        .post(gen_url)
-        .header("Referer", "https://weibo.com/")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await
-        .ok()?;
+    let resp = crate::httpfollow::get_follow_redirects(
+        state,
+        gen_url,
+        false,
+        "weibo",
+        5,
+        |client, cur_url, _hop| {
+            client
+                .post(cur_url)
+                .header("Referer", "https://weibo.com/")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body.clone())
+        },
+    )
+    .await
+    .ok()?;
     // The response is a tiny JSONP body, but it still comes from an external
     // endpoint: use the shared 20MB capped reader instead of an unbounded
     // .text() buffering path.
@@ -626,12 +663,16 @@ pub(crate) async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
             .map(|d| d.subsec_nanos())
             .unwrap_or(123456789)
     );
-    let resp2 = client
-        .get(&incarnate_url)
-        .header("Referer", "https://weibo.com/")
-        .send()
-        .await
-        .ok()?;
+    let resp2 = crate::httpfollow::get_follow_redirects(
+        state,
+        &incarnate_url,
+        false,
+        "weibo",
+        5,
+        |client, cur_url, _hop| client.get(cur_url).header("Referer", "https://weibo.com/"),
+    )
+    .await
+    .ok()?;
 
     // Extract SUB and SUBP from the Set-Cookie headers
     let mut sub = String::new();
@@ -653,13 +694,7 @@ pub(crate) async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
     } else {
         format!("SUB={}; SUBP={}", sub, subp)
     };
-    debug!("weibo visitor cookie obtained (cached 1h)");
-
-    // Write to cache
-    {
-        let mut guard = state.weibo_visitor_cookie.lock().await;
-        *guard = Some((cookie.clone(), std::time::Instant::now()));
-    }
+    debug!("weibo visitor cookie obtained (fresh handshake)");
     Some(cookie)
 }
 
@@ -716,12 +751,37 @@ fn detect_image_ext(head: &[u8]) -> Option<&'static str> {
     }
     let start = head.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(head.len());
     let trimmed = &head[start..];
-    if trimmed.starts_with(b"<svg")
-        || (trimmed.starts_with(b"<?xml") && head.windows(4).any(|w| w == b"<svg"))
-    {
+    if trimmed.starts_with(b"<svg") {
         return Some("svg");
     }
+    if trimmed.starts_with(b"<?xml") {
+        // Skip the XML declaration/index, then any comments/whitespace, and
+        // require the svg element to be the document root. A plain "contains
+        // <svg" prefix test would also match XML documents that merely embed
+        // an svg element somewhere in the first chunk.
+        let decl_end = find_subslice(trimmed, b"?>")?;
+        let mut rest = &trimmed[decl_end + 2..];
+        loop {
+            let skip = rest.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(rest.len());
+            rest = &rest[skip..];
+            if rest.starts_with(b"<!--") {
+                let end = find_subslice(rest, b"-->")?;
+                rest = &rest[end + 3..];
+            } else {
+                break;
+            }
+        }
+        if rest.starts_with(b"<svg") {
+            return Some("svg");
+        }
+    }
     None
+}
+
+/// First position of `needle` inside `haystack` (byte search for the small
+/// prefix buffers used by format sniffing).
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Accept only recognizable video containers before handing the file to
@@ -868,16 +928,28 @@ fn urlencoding(s: &str) -> String {
 /// download stage and notifies the owner.
 async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -> Option<String> {
     let api = format!("https://weibo.com/ajax/statuses/show?id={}", mid);
-    let client = state.client_for_url(&api);
-    let mut req = client
-        .get(&api)
-        .header("Referer", "https://weibo.com/")
-        .header("Accept", "application/json, text/plain, */*")
-        .header("X-Requested-With", "XMLHttpRequest");
-    if !cookies.is_empty() {
-        req = req.header("Cookie", cookies);
-    }
-    let resp = req.send().await.ok()?;
+    // Fixed upstream host; manual redirect following keeps the per-hop
+    // target checks consistent with the rest of the outbound traffic.
+    let resp = crate::httpfollow::get_follow_redirects(
+        state,
+        &api,
+        false,
+        "weibo",
+        5,
+        |client, cur_url, _hop| {
+            let mut req = client
+                .get(cur_url)
+                .header("Referer", "https://weibo.com/")
+                .header("Accept", "application/json, text/plain, */*")
+                .header("X-Requested-With", "XMLHttpRequest");
+            if !cookies.is_empty() {
+                req = req.header("Cookie", cookies);
+            }
+            req
+        },
+    )
+    .await
+    .ok()?;
     // Route through the shared capped JSON reader (same 20MB limit as the RSS
     // pipeline and the other platform JSON reads). `.ok()?` keeps the previous
     // silent-None-on-any-failure semantics; the only change is that an
@@ -1494,6 +1566,10 @@ pub async fn prepare_entry_media(
                 Some(true) => {
                     if let Some(gif) = out.items.pop() {
                         debug!(path = %gif.path.display(), "single-media mode: GIF cover dropped, trying next candidate");
+                        // The cover's bytes were folded into the entry budget
+                        // when the download succeeded; give them back so later
+                        // candidates are not measured against an inflated total.
+                        entry_bytes = entry_bytes.saturating_sub(gif.size);
                         let _ = tokio::fs::remove_file(&gif.path).await;
                     }
                 }
@@ -1576,54 +1652,29 @@ async fn download_one(
         let tmp = tmp_path.clone();
         result = async {
             // SSRF redirect protection: automatic following disabled,
-            // validated manually hop-by-hop (≤5 hops).
-            // reqwest follows up to 10 redirects by default without
-            // re-running is_private_url; a malicious feed could 302 → an
-            // internal address to bypass the entry check.
+            // validated manually hop-by-hop through the shared helper
+            // (reqwest follows up to 10 redirects by default without
+            // re-running the target policy; a malicious feed could 302 to an
+            // internal address to bypass the entry check).
             const MAX_REDIRECTS: u32 = 5;
-            let mut cur_url = url.to_string();
-            let mut resp;
-            let mut hops = 0u32;
-            loop {
-                // Client selection and the target policy are evaluated per
-                // hop against the URL actually being requested, so a direct
-                // URL cannot 302 to a private literal IP / private DNS answer
-                // with checks skipped. Trusted allowlist URLs use the
-                // dedicated direct client (bypasses the connection-layer
-                // resolver) and skip the policy pre-check.
-                let client = state.media_client_for_url_trusted(&cur_url, allow_trusted_private);
-                state
-                    .check_target(&cur_url, allow_trusted_private, "media")
-                    .await?;
-                // The client has automatic redirects disabled; follow them
-                // manually here.
-                let mut req = client.get(&cur_url)
-                    .timeout(std::time::Duration::from_secs(300))
-                    .header(reqwest::header::ACCEPT, media_accept(*kind));
-                if let Some(referer) = referer_for(url) {
-                    req = req.header("Referer", referer);
-                }
-                let r = req.send().await?;
-                if r.status().is_redirection() {
-                    hops += 1;
-                    if hops > MAX_REDIRECTS {
-                        anyhow::bail!("too many redirects (>{}): {}", MAX_REDIRECTS, url);
+            let mut resp = crate::httpfollow::get_follow_redirects(
+                state,
+                url,
+                allow_trusted_private,
+                "media",
+                MAX_REDIRECTS,
+                |client, cur_url, _hop| {
+                    let mut req = client
+                        .get(cur_url)
+                        .timeout(std::time::Duration::from_secs(300))
+                        .header(reqwest::header::ACCEPT, media_accept(*kind));
+                    if let Some(referer) = referer_for(url) {
+                        req = req.header("Referer", referer);
                     }
-                    let loc = r.headers()
-                        .get(reqwest::header::LOCATION)
-                        .and_then(|v| v.to_str().ok())
-                        .ok_or_else(|| anyhow::anyhow!("redirect without Location header"))?;
-                    let next = url::Url::parse(&cur_url)
-                        .and_then(|base| base.join(loc))
-                        .map_err(|e| anyhow::anyhow!("bad redirect Location: {}", e))?;
-                    // Scheme and private-address checks run at the top of the
-                    // next iteration, against the URL actually requested.
-                    cur_url = next.to_string();
-                    continue;
-                }
-                resp = r;
-                break;
-            }
+                    req
+                },
+            )
+            .await?;
             if !resp.status().is_success() {
                 anyhow::bail!("HTTP {}", resp.status());
             }
@@ -1674,32 +1725,31 @@ async fn download_one(
             Err(e) => {
                 // Clean up any leftover temp file
                 let _ = tokio::fs::remove_file(&tmp_path).await;
-                // `{:#}` renders the full anyhow/reqwest source chain so the
-                // per-attempt transient diagnosis (debug log below) names the
-                // connect/SOCKS layer, not just the outer wrapper. The
-                // classification is contains/starts_with based and unaffected.
+                // `{:#}` renders the full anyhow/reqwest source chain for the
+                // debug log; classification below uses typed inspection where
+                // possible instead of matching that rendered text.
                 let es = format!("{:#}", e);
                 // 5xx (502/503/504…) are transient upstream failures (especially
                 // img-relay Worker origin-fetch jitter) — retryable; 4xx
                 // (403 hotlink protection / 404 resource missing) are
                 // deterministic failures — no retry.
                 let is_http_5xx = es.starts_with("HTTP 5");
-                let transient = is_http_5xx
-                    || (!es.starts_with("HTTP ")
-                        && (es.contains("error sending request")
-                            || es.contains("error decoding response body")
-                            // reqwest renders a timeout as "operation timed out"
-                            // (no "timeout" substring), so match both spellings;
-                            // a mid-body stall that only says "timed out" would
-                            // otherwise be classified non-transient and the media
-                            // dropped without retry.
-                            || es.contains("timed out")
-                            || es.contains("timeout")
-                            || es.contains("connection")
-                            // SSRF pre-check DNS blip: transient, retry instead
-                            // of classifying the media as permanently blocked.
-                            || es.contains("dns resolve failed")
-                            || es.contains("incomplete")));
+                // Transport classification via the reqwest error type: the
+                // rendered chain embeds the URL, so a path containing words
+                // like "connection" or "timeout" must not flip a
+                // deterministic failure to retryable.
+                let typed_transient = e
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+                    .map(|re| {
+                        re.is_timeout() || re.is_connect() || re.is_body() || re.is_decode()
+                    })
+                    .unwrap_or(false);
+                // SSRF pre-check DNS blip: transient, retry instead of
+                // classifying the media as permanently blocked. The text comes
+                // from our own check, never from URL content.
+                let is_dns_blip = es.contains("dns resolve failed");
+                let transient = is_http_5xx || typed_transient || is_dns_blip;
                 if !transient || attempt + 1 == ATTEMPTS {
                     break;
                 }
@@ -2366,6 +2416,12 @@ mod tests {
         assert_eq!(
             detect_image_ext(b"<?xml version=\"1.0\"?><svg></svg>"),
             Some("svg")
+        );
+        // An XML document that merely embeds an svg element is not an svg
+        // document and must not be labeled as one.
+        assert_eq!(
+            detect_image_ext(b"<?xml version=\"1.0\"?><html><svg></svg></html>"),
+            None
         );
         // TIFF little/big endian.
         assert_eq!(detect_image_ext(b"II*\0rest"), Some("tiff"));
