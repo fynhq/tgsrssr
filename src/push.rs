@@ -1601,10 +1601,12 @@ pub async fn send_entry_with_media(
                     }
                 }
                 // Retweet inline images get the same follow-up send, quoting
-                // the fallback body message.
+                // the fallback body message. Use the retry variant for
+                // consistency with the main path: a transient network blip
+                // must not silently drop the images on this branch.
                 if !rt_photos.is_empty() {
                     let rt_ops = build_rich_ops(&rt_photos, &[], &[]);
-                    if let Err((_, _, re)) = send_rich_ops(bot, db, chat_id, "", false, &rt_ops, 0, fallback_msg_id).await {
+                    if let Err((_, _, re)) = send_rich_ops_with_retry(bot, db, chat_id, "", false, &rt_ops, fallback_msg_id, "rt_images_text_fallback").await {
                         tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %re, "retweet images send failed after text fallback");
                     }
                 }
@@ -2577,15 +2579,31 @@ async fn send_single_html(
                         "HTML parse failed, falling back to plain text"
                     );
                     let plain = strip_html_tags(&html_text);
-                    let mut req2 = bot.send_message(ChatId(chat_id), &plain);
-                    if let Some(o) = &lpo {
-                        req2 = req2.link_preview_options(o.clone());
+                    // The fallback send gets its own flood backoff: a 429
+                    // here is not covered by the outer retry layer (429 is
+                    // not is_retryable_error), and losing the chunk over a
+                    // transient flood window would push the entry to outbox
+                    // even though the HTML problem itself is permanent.
+                    let mut fallback_flood_tries = 0u32;
+                    loop {
+                        let mut req2 = bot.send_message(ChatId(chat_id), &plain);
+                        if let Some(o) = &lpo {
+                            req2 = req2.link_preview_options(o.clone());
+                        }
+                        if let Some(rid) = reply_to {
+                            req2 = req2.reply_parameters(teloxide::types::ReplyParameters::new(rid));
+                        }
+                        match req2.await {
+                            Ok(m) => return Ok(m),
+                            Err(e2) => {
+                                let err2 = e2.to_string();
+                                if flood_backoff(&err2, &mut fallback_flood_tries, chat_id).await {
+                                    continue;
+                                }
+                                return Err(e2.into());
+                            }
+                        }
                     }
-                    if let Some(rid) = reply_to {
-                        req2 = req2.reply_parameters(teloxide::types::ReplyParameters::new(rid));
-                    }
-                    let m = req2.await?;
-                    return Ok(m);
                 }
                 return Err(e.into());
             }

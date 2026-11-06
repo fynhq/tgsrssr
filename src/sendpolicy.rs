@@ -156,7 +156,10 @@ struct ChatPacer {
 }
 
 impl ChatPacer {
-    const MIN_INTERVAL: Duration = Duration::from_millis(2000);
+    // 3s keeps the sustained per-chat rate at the ~20 messages/minute the
+    // per-chat Telegram limit cited above allows; a tighter interval would
+    // only converge through passive 429 backoff under sustained load.
+    const MIN_INTERVAL: Duration = Duration::from_millis(3000);
 
     async fn wait(&self, chat_id: i64) {
         loop {
@@ -184,7 +187,7 @@ impl ChatPacer {
 static PACER: std::sync::OnceLock<ChatPacer> = std::sync::OnceLock::new();
 
 /// Queue before sending: guarantees adjacent messages to the same chat are
-/// spaced at least 2 seconds apart.
+/// spaced at least 3 seconds apart.
 pub async fn pace(chat_id: i64) {
     PACER
         .get_or_init(|| ChatPacer {
