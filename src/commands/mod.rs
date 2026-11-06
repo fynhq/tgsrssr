@@ -255,18 +255,7 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         return Ok(());
     }
 
-    let active_count = subs.iter().filter(|s| s.active == 1).count();
-    let paused_count = subs.len() - active_count;
-
-    let title_html = push::format_chat_title_html(&title, &chat_id);
-    let chat_html = push::format_chat_id_html(&chat_id);
-    let total_s = subs.len().to_string();
-    let active_s = active_count.to_string();
-    let paused_s = paused_count.to_string();
-    let header = i18n::fill(
-        i18n::t(lang, "list_header"),
-        &[&title_html, &chat_html, &total_s, &active_s, &paused_s],
-    );
+    let header = push::channel_header_text(lang, "list_header", &title, &chat_id, &subs);
     let paused_suffix = i18n::t(lang, "list_paused_suffix");
     let lines: Vec<String> = subs
         .iter()

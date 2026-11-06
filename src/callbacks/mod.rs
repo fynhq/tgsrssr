@@ -251,7 +251,7 @@ fn guard_target(op: &str) -> Option<GuardTarget> {
         | "srcfsp" | "srcfcp" | "srcflp" | "srcfilter" | "srcftoggle" | "srcfmode" | "srcfkw"
         | "srcfi" | "srcfm" | "srcfs" | "unsub" => GuardTarget::Sub,
         // explicitly no target channel involved
-        "chlist" | "lang" | "cancelop" | "ck" => GuardTarget::None,
+        "chlist" | "lang" | "cancelop" | "ck" | "page" => GuardTarget::None,
         // Unknown op: fail closed.
         _ => return None,
     })
@@ -565,7 +565,7 @@ pub async fn handle_callback(
                         render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
                     }
                     Err(e) => {
-                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                        bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
                     }
                 }
             }
@@ -590,7 +590,7 @@ pub async fn handle_callback(
                         render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
                     }
                     Err(e) => {
-                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                        bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
                     }
                 }
             }
@@ -645,7 +645,7 @@ pub async fn handle_callback(
                         render_settings_page(&bot, PageTarget::Edit(&q), cid, &state, ch_page, chlist_page, lang).await?;
                     }
                     Err(e) => {
-                        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                        bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
                     }
                 }
             }
@@ -769,7 +769,7 @@ pub async fn handle_callback(
                             render_feed_page_impl(&bot, PageTarget::Edit(&q), id, &state, ch_page, chlist_page, lang).await?;
                         }
                         Err(e) => {
-                            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                            bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
                         }
                     }
                 }
@@ -807,7 +807,7 @@ pub async fn handle_callback(
                             render_feed_page_impl(&bot, PageTarget::Edit(&q), id, &state, ch_page, chlist_page, lang).await?;
                         }
                         Err(e) => {
-                            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                            bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
                         }
                     }
                 }
@@ -842,7 +842,7 @@ pub async fn handle_callback(
                             render_feed_filter_impl(&bot, PageTarget::Edit(&q), id, &state, ch_page, chlist_page, lang).await?;
                         }
                         Err(e) => {
-                            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                            bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
                         }
                     }
                 }
@@ -870,7 +870,7 @@ pub async fn handle_callback(
                             render_feed_filter_impl(&bot, PageTarget::Edit(&q), id, &state, ch_page, chlist_page, lang).await?;
                         }
                         Err(e) => {
-                            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                            bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
                         }
                     }
                 }
@@ -979,7 +979,7 @@ pub async fn handle_callback(
                             render_feed_page_impl(&bot, PageTarget::Edit(&q), id, &state, ch_page, chlist_page, lang).await?;
                         }
                         Err(e) => {
-                            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e))).await.ok();
+                            bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
                         }
                     }
                 }
@@ -1300,18 +1300,8 @@ pub async fn render_channel_page(
 
     let (total_pages, page, start, end) = paginate(subs.len(), page);
 
-    let active_count = subs.iter().filter(|s| s.active == 1).count();
-    let paused_count = subs.len() - active_count;
-
-    let title_html = crate::push::format_chat_title_html(&title, chat_id);
-    let chat_html = crate::push::format_chat_id_html(chat_id);
-    let total_s = subs.len().to_string();
-    let active_s = active_count.to_string();
-    let paused_s = paused_count.to_string();
-    let mut text = i18n::fill(
-        i18n::t(lang, "chpage_header"),
-        &[&title_html, &chat_html, &total_s, &active_s, &paused_s],
-    );
+    let mut text = crate::push::channel_header_text(lang, "chpage_header", &title, chat_id, &subs);
+    let (_, paused_count) = crate::push::channel_sub_counts(&subs);
     if subs.is_empty() {
         text.push_str(i18n::t(lang, "chpage_no_subs"));
     } else if total_pages > 1 {

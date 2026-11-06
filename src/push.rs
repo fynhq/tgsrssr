@@ -24,6 +24,36 @@ pub use crate::htmltext::{
     normalize_blockquote_fold, take_utf16_prefix, utf16_len, visible_len,
 };
 
+/// (active, paused) subscription counts shared by the channel headers and
+/// the resume-all button. Single definition of "active" for UI surfaces.
+pub fn channel_sub_counts(subs: &[db::SubRow]) -> (usize, usize) {
+    let active = subs.iter().filter(|s| s.active == 1).count();
+    (active, subs.len() - active)
+}
+
+/// Shared channel-page header for /list (`list_header`) and the callback
+/// channel page (`chpage_header`): both templates take the same five values
+/// (title, chat link, total, active, paused), so the count logic and fill
+/// live here and the two surfaces cannot drift.
+pub fn channel_header_text(
+    lang: Lang,
+    template_key: &str,
+    title: &str,
+    chat_id: &str,
+    subs: &[db::SubRow],
+) -> String {
+    let (active_count, paused_count) = channel_sub_counts(subs);
+    let title_html = format_chat_title_html(title, chat_id);
+    let chat_html = format_chat_id_html(chat_id);
+    let total_s = subs.len().to_string();
+    let active_s = active_count.to_string();
+    let paused_s = paused_count.to_string();
+    crate::i18n::fill(
+        crate::i18n::t(lang, template_key),
+        &[&title_html, &chat_html, &total_s, &active_s, &paused_s],
+    )
+}
+
 // Hot-path regexes are compiled statically once (hit on every message/chunk).
 // RE_TAG and the anchor/entity regexes live in crate::htmltext along with the
 // HTML helpers (imported via the `use` at the top).

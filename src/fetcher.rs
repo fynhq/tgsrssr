@@ -230,17 +230,69 @@ impl FetchResult {
 /// Normalize a feed URL to a canonical form so that logically identical
 /// sources (different host/path variants) deduplicate correctly at subscribe
 /// time. Platform sources are rewritten via the platform registry's
-/// `canonical_url`; plain RSS URLs are returned unchanged.
+/// `canonical_url`; plain RSS URLs get a conservative normalization (see
+/// `normalize_plain_feed_url`).
 ///
 /// Canonical forms:
 /// - weibo: `https://weibo.com/u/<uid>` (m./www./weibo.cn variants collapse)
 /// - x:     `https://x.com/<name>` (twitter.com / www / mobile collapse)
 /// - tg:    `https://t.me/<name>` (telegram.me and /s/<name> collapse)
+/// - other: scheme/host lowercased, scheme's default port removed
 pub fn normalize_feed_url(url: &str) -> String {
     match crate::platforms::platform_for_url(url) {
         Some(p) => (p.canonical_url)(url).unwrap_or_else(|| url.to_string()),
-        None => url.to_string(),
+        None => normalize_plain_feed_url(url),
     }
+}
+
+/// Conservative normalization for non-platform feed URLs: lowercase the
+/// scheme and host and drop the scheme's default port (`http:80` /
+/// `https:443`). Path, query and fragment are preserved byte-for-byte:
+/// paths can be case-sensitive on the server, and trailing-slash or query
+/// reordering can change the served resource, so only spellings that cannot
+/// denote different resources are merged. Existing subscription rows keep
+/// their stored form; this only dedups new /sub input.
+fn normalize_plain_feed_url(url: &str) -> String {
+    let Some(sep) = url.find("://") else {
+        return url.to_string();
+    };
+    let scheme = url[..sep].to_ascii_lowercase();
+    let after = &url[sep + 3..];
+    // The authority ends at the first '/', '?' or '#'.
+    let auth_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let authority = &after[..auth_end];
+    let rest = &after[auth_end..];
+    // Keep userinfo verbatim; normalize only scheme/host/port.
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => (&authority[..=i], &authority[i + 1..]),
+        None => ("", authority),
+    };
+    let (host, port) = if hostport.starts_with('[') {
+        // IPv6 literal: the port, if present, follows the closing bracket.
+        match hostport.find(']') {
+            Some(i) => (&hostport[..=i], hostport[i + 1..].strip_prefix(':').unwrap_or("")),
+            None => (hostport, ""),
+        }
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, p),
+            None => (hostport, ""),
+        }
+    };
+    let host = host.to_ascii_lowercase();
+    let is_default_port =
+        (scheme == "http" && port == "80") || (scheme == "https" && port == "443");
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&scheme);
+    out.push_str("://");
+    out.push_str(userinfo);
+    out.push_str(&host);
+    if !port.is_empty() && !is_default_port {
+        out.push(':');
+        out.push_str(port);
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Response body size cap (20MB): prevents abnormal/malicious sources from
@@ -1280,5 +1332,39 @@ mod tests {
         );
         assert_eq!(entry_title(&entry, Lang::Zh), "(无标题)");
         assert_eq!(entry_title(&entry, Lang::En), "(Untitled)");
+    }
+
+    #[test]
+    fn plain_feed_url_normalization_is_conservative() {
+        // Scheme/host case and default ports are the only variants merged.
+        assert_eq!(
+            normalize_plain_feed_url("HTTP://Example.COM/Feed.xml"),
+            "http://example.com/Feed.xml"
+        );
+        assert_eq!(
+            normalize_plain_feed_url("https://example.com:443/feed"),
+            "https://example.com/feed"
+        );
+        assert_eq!(
+            normalize_plain_feed_url("http://example.com:80/feed"),
+            "http://example.com/feed"
+        );
+        // Non-default port and path/query casing are preserved.
+        assert_eq!(
+            normalize_plain_feed_url("https://Example.com:8443/Feed?Q=A"),
+            "https://example.com:8443/Feed?Q=A"
+        );
+        // Trailing slash and query order keep their identity (no merging).
+        assert_eq!(
+            normalize_plain_feed_url("https://example.com/feed/"),
+            "https://example.com/feed/"
+        );
+        // IPv6 literal host and userinfo survive normalization.
+        assert_eq!(
+            normalize_plain_feed_url("http://user:pw@[::1]:8080/feed"),
+            "http://user:pw@[::1]:8080/feed"
+        );
+        // Non-URL input passes through untouched.
+        assert_eq!(normalize_plain_feed_url("not a url"), "not a url");
     }
 }

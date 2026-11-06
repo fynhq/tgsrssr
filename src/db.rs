@@ -366,6 +366,68 @@ pub async fn upsert_chat(
     Ok(())
 }
 
+/// Cascade-clean every per-chat settings key family (media_dl_fail retries,
+/// auto_disable_notified edge flags, stale_zero streak counters) for one
+/// chat. Single home for the chat-wide key list: purge_chat once missed a
+/// key because the list was hand-copied across cleanup sites.
+async fn cleanup_chat_settings_keys(
+    conn: &mut sqlx::SqliteConnection,
+    chat_id: &str,
+) -> anyhow::Result<()> {
+    for prefix in ["media_dl_fail", "auto_disable_notified", "stale_zero"] {
+        sqlx::query("DELETE FROM settings WHERE key LIKE ?")
+            .bind(format!("{prefix}:{chat_id}:%"))
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Cascade-clean every per-feed settings key for the subscription identified
+/// by `sub_id` (the subscriptions row must still exist when this runs).
+/// media_dl_fail keys carry a length-prefixed URL and are matched with
+/// `instr` instead of LIKE: feed URLs often contain `%` / `_`, which LIKE
+/// would treat as wildcards and wrongly match adjacent sources.
+async fn cleanup_feed_settings_keys(
+    conn: &mut sqlx::SqliteConnection,
+    sub_id: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "DELETE FROM settings WHERE instr(key, (SELECT 'media_dl_fail:' || chat_id || ':' || length(feed_url) || ':' || feed_url || ':' FROM subscriptions WHERE id = ?)) = 1",
+    )
+    .bind(sub_id)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "DELETE FROM settings WHERE key = (SELECT 'auto_disable_notified:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
+    )
+    .bind(sub_id)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "DELETE FROM settings WHERE key = (SELECT 'stale_zero:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
+    )
+    .bind(sub_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Clear the auto-disable notification edge flag for one subscription.
+/// Re-enabling a source (via /sub or the panel resume paths) must reset it,
+/// otherwise a later failure that reaches the threshold stays silent.
+async fn clear_auto_disable_notified(
+    conn: &mut sqlx::SqliteConnection,
+    chat_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(setting_key::auto_disable_notified(chat_id, feed_url))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Delete all data for a chat (subscriptions, configs, sent_entries, chat itself).
 /// Wrapped in a transaction: any step failing rolls everything back, avoiding
 /// half-deleted residual state.
@@ -377,24 +439,7 @@ pub async fn purge_chat(db: &Db, chat_id: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM feed_configs WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM subscriptions WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM chat_configs WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
-    // Cascade-clean the media_dl_fail retry keys (prevents settings from
-    // slowly leaking after purge).
-    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
-        .bind(format!("media_dl_fail:{}:%", chat_id))
-        .execute(&mut *tx)
-        .await?;
-    // Cascade-clean the auto_disable_notified edge-dedup flag (v1.9.7 fix:
-    // purge_chat previously missed this key, inconsistent with
-    // delete_subscription/delete_all_subscriptions).
-    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
-        .bind(format!("auto_disable_notified:{}:%", chat_id))
-        .execute(&mut *tx)
-        .await?;
-    // Cascade-clean the stale-zero streak counters.
-    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
-        .bind(format!("stale_zero:{}:%", chat_id))
-        .execute(&mut *tx)
-        .await?;
+    cleanup_chat_settings_keys(&mut tx, chat_id).await?;
     sqlx::query("DELETE FROM chats WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
@@ -598,6 +643,19 @@ pub async fn add_subscription_with_sent(
     entry_ids: &[String],
 ) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
+    // /sub resolves the target chat and fetches the feed before reaching this
+    // call; the bot can be removed from the chat in that window, and purge_chat
+    // then deletes the chats row. An orphan subscription would be invisible:
+    // the due query INNER JOINs chats, and ownership resolution reads chats
+    // too, so no command could list, edit or unsubscribe it. Re-check inside
+    // the transaction and fail the add instead of persisting the orphan.
+    let chat_exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM chats WHERE chat_id = ?")
+        .bind(chat_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if chat_exists.is_none() {
+        anyhow::bail!("chat no longer registered (bot removed before the subscription was saved)");
+    }
     sqlx::query(
         r#"INSERT INTO subscriptions (chat_id, feed_url, feed_title, title_overridden, active, error_count)
            VALUES (?1, ?2, ?3, 0, 1, 0)
@@ -623,10 +681,7 @@ pub async fn add_subscription_with_sent(
     // Re-enabling through /sub must clear the auto-disable notification edge
     // flag, exactly like the panel resume paths. Otherwise a later failure
     // that reaches the threshold stays silent because the stale flag remains.
-    sqlx::query("DELETE FROM settings WHERE key = ?")
-        .bind(setting_key::auto_disable_notified(chat_id, feed_url))
-        .execute(&mut *tx)
-        .await?;
+    clear_auto_disable_notified(&mut tx, chat_id, feed_url).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -734,32 +789,10 @@ pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
     .bind(sub_id)
     .execute(&mut *tx)
     .await?;
-    // Cascade-clean the media_dl_fail retry keys (prevents settings from
-    // slowly leaking after unsubscribe). Uses instr prefix matching instead of
-    // LIKE: feed_url often contains % or _ (URL encoding / underscores), and
-    // LIKE would treat them as wildcards and wrongly delete keys of adjacent
-    // sources.
-    sqlx::query(
-        "DELETE FROM settings WHERE instr(key, (SELECT 'media_dl_fail:' || chat_id || ':' || length(feed_url) || ':' || feed_url || ':' FROM subscriptions WHERE id = ?)) = 1",
-    )
-    .bind(sub_id)
-    .execute(&mut *tx)
-    .await?;
-    // Cascade-clean the auto_disable_notified edge-dedup flag (this key has
-    // no suffix, exact match).
-    sqlx::query(
-        "DELETE FROM settings WHERE key = (SELECT 'auto_disable_notified:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
-    )
-    .bind(sub_id)
-    .execute(&mut *tx)
-    .await?;
-    // Cascade-clean the stale-zero streak counter (exact match, same shape).
-    sqlx::query(
-        "DELETE FROM settings WHERE key = (SELECT 'stale_zero:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
-    )
-    .bind(sub_id)
-    .execute(&mut *tx)
-    .await?;
+    // Cascade-clean the per-feed settings keys (media_dl_fail /
+    // auto_disable_notified / stale_zero) while the subscriptions row still
+    // exists so the correlated lookups work.
+    cleanup_feed_settings_keys(&mut tx, sub_id).await?;
     // Drop per-feed config overrides in the same transaction: a later
     // re-subscribe must start from channel defaults instead of reviving stale
     // interval/content/filter settings (previously this ran outside the
@@ -784,22 +817,9 @@ pub async fn delete_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<
         .bind(chat_id)
         .execute(&mut *tx)
         .await?;
-    // Cascade-clean the media_dl_fail retry keys (prevents settings from
-    // slowly leaking after unsubscribe).
-    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
-        .bind(format!("media_dl_fail:{}:%", chat_id))
-        .execute(&mut *tx)
-        .await?;
-    // Cascade-clean the auto_disable_notified edge-dedup flag.
-    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
-        .bind(format!("auto_disable_notified:{}:%", chat_id))
-        .execute(&mut *tx)
-        .await?;
-    // Cascade-clean the stale-zero streak counters.
-    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
-        .bind(format!("stale_zero:{}:%", chat_id))
-        .execute(&mut *tx)
-        .await?;
+    // Cascade-clean every per-chat settings key family (same list as
+    // purge_chat via the shared helper).
+    cleanup_chat_settings_keys(&mut tx, chat_id).await?;
     // Drop per-feed config overrides for this chat as well (same contract as
     // single unsubscribe: a later re-subscribe starts from defaults).
     sqlx::query("DELETE FROM feed_configs WHERE chat_id = ?")
@@ -1214,6 +1234,31 @@ pub async fn get_chat_config(db: &Db, chat_id: &str) -> anyhow::Result<Option<Ch
     Ok(row)
 }
 
+/// Write-side whitelist for enum-valued chat/feed config fields. Callback
+/// data is client-controlled; an unknown value would otherwise be persisted
+/// verbatim (readers fall back to defaults, so this was never a crash, but
+/// dirty values lingered in the DB and were copied into outbox snapshots).
+/// Canonical snake_case only — legacy camel-case spellings are still accepted
+/// by readers for old rows, but writers always produce the canonical form.
+fn validate_config_value(field: &str, value: &str) -> anyhow::Result<()> {
+    let allowed: &[&str] = match field {
+        "content_mode" => &[
+            "title_link",
+            "title_summary",
+            "title_content",
+            "title_only",
+            "content_only",
+            "media_only",
+        ],
+        "source_display" => &["source", "author", "none"],
+        _ => return Ok(()),
+    };
+    if !allowed.contains(&value) {
+        anyhow::bail!("invalid {} value: '{}'", field, value);
+    }
+    Ok(())
+}
+
 pub async fn set_chat_config_field(
     db: &Db,
     chat_id: &str,
@@ -1243,6 +1288,7 @@ pub async fn set_chat_config_field(
             .map_err(|_| anyhow::anyhow!("interval_minutes must be numeric, got '{}'", value))?;
         sqlx::query(sql).bind(v).bind(chat_id).execute(db).await?;
     } else {
+        validate_config_value(field, value)?;
         sqlx::query(sql).bind(value).bind(chat_id).execute(db).await?;
     }
     Ok(())
@@ -1297,6 +1343,7 @@ pub async fn set_feed_config_field(
                 .map_err(|_| anyhow::anyhow!("interval_minutes must be numeric, got '{}'", v))?;
             sqlx::query(sql).bind(chat_id).bind(feed_url).bind(n).execute(db).await?;
         } else {
+            validate_config_value(field, v)?;
             sqlx::query(sql).bind(chat_id).bind(feed_url).bind(v).execute(db).await?;
         }
     }
