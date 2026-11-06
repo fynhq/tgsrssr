@@ -1,5 +1,4 @@
 use teloxide::prelude::*;
-use teloxide::types::ChatId;
 use tokio::sync::Semaphore;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{debug, error, info, warn};
@@ -7,6 +6,10 @@ use tracing::{debug, error, info, warn};
 use crate::db;
 use crate::fetcher;
 use crate::i18n::{self, Lang};
+use crate::notify::{
+    notify_admins_html, notify_download_failed, notify_oversized_video, notify_owner_html,
+    owner_lang, push_fail_msg, push_line,
+};
 use crate::push::{self, ContentMode};
 use crate::sendpolicy;
 use crate::state::AppState;
@@ -1394,13 +1397,17 @@ async fn process_feed(
                             crate::push::escape_html(t)
                         ))
                         .unwrap_or_else(|| crate::push::escape_html(&sub.feed_url));
+                    // i18n::fill: single-pass substitution, so a source name
+                    // containing literal `{}` cannot swallow the chat-id slot.
+                    let auto_disable_msg = i18n::fill(
+                        i18n::t(lang, "notif_auto_disable"),
+                        &[&name, &crate::push::escape_html(&sub.chat_id)],
+                    );
                     notify_owner_html(
                         bot,
                         state,
                         &sub.chat_id,
-                        &i18n::t(lang, "notif_auto_disable")
-                            .replacen("{}", &name, 1)
-                            .replacen("{}", &crate::push::escape_html(&sub.chat_id), 1),
+                        &auto_disable_msg,
                     )
                     .await;
                 }
@@ -1505,192 +1512,6 @@ async fn maybe_notify_platform_recovered(bot: &Bot, state: &AppState, platform: 
     }).await;
 }
 
-/// Send an HTML notification to a single user (falls back to plain text
-/// when HTML parsing fails, so the notice is never lost).
-pub async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) {
-    // Unified blockquote folding rule (fold when >200 characters), consistent
-    // with message pushing.
-    let html_msg = crate::push::normalize_blockquote_fold(html_msg);
-    // Notifications uniformly disable link previews: they often contain
-    // source/message links, and preview cards are noise.
-    let no_preview = crate::push::no_preview();
-    // Notifications share the per-chat pacer with pushes: a burst of owner
-    // alerts (media failures / disabled sources) can otherwise hit Telegram's
-    // flood control. Flood errors back off and retry the notification once.
-    let mut tries = 0u32;
-    let first_err = loop {
-        crate::sendpolicy::pace(user_id).await;
-        match bot
-            .send_message(ChatId(user_id), html_msg.as_str())
-            .parse_mode(teloxide::types::ParseMode::Html)
-            .link_preview_options(no_preview.clone())
-            .await
-        {
-            Ok(_) => return,
-            Err(e) => {
-                let err_str = e.to_string();
-                if crate::sendpolicy::flood_backoff(&err_str, &mut tries, user_id).await {
-                    continue;
-                }
-                break err_str;
-            }
-        }
-    };
-    // 403 = the owner never /start'ed the bot (or blocked it): the plain-
-    // text fallback would also inevitably 403, so log a prominent warn and
-    // skip the fallback, saving one wasted API call.
-    if first_err.contains("Forbidden") || first_err.contains("403") {
-        warn!(
-            user = user_id,
-            "NOTIFICATION UNDELIVERABLE: user has not started a private chat with the bot (or blocked it). \
-             All alerts for this user are silently lost. Ask the user to send /start to the bot."
-        );
-        return;
-    }
-    // Downgrade to plain text: first restore <a href="URL">text</a> to
-    // "URL text" (link information in notifications must not be lost),
-    // then strip tags uniformly (reusing fetcher::strip_tags).
-    let plain = html_msg
-        .replace("<a href=\"", "")
-        .replace("\">", " ")
-        .replace("</a>", "");
-    let plain = crate::fetcher::strip_tags(&plain);
-    let mut tries = 0u32;
-    loop {
-        crate::sendpolicy::pace(user_id).await;
-        match bot
-            .send_message(ChatId(user_id), &plain)
-            .link_preview_options(no_preview.clone())
-            .await
-        {
-            Ok(_) => return,
-            Err(e2) => {
-                let err_str = e2.to_string();
-                if crate::sendpolicy::flood_backoff(&err_str, &mut tries, user_id).await {
-                    continue;
-                }
-                error!(user = user_id, error = %err_str, "failed to notify user (html fallback also failed, first error: {})", first_err);
-                return;
-            }
-        }
-    }
-}
-
-/// Resolve the owner of a chat and send an HTML notification to them.
-/// If the chat has no owner (shouldn't happen post-migration), log and skip.
-async fn notify_owner_html(bot: &Bot, state: &AppState, chat_id: &str, html_msg: &str) {
-    match db::get_chat_owner(&state.db, chat_id).await {
-        Ok(Some(owner)) => notify_user_html(bot, owner, html_msg).await,
-        Ok(None) => warn!(chat_id = chat_id, "cannot notify: chat has no owner"),
-        Err(e) => warn!(chat_id = chat_id, error = %e, "cannot notify: get_chat_owner failed"),
-    }
-}
-
-/// Send an HTML notification to the admin (v1.11.0: after cookies were
-/// globalized, platform-level alerts go to admins instead of channel owners;
-/// v1.11.3: exactly one admin is configured, so this is a single recipient).
-/// The copy is rendered in the admin's own language preference.
-async fn notify_admins_html(
-    bot: &Bot,
-    state: &AppState,
-    build_msg: impl Fn(Lang) -> String,
-) {
-    let admin = state.config.admin_user_id;
-    let lang = owner_lang(state, admin).await;
-    notify_user_html(bot, admin, &build_msg(lang)).await;
-}
-
-/// Resolve the owner's language preference from DB.
-async fn owner_lang(state: &AppState, owner_id: i64) -> Lang {
-    // Delegate to the single source of truth for language resolution
-    // (callbacks::resolve_lang) — notifications have no Telegram client
-    // language hint, so pass None (falls back to En like before).
-    crate::callbacks::resolve_lang(state, owner_id, None).await
-}
-
-/// Append a line "\nlabel：value" (skipped when the value is empty). The
-/// unified way of assembling notification copy.
-fn push_line(msg: &mut String, lang: Lang, label_key: &str, value: &str) {
-    if !value.is_empty() {
-        // Values are mostly URLs (containing & query parameters); escape them
-        // uniformly so they are not parsed as HTML entities.
-        msg.push_str(&format!("\n{}：{}", i18n::t(lang, label_key), push::escape_html(value)));
-    }
-}
-
-/// Oversized-video notification (build + send).
-/// `delivered_as_text` is true only when the entry's main message is the
-/// plain-text fallback. `delivered_tg_link` can be Some for a media message
-/// too (the entry was sent with other media), so it must not be used to
-/// decide the copy. When the link is None the entry was not pushed
-/// (media-only mode / still queued).
-#[allow(clippy::too_many_arguments)]
-async fn notify_oversized_video(
-    bot: &Bot,
-    lang: Lang,
-    owner_id: Option<i64>,
-    chat_title: &str,
-    entry_link: &str,
-    delivered_tg_link: Option<&str>,
-    delivered_as_text: bool,
-    ov: &crate::media::OversizedVideo,
-) {
-    let Some(owner) = owner_id else { return };
-    // The video's actual size is folded into the first line (e.g. "video
-    // ~155 MB not pushed"); omitted when the size is unknown, leaving no
-    // extra spaces. The video direct link is no longer listed separately.
-    let size_part = ov
-        .size
-        .map(|s| i18n::t(lang, "notif_video_size").replacen("{}", &(s / (1024 * 1024)).to_string(), 1))
-        .unwrap_or_default();
-    let mut msg = if delivered_as_text {
-        i18n::t(lang, "notif_video_oversized")
-            .replacen("{}", &size_part, 1)
-            .replacen("{}", &push::escape_html(chat_title), 1)
-    } else {
-        // Either not delivered yet, or delivered with other media; in both
-        // cases "text message sent" would be wrong.
-        i18n::t(lang, "notif_video_oversized_no_text")
-            .replacen("{}", &size_part, 1)
-            .replacen("{}", &push::escape_html(chat_title), 1)
-    };
-    if let Some(tg) = delivered_tg_link {
-        push_line(&mut msg, lang, "label_message", tg);
-    }
-    push_line(&mut msg, lang, "label_entry", entry_link);
-    notify_user_html(bot, owner, &msg).await;
-}
-
-/// Media download failure notification (build + send).
-/// `header_note` is an additional note (e.g. the media-only mode's "entry not
-/// pushed, retrying next round"); an empty string means none.
-#[allow(clippy::too_many_arguments)]
-async fn notify_download_failed(
-    bot: &Bot,
-    lang: Lang,
-    owner_id: Option<i64>,
-    feed_title: &str,
-    warnings: &[String],
-    header_note: &str,
-    delivered_tg_link: Option<&str>,
-    entry_link: &str,
-) {
-    let Some(owner) = owner_id else { return };
-    let mut msg = i18n::t(lang, "notif_dl_failed")
-        .replacen("{}", header_note, 1)
-        .replacen("{}", &push::escape_html(feed_title), 1);
-    for w in warnings {
-        msg.push('\n');
-        msg.push_str(&push::escape_html(w));
-    }
-    if let Some(tg) = delivered_tg_link {
-        push_line(&mut msg, lang, "label_message", tg);
-    }
-    push_line(&mut msg, lang, "label_source", entry_link);
-    notify_user_html(bot, owner, &msg).await;
-}
-
-
 // ===== Outbox retry (persistent retry queue for failed sends) =====
 
 /// Register the outbox retry job: runs every 5 minutes, retries failed sends
@@ -1758,22 +1579,6 @@ fn outbox_abandon_due(
     }
     let anchor = first_attempt_at.unwrap_or(created_at);
     now - anchor >= OUTBOX_ABANDON_SECS
-}
-
-/// Unified construction of push-failure notifications (M5 fix: the original
-/// 4 format! templates were verbatim duplicates).
-/// header = the text inside the parentheses (e.g. "queued for retry" /
-/// "abandoned" / "enqueue failed, entry lost"), reason = the details
-/// inside the blockquote, link_label/link_url = optional source/entry link.
-fn push_fail_msg(lang: Lang, header: &str, feed_title: &str, reason: &str, link_label_key: &str, link_url: &str) -> String {
-    let mut msg = i18n::t(lang, "notif_push_failed")
-        .replacen("{}", header, 1)
-        .replacen("{}", &push::escape_html(feed_title), 1)
-        .replacen("{}", reason, 1);
-    if !link_url.is_empty() {
-        push_line(&mut msg, lang, link_label_key, link_url);
-    }
-    msg
 }
 
 /// Abandon one outbox entry: notify the owner + mark sent + delete the queue

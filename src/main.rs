@@ -12,6 +12,7 @@ mod i18n;
 mod limits;
 mod logging;
 mod media;
+mod notify;
 mod platforms;
 mod push;
 mod richmsg;
