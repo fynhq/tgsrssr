@@ -480,15 +480,14 @@ async fn register_cleanup_job(sched: &JobScheduler, state: AppState) -> anyhow::
     } else {
         state.config.cleanup_interval_minutes
     };
-    // The cron minute-field step only accepts 1-59. Intervals of an hour or
-    // more run an hourly tick and gate execution with the configured interval
-    // (previously every value >=60 was silently coerced to hourly, so 120/180
-    // never meant what the README said).
-    let (expr, gate_secs) = if interval >= 60 {
-        ("0 0 * * * *".to_string(), Some(interval.saturating_mul(60)))
-    } else {
-        (format!("0 */{} * * * *", interval), None)
-    };
+    // Tick every minute and gate with the configured interval. A cron
+    // `0 */N` step is anchored to the hour, so values that do not divide 60
+    // (e.g. 45) would run at 45/15-minute intervals instead of 45. The gate
+    // makes every value mean exactly what the configuration says.
+    let (expr, gate_secs) = (
+        "0 * * * * *".to_string(),
+        Some(interval.saturating_mul(60)),
+    );
     // Startup cleanup already ran; count it as the last run so a long
     // interval is honored from process start.
     let last_run = std::sync::Arc::new(std::sync::Mutex::new(Some(std::time::Instant::now())));

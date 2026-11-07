@@ -160,6 +160,9 @@ pub struct AppState {
     /// guard, auto-redirect disabled). Only used for exact host:port entries
     /// in RSS_TRUSTED_PRIVATE_HOSTS and only for permitted users.
     pub media_trusted: reqwest::Client,
+    /// Trusted private host that is also in RSS_INSECURE_HOSTS: direct,
+    /// no DNS guard, TLS verification disabled (self-signed LAN RSSHub).
+    pub media_trusted_insecure: reqwest::Client,
     /// Bot username (needed for command parsing in groups).
     pub bot_username: String,
     /// Command-path platform fetch concurrency (B scheme: commands only;
@@ -206,6 +209,9 @@ pub struct AppState {
     /// Weibo visitor cookie cache (genvisitor/incarnate self-issued guest identity).
     /// Used by the desktop video API to fetch playback_list without login. TTL 1h.
     pub weibo_visitor_cookie: Arc<Mutex<Option<(String, std::time::Instant)>>>,
+    /// Serializes the genvisitor/incarnate handshake so a cold cache does not
+    /// make every concurrent video worker run its own two-request handshake.
+    pub weibo_visitor_cookie_fetch: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -275,6 +281,7 @@ impl AppState {
         // answers. The allowlist match is enforced by the caller before this
         // client is selected.
         let media_trusted = build_client(None, false, false, false)?;
+        let media_trusted_insecure = build_client(None, true, false, false)?;
 
         Ok(Self {
             fetch_semaphore: Arc::new(Semaphore::new(config.fetch_concurrency)),
@@ -286,6 +293,7 @@ impl AppState {
             cleanup_active: Arc::new(AtomicBool::new(false)),
             cookies: Arc::new(RwLock::new(HashMap::new())),
             weibo_visitor_cookie: Arc::new(Mutex::new(None)),
+            weibo_visitor_cookie_fetch: Arc::new(tokio::sync::Mutex::new(())),
             config: Arc::new(config),
             db,
             bot_username,
@@ -293,6 +301,7 @@ impl AppState {
             media_direct,
             media_insecure,
             media_trusted,
+            media_trusted_insecure,
             platform_command_semaphore: Arc::new(Semaphore::new(PLATFORM_COMMAND_CONCURRENCY)),
             command_rate_limiter: Arc::new(crate::limits::CommandRateLimiter::new()),
             user_sub_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -371,6 +380,16 @@ impl AppState {
         allow_trusted: bool,
     ) -> (&reqwest::Client, bool) {
         if allow_trusted && self.is_trusted_private_url(url) {
+            // A self-signed LAN RSSHub needs both allowlists; without this
+            // combined client the trusted branch would bypass the insecure
+            // TLS switch and every request would fail certificate validation.
+            let host = url::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                .unwrap_or_default();
+            if crate::config::host_in_list(&host, &self.config.rss_insecure_hosts) {
+                return (&self.media_trusted_insecure, false);
+            }
             return (&self.media_trusted, false);
         }
         self.media_route_for_url(url)

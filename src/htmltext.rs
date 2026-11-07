@@ -229,7 +229,9 @@ pub fn truncate_html_keep_links(html: &str, max_visible: usize) -> (String, bool
                 i += ch_adv;
             }
         }
-        visible += 1;
+        // Match visible_len's UTF-16 unit: an entity decodes to one unit, a
+        // supplementary-plane char counts as two.
+        visible += if entity.is_some() { 1 } else { ch.len_utf16() };
     }
 
     if in_link {
@@ -481,49 +483,17 @@ pub fn extract_cookie_value(set_cookie: &str, name: &str) -> Option<String> {
 pub fn normalize_blockquote_fold(html: &str) -> String {
     const FOLD_THRESHOLD: usize = 200;
     const HEADER_MAX_VISIBLE: usize = 50;
-    static RE_BQ_OPEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)<blockquote\b[^>]*>").unwrap()
-    });
-    static RE_BQ_CLOSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)</blockquote\s*>").unwrap()
-    });
 
     let mut out = String::with_capacity(html.len());
     let mut pos = 0usize;
-    while let Some(open) = RE_BQ_OPEN.find(&html[pos..]) {
+    while let Some(open) = RE_BQ_OPEN_TAG.find(&html[pos..]) {
         let open_start = pos + open.start();
         let inner_start = pos + open.end();
         out.push_str(&html[pos..open_start]);
-        // Depth-counting scan to locate the outermost closing tag (when
-        // nested, depth increments then decrements).
-        let mut depth = 1usize;
-        let mut cursor = inner_start;
-        // Start of the closing tag (inner's right boundary) and end (the
-        // position where scanning continues).
-        let mut close_span: Option<(usize, usize)> = None;
-        while depth > 0 {
-            let rest = &html[cursor..];
-            let next_open = RE_BQ_OPEN.find(rest).map(|m| (cursor + m.start(), cursor + m.end(), true));
-            let next_close = RE_BQ_CLOSE.find(rest).map(|m| (cursor + m.start(), cursor + m.end(), false));
-            let next = match (next_open, next_close) {
-                (Some(o), Some(c)) => {
-                    if o.0 <= c.0 { o } else { c }
-                }
-                (Some(o), None) => o,
-                (None, Some(c)) => c,
-                (None, None) => break, // Unclosed: keep original text
-            };
-            if next.2 {
-                depth += 1;
-            } else {
-                depth -= 1;
-                if depth == 0 {
-                    close_span = Some((next.0, next.1));
-                    break;
-                }
-            }
-            cursor = next.1;
-        }
+        // Single depth-counting implementation shared with the splitter and
+        // the Telegram channel parser.
+        let close_span =
+            find_balanced_close(html, inner_start, &RE_BQ_OPEN_TAG, &RE_BQ_CLOSE_TAG);
         let Some((close_start, close_end)) = close_span else {
             out.push_str(&html[open_start..]);
             pos = html.len();
@@ -626,7 +596,7 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                 chunks.push(current.clone());
                 current.clear();
             }
-            if para.contains("<pre") {
+            if RE_PRE_TAG_OPEN.is_match(&para) {
                 // Code block exceeds the limit: split on \n line boundaries,
                 // re-wrapping each chunk in its own wrapper tags.
                 // Extract the opening tag (may contain class="language-xxx")
@@ -636,11 +606,11 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                 // inside the re-wrapped wrapper (malformed double-pre HTML).
                 static RE_PRE_OPEN: std::sync::LazyLock<regex::Regex> =
                     std::sync::LazyLock::new(|| {
-                        regex::Regex::new(r"(?s)<pre\b[^>]*><code\b[^>]*>").unwrap()
+                        regex::Regex::new(r"(?is)<pre\b[^>]*><code\b[^>]*>").unwrap()
                     });
                 static RE_PRE_BARE: std::sync::LazyLock<regex::Regex> =
                     std::sync::LazyLock::new(|| {
-                        regex::Regex::new(r"(?s)<pre\b[^>]*>").unwrap()
+                        regex::Regex::new(r"(?is)<pre\b[^>]*>").unwrap()
                     });
                 let code_match = RE_PRE_OPEN.find(para.as_str());
                 let bare_match = RE_PRE_BARE.find(para.as_str());
@@ -861,6 +831,12 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
         chunks.push(current);
     }
     rebalance_chunks(&mut chunks);
+    // Tags-only fragments (e.g. an image-only blockquote whose image was
+    // stripped upstream) have zero visible text. Telegram rejects an empty
+    // message, and a failed chunk would send the whole entry to outbox, so
+    // drop them after rebalancing (the next chunk already carries any open
+    // tags that need to continue).
+    chunks.retain(|c| visible_len(c) > 0);
     chunks
 }
 
@@ -1113,6 +1089,26 @@ fn scan_raw_cut(text: &str, max_units: usize) -> (usize, Vec<(String, String)>) 
     (best, best_stack)
 }
 
+/// Hard-split plain text at UTF-16 unit boundaries. Used only as a last
+/// resort when markup makes a safe HTML cut impossible; formatting is lost,
+/// but the message still fits Telegram's limit.
+fn split_plain_utf16(text: &str, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while utf16_len(rest) > limit {
+        let cut = take_utf16_prefix(rest, limit);
+        if cut.is_empty() {
+            break;
+        }
+        out.push(cut.to_string());
+        rest = &rest[cut.len()..];
+    }
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
+}
+
 /// Split a single HTML paragraph that exceeds `limit` at safe positions:
 /// after closing tags, before opening tags, or after whitespace — never
 /// inside a tag or an entity reference. Tags still open at the cut are
@@ -1196,15 +1192,20 @@ pub fn split_html_safe(text: &str, limit: usize) -> Vec<String> {
         }
         if cut == 0 {
             // Pathological input (e.g. a single tag/entity larger than the
-            // whole budget): keep the remainder as one over-long chunk instead
-            // of cutting inside markup. Telegram may reject it, but it is
-            // still valid HTML, and no content is cut in half.
+            // whole budget). Keep valid HTML when its visible text still fits;
+            // otherwise fall back to plain-text hard cuts so Telegram does not
+            // reject the whole entry with "message is too long".
             tracing::warn!(
                 limit = limit,
                 remaining_units = utf16_len(&remaining),
-                "split_html_safe found no safe raw cut; emitting an over-long remainder"
+                "split_html_safe found no safe raw cut; falling back to plain text"
             );
-            chunks.push(remaining);
+            let plain = strip_html_tags(&remaining);
+            if visible_len(&plain) > limit {
+                chunks.extend(split_plain_utf16(&plain, limit));
+            } else {
+                chunks.push(remaining);
+            }
             return chunks;
         }
         let openers: String = cut_stack.iter().map(|(_, t)| t.as_str()).collect();
@@ -1223,9 +1224,14 @@ pub fn split_html_safe(text: &str, limit: usize) -> Vec<String> {
                 head_units = head_len,
                 closers_units = utf16_len(&closers),
                 openers_units = utf16_len(&openers),
-                "split_html_safe cannot make progress within the limit; emitting an over-long remainder"
+                "split_html_safe cannot make progress within the limit; falling back to plain text"
             );
-            chunks.push(remaining);
+            let plain = strip_html_tags(&remaining);
+            if visible_len(&plain) > limit {
+                chunks.extend(split_plain_utf16(&plain, limit));
+            } else {
+                chunks.push(remaining);
+            }
             return chunks;
         }
         chunks.push(format!("{}{}", &remaining[..cut], closers));
@@ -1774,5 +1780,17 @@ second paragraph</a> tail"#;
             assert!(scan.end_stack.is_empty(), "unclosed tags in chunk: {c}");
             assert!(visible_len(c) <= 20, "chunk exceeds limit: {c}");
         }
+    }
+
+    #[test]
+    fn split_html_drops_zero_visible_blockquote_fragment() {
+        // An image-only blockquote becomes <blockquote></blockquote> after
+        // upstream media removal. If a following long paragraph forces a
+        // split, that fragment must not become its own message: Telegram
+        // rejects empty text and the whole entry would fall into outbox.
+        let html = format!("<blockquote></blockquote>\n\n{}", "长".repeat(300));
+        let out = split_html(&html, 100);
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|c| visible_len(c) > 0), "{out:?}");
     }
 }

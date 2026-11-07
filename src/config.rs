@@ -63,9 +63,9 @@ pub struct Config {
     // (key = "cookie:<platform>"); configured by admins via /cookies.
 
     // Media transport: where the Bot API server sees our media directory.
-    // Empty => official API (or unknown mount): 49MB upload cap.
-    // Set => local Bot API mode: 2GB cap; standard sends stream multipart,
-    // rich-message attachments may use file:// server-side reads.
+    // BOT_API_URL controls the 2GB upload cap; this path only enables
+    // rich-message file:// server-side reads. Empty => multipart uploads even
+    // with a local Bot API.
     pub bot_api_media_dir: String,
 
     // Image relay (enabled when the base URL is non-empty and a host matches

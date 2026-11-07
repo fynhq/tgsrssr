@@ -108,6 +108,9 @@ pub struct MediaBudget {
     used: std::sync::atomic::AtomicU64,
     reserved: std::sync::atomic::AtomicU64,
     initialized: std::sync::atomic::AtomicBool,
+    /// Set when the last directory scan failed. Callers use this to defer the
+    /// entry as retryable instead of treating the result as a real quota skip.
+    scan_failed: std::sync::atomic::AtomicBool,
     refresh_lock: tokio::sync::Mutex<()>,
     last_refresh: std::sync::Mutex<Option<std::time::Instant>>,
 }
@@ -118,6 +121,7 @@ impl MediaBudget {
             used: std::sync::atomic::AtomicU64::new(0),
             reserved: std::sync::atomic::AtomicU64::new(0),
             initialized: std::sync::atomic::AtomicBool::new(false),
+            scan_failed: std::sync::atomic::AtomicBool::new(false),
             refresh_lock: tokio::sync::Mutex::new(()),
             last_refresh: std::sync::Mutex::new(None),
         }
@@ -129,6 +133,11 @@ impl MediaBudget {
         self.initialized
             .store(false, std::sync::atomic::Ordering::Release);
         *self.last_refresh.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// True when the last scan failed (not a genuine quota exhaustion).
+    pub fn scan_failed(&self) -> bool {
+        self.scan_failed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn release_reserved(&self, units: u64) {
@@ -175,9 +184,12 @@ impl MediaBudget {
                     .load(std::sync::atomic::Ordering::Acquire)
             {
                 match crate::cleanup::dir_size(media_dir).await {
-                    Ok(size) => self
-                        .used
-                        .store(size, std::sync::atomic::Ordering::Release),
+                    Ok(size) => {
+                        self.used
+                            .store(size, std::sync::atomic::Ordering::Release);
+                        self.scan_failed
+                            .store(false, std::sync::atomic::Ordering::Release);
+                    }
                     Err(e) => {
                         warn!(
                             media_dir = %media_dir.display(),
@@ -189,6 +201,8 @@ impl MediaBudget {
                         // disk guard entirely. The next stale-interval scan
                         // restores the real value.
                         self.used.store(cap, std::sync::atomic::Ordering::Release);
+                        self.scan_failed
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                 }
                 self.initialized
@@ -266,28 +280,32 @@ const STORAGE_SUFFIX: &str = ".tgsr";
 ///   uploads > 50MB).
 #[derive(Debug, Clone)]
 pub struct MediaTransport {
+    /// True when a local Bot API is configured. This alone controls the 2GB
+    /// upload ceiling, matching the README contract.
+    local_api: bool,
+    /// Set only when BOT_API_MEDIA_DIR is non-empty: rich attachments may use
+    /// file:// paths that the Bot API server can read.
     local_prefix: Option<PathBuf>,
     bot_prefix: Option<PathBuf>,
 }
 
 impl MediaTransport {
     pub fn new(cfg: &Config) -> Self {
-        let use_file = cfg.bot_api_url.is_some() && !cfg.bot_api_media_dir.is_empty();
+        let local_api = cfg.bot_api_url.is_some();
+        let use_file = local_api && !cfg.bot_api_media_dir.is_empty();
         if use_file {
             Self {
+                local_api,
                 local_prefix: Some(cfg.media_dir.clone()),
                 bot_prefix: Some(PathBuf::from(&cfg.bot_api_media_dir)),
             }
         } else {
             Self {
+                local_api,
                 local_prefix: None,
                 bot_prefix: None,
             }
         }
-    }
-
-    fn use_file(&self) -> bool {
-        self.bot_prefix.is_some()
     }
 
     /// Translate one of our local media paths into the Bot API server's
@@ -301,7 +319,9 @@ impl MediaTransport {
     }
 
     pub fn max_download_bytes(&self) -> u64 {
-        if self.use_file() {
+        // The 2GB ceiling follows BOT_API_URL, not the media-dir mount: an
+        // empty BOT_API_MEDIA_DIR only disables file:// rich attachments.
+        if self.local_api {
             MAX_VIDEO_FILE_BYTES
         } else {
             MAX_VIDEO_OFFICIAL_BYTES
@@ -533,13 +553,13 @@ async fn upgrade_weibo_video_hd(
         false,
         "weibo",
         5,
-        |client, cur_url, _hop| {
+        |client, cur_url, hop| {
             let mut req = client
                 .get(cur_url)
                 .header("Referer", "https://m.weibo.cn/")
                 .header("User-Agent", crate::state::MOBILE_BROWSER_UA)
                 .header("Accept", "application/json, text/plain, */*");
-            if !user_cookies.is_empty() {
+            if !user_cookies.is_empty() && (hop == 0 || same_origin(cur_url, &api)) {
                 req = req.header("Cookie", user_cookies.as_str());
             }
             req
@@ -604,6 +624,20 @@ pub(crate) async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
         }
     }
 
+    // Single-flight: only one handshake at a time. Other callers wait, then
+    // re-check the cache (double-checked locking) instead of replaying the
+    // two-request handshake in parallel during a cold cache or risk-control
+    // window.
+    let _handshake = state.weibo_visitor_cookie_fetch.lock().await;
+    {
+        let guard = state.weibo_visitor_cookie.lock().await;
+        if let Some((cookie, ts)) = guard.as_ref() {
+            let ttl = if cookie.is_empty() { NEGATIVE_TTL } else { TTL };
+            if ts.elapsed() < ttl {
+                return if cookie.is_empty() { None } else { Some(cookie.clone()) };
+            }
+        }
+    }
     let cookie = fetch_visitor_cookie(state).await;
     {
         // Record the outcome for the TTL window (empty string = negative).
@@ -734,8 +768,14 @@ fn detect_image_ext(head: &[u8]) -> Option<&'static str> {
     if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" {
         return Some("webp");
     }
-    if head.starts_with(b"BM") {
-        return Some("bmp");
+    // BMP: require the minimum header (14-byte file header + 12-byte DIB) and
+    // a plausible DIB header size; a bare "BM" prefix is too weak and would
+    // accept arbitrary text starting with those bytes.
+    if head.len() >= 26 && head.starts_with(b"BM") {
+        let dib_size = u32::from_le_bytes([head[14], head[15], head[16], head[17]]);
+        if (12..=124).contains(&dib_size) {
+            return Some("bmp");
+        }
     }
     // ISO BMFF: [size:4]["ftyp"][brand:4]...
     if head.len() >= 12 && &head[4..8] == b"ftyp" {
@@ -793,8 +833,23 @@ fn detect_video_container(head: &[u8]) -> Option<&'static str> {
     // start with moov/mdat/wide/free/skip instead of ftyp.
     if head.len() >= 8 {
         let box_type = &head[4..8];
-        if box_type == b"ftyp"
-            || box_type == b"moov"
+        if box_type == b"ftyp" {
+            // ftyp is shared by images (HEIC/AVIF) and videos; reject the
+            // known image brands before classifying the payload as mp4.
+            if head.len() >= 12 {
+                let brand = &head[8..12];
+                let image_brand = matches!(
+                    brand,
+                    b"avif" | b"avis" | b"heic" | b"heix" | b"hevc" | b"hevx"
+                        | b"heim" | b"heis" | b"hevm" | b"hevs" | b"mif1" | b"msf1"
+                );
+                if image_brand {
+                    return None;
+                }
+            }
+            return Some("mp4");
+        }
+        if box_type == b"moov"
             || box_type == b"mdat"
             || box_type == b"wide"
             || box_type == b"free"
@@ -918,6 +973,18 @@ fn urlencoding(s: &str) -> String {
     out
 }
 
+/// Same host:port comparison for redirect hops that must not receive
+/// credentials. The media clients disable reqwest's automatic redirect
+/// handling, so the manual follower has to enforce the "sensitive headers do
+/// not cross authorities" rule itself.
+fn same_origin(a: &str, b: &str) -> bool {
+    let key = |s: &str| {
+        let u = url::Url::parse(s).ok()?;
+        Some((u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()))
+    };
+    matches!((key(a), key(b)), (Some(a), Some(b)) if a == b)
+}
+
 /// Get the highest-quality video stream from the desktop API:
 /// page_info.media_info.playback_list in weibo.com/ajax/statuses/show
 /// contains 1080p+ (the mobile API only goes up to 720p).
@@ -936,13 +1003,13 @@ async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -
         false,
         "weibo",
         5,
-        |client, cur_url, _hop| {
+        |client, cur_url, hop| {
             let mut req = client
                 .get(cur_url)
                 .header("Referer", "https://weibo.com/")
                 .header("Accept", "application/json, text/plain, */*")
                 .header("X-Requested-With", "XMLHttpRequest");
-            if !cookies.is_empty() {
+            if !cookies.is_empty() && (hop == 0 || same_origin(cur_url, &api)) {
                 req = req.header("Cookie", cookies);
             }
             req
@@ -1079,6 +1146,10 @@ enum RawOutcome {
     /// (computed incrementally).
     File { path: PathBuf, size: u64, content_hash: String },
     Oversized { size: Option<u64> },
+    /// The shared budget granted less than the requested per-file cap and the
+    /// file fits the requested cap but not the grant. This is a quota skip,
+    /// not an oversized file.
+    QuotaSkipped,
     Empty,
 }
 
@@ -1396,6 +1467,22 @@ pub async fn prepare_entry_media(
             debug!(url = %raw_url, "single-media mode: candidate skipped (not image/video)");
             continue;
         }
+        let entry_remaining = MAX_MEDIA_BYTES_PER_ENTRY.saturating_sub(entry_bytes);
+        if entry_remaining < MIN_MEDIA_FREE_BYTES {
+            warn!(entry_id = %fetcher::entry_id(entry), "per-entry media byte cap reached, skipping remaining candidates");
+            out.warnings.push(crate::i18n::t(lang, "media_entry_cap_skip").to_string());
+            break;
+        }
+        let download_cap = base_cap.min(entry_remaining);
+
+        // Hold the download permit across Weibo enrichment too: the HD API
+        // calls are outbound requests and must count against the media
+        // concurrency budget, not run ahead of it.
+        let _permit = match state.download_semaphore.acquire().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+
         // Weibo-specific: upgrade thumbnail size segment to `large`.
         let mut url = upgrade_weibo_size(&raw_url);
         // Weibo-specific: resolve HD video stream via status API.
@@ -1408,19 +1495,6 @@ pub async fn prepare_entry_media(
         // Optional img-relay (anti-hotlink bypass service) when configured.
         let url = fetcher::resolve_url(state, &url);
         let via_relay = url != direct_url;
-
-        let entry_remaining = MAX_MEDIA_BYTES_PER_ENTRY.saturating_sub(entry_bytes);
-        if entry_remaining < MIN_MEDIA_FREE_BYTES {
-            warn!(entry_id = %fetcher::entry_id(entry), "per-entry media byte cap reached, skipping remaining candidates");
-            out.warnings.push(crate::i18n::t(lang, "media_entry_cap_skip").to_string());
-            break;
-        }
-        let download_cap = base_cap.min(entry_remaining);
-
-        let _permit = match state.download_semaphore.acquire().await {
-            Ok(p) => p,
-            Err(_) => break,
-        };
 
         // Download: when the relay fails, retry once with the original
         // direct URL as a fallback (the relay can 502 on large files /
@@ -1504,6 +1578,11 @@ pub async fn prepare_entry_media(
                 let msg = crate::i18n::t(lang, "media_dl_empty").replacen("{}", kind_label(lang, &kind), 1);
                 debug!(url = %url, "media skipped (empty response)");
                 out.warnings.push(msg);
+                // A 200 with an empty body is often a transient CDN hiccup
+                // (the relay path already retries it directly). Treat it like
+                // other download failures so the entry is deferred instead of
+                // permanently dropping the media.
+                out.download_failed = true;
                 if kind == MediaKind::Video {
                     video_needs_cover = true;
                 }
@@ -1586,9 +1665,32 @@ pub async fn prepare_entry_media(
     // not occupy a download concurrency slot).
     // Videos: probe the duration + generate a thumbnail; long/large images
     // (sent as documents): generate a thumbnail.
+    //
+    // Thumbnails are written next to the media without going through the
+    // per-download reservation. Reserve their worst-case bytes up front so
+    // they cannot silently push the directory past the global budget; when
+    // the reservation is unavailable, still probe durations but skip previews.
+    const MAX_THUMB_BYTES: u64 = 190 * 1024;
+    let max_thumbs = (MAX_MEDIA_PER_ENTRY as u64).saturating_add(1);
+    let mut thumb_reservation = state
+        .media_budget
+        .reserve(
+            &state.config.media_dir,
+            state.config.media_max_bytes(),
+            MAX_THUMB_BYTES.saturating_mul(max_thumbs),
+        )
+        .await;
+    let allow_thumb = thumb_reservation
+        .as_ref()
+        .is_some_and(|r| r.granted() >= MAX_THUMB_BYTES.saturating_mul(max_thumbs));
+    if !allow_thumb {
+        // Release a partial reservation; thumbnails are optional and must not
+        // push the directory past the budget.
+        thumb_reservation = None;
+    }
     for item in &mut out.items {
         if item.kind == MediaKind::Video {
-            let (thumb, dur) = probe_video_meta(&item.path).await;
+            let (thumb, dur) = probe_video_meta(&item.path, allow_thumb).await;
             item.thumb_path = thumb;
             item.duration_secs = dur;
         } else if item.kind == MediaKind::Image
@@ -1600,8 +1702,18 @@ pub async fn prepare_entry_media(
             // sendDocument (AVIF/SVG/HEIC/TIFF) both need a preview thumbnail.
             // The old condition only looked at dimensions, leaving
             // format-converted documents without one.
-            item.thumb_path = make_image_thumb(&item.path).await;
+            item.thumb_path = make_image_thumb(&item.path, allow_thumb).await;
         }
+    }
+    if let Some(reservation) = thumb_reservation.as_mut() {
+        let actual: u64 = out
+            .items
+            .iter()
+            .filter_map(|item| item.thumb_path.as_ref())
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|meta| meta.len())
+            .sum();
+        reservation.commit(actual);
     }
 
     out
@@ -1634,6 +1746,12 @@ async fn download_one(
         .await
     {
         Some(r) => r,
+        None if state.media_budget.scan_failed() => {
+            // A failed directory scan is not a real quota decision: surface it
+            // as a retryable error so the entry is deferred instead of losing
+            // its media permanently.
+            anyhow::bail!("media budget scan failed; deferring download");
+        }
         None => return Ok(DownloadOutcome::QuotaSkipped),
     };
     let cap = reservation.granted();
@@ -1678,10 +1796,16 @@ async fn download_one(
             if !resp.status().is_success() {
                 anyhow::bail!("HTTP {}", resp.status());
             }
-            // Pre-check content-length when advertised
+            // Pre-check content-length when advertised. The budget may have
+            // granted less than the caller's per-file cap; a file that fits
+            // the requested cap but not the partial grant is a quota skip.
+            let partial_grant = cap < download_cap;
             if let Some(len) = resp.content_length() {
-                if len > cap {
+                if len > download_cap {
                     return Ok(RawOutcome::Oversized { size: Some(len) });
+                }
+                if partial_grant && len > cap {
+                    return Ok(RawOutcome::QuotaSkipped);
                 }
             }
             // Streaming to disk: write to the temp file while downloading +
@@ -1699,6 +1823,9 @@ async fn download_one(
                 if written > cap {
                     drop(file);
                     let _ = tokio::fs::remove_file(&tmp).await;
+                    if partial_grant {
+                        return Ok(RawOutcome::QuotaSkipped);
+                    }
                     return Ok(RawOutcome::Oversized { size: None });
                 }
             }
@@ -1764,6 +1891,7 @@ async fn download_one(
     let (tmp_path, size, content_hash) = match result? {
         RawOutcome::File { path, size, content_hash } => (path, size, content_hash),
         RawOutcome::Oversized { size } => return Ok(DownloadOutcome::Oversized { size }),
+        RawOutcome::QuotaSkipped => return Ok(DownloadOutcome::QuotaSkipped),
         RawOutcome::Empty => return Ok(DownloadOutcome::Empty),
     };
 
@@ -2000,7 +2128,10 @@ async fn grab_thumb(path: &std::path::Path, ss: Option<&str>, thumb: &std::path:
 
 /// Grab one frame from an image and scale it to a JPEG thumbnail (for the
 /// document-send preview). Silently returns None on failure.
-async fn make_image_thumb(path: &std::path::Path) -> Option<PathBuf> {
+async fn make_image_thumb(path: &std::path::Path, allow_thumb: bool) -> Option<PathBuf> {
+    if !allow_thumb {
+        return None;
+    }
     let thumb = stored_thumb_path(path);
     if grab_thumb(path, None, &thumb).await {
         Some(thumb)
@@ -2013,7 +2144,7 @@ async fn make_image_thumb(path: &std::path::Path) -> Option<PathBuf> {
 /// make a JPEG thumbnail (width ≤320; Telegram requires thumbnails ≤200KB).
 /// If either step fails, silently degrade to None — the video is sent as
 /// usual, just without a preview (same behavior as before this change).
-async fn probe_video_meta(path: &std::path::Path) -> (Option<PathBuf>, Option<u32>) {
+async fn probe_video_meta(path: &std::path::Path, allow_thumb: bool) -> (Option<PathBuf>, Option<u32>) {
     // Duration
     let mut probe_cmd = tokio::process::Command::new("ffprobe");
     probe_cmd
@@ -2033,7 +2164,11 @@ async fn probe_video_meta(path: &std::path::Path) -> (Option<PathBuf>, Option<u3
         .map(|d| d.round() as u32);
 
     // Thumbnail: prefer the frame at the 1st second; if unavailable (short
-    // video), take the first frame
+    // video), take the first frame. Skip it entirely when the media budget
+    // could not reserve room for thumbnail bytes.
+    if !allow_thumb {
+        return (None, duration_secs);
+    }
     let thumb = stored_thumb_path(path);
     let mut made = false;
     for ss in ["1", "0"] {
