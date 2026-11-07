@@ -1555,6 +1555,7 @@ const EMOJI_MAP: &[(&str, &str)] = &[
     ("[吐]", "🤮"),
     // Actions
     ("[鼓掌]", "👏"),
+    ("[打call]", "🙌"),
     ("[握手]", "🤝"),
     ("[抱拳]", "🙏"),
     ("[合十]", "🙏"),
@@ -1889,6 +1890,10 @@ mod tests {
         let html3 = r#"<img alt="[doge]" src="https://face.t.sinajs.cn/doge.png"><img src="https://h5.sinaimg.cn/upload/icon.png">"#;
         let out3 = strip_ui_icons(html3);
         assert_eq!(out3, "🐶");
+
+        // Action marker converted to its mapped emoji.
+        let html3b = r#"<img alt="[打call]" src="https://face.t.sinajs.cn/x.png">"#;
+        assert_eq!(strip_ui_icons(html3b), "🙌");
 
         // Unmapped emoji stays as text.
         let html4 = r#"<img alt="[某平台专属表情]" src="https://face.t.sinajs.cn/x.png">"#;
