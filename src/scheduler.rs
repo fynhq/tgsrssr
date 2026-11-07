@@ -164,14 +164,20 @@ async fn note_zero_entry_round(state: &AppState, sub: &db::SubRow, round_zero: b
 /// arguments on process_feed (clippy too_many_arguments).
 #[derive(Default)]
 struct PlatRoundStats {
-    /// Platforms scheduled this round (regardless of success/failure)
-    seen: tokio::sync::Mutex<std::collections::HashSet<&'static str>>,
+    /// Platforms scheduled this round and how many of their sources ran
+    /// (regardless of success/failure).
+    seen: tokio::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
     /// Platforms that had failures this round
     failed: tokio::sync::Mutex<std::collections::HashSet<&'static str>>,
     /// Platforms that had successes this round
     ok: tokio::sync::Mutex<std::collections::HashSet<&'static str>>,
     /// Last error message (for display in anomaly notifications)
     last_err: tokio::sync::Mutex<std::collections::HashMap<&'static str, String>>,
+    /// Number of active sources per platform. A platform-level health verdict
+    /// is only valid when every active source was scheduled this round; with
+    /// mixed per-source intervals a single due source is not a whole-platform
+    /// sample.
+    active_counts: std::collections::HashMap<&'static str, usize>,
 }
 
 /// Maximum number of RSS sources processed concurrently by one fetch cycle.
@@ -238,7 +244,26 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     // streak), preventing one permanently failing source (when an owner has
     // multiple sources) from dragging the whole platform into a persistent
     // down state that never recovers.
-    let stats = std::sync::Arc::new(PlatRoundStats::default());
+    let active_counts = match db::active_subscription_urls(&state.db).await {
+        Ok(urls) => {
+            let mut counts: std::collections::HashMap<&'static str, usize> =
+                std::collections::HashMap::new();
+            for url in urls {
+                if let Some(p) = platform_of_url(&url) {
+                    *counts.entry(p).or_insert(0) += 1;
+                }
+            }
+            counts
+        }
+        Err(e) => {
+            warn!(error = %e, "active subscription count failed; platform health uses the due sample only");
+            std::collections::HashMap::new()
+        }
+    };
+    let stats = std::sync::Arc::new(PlatRoundStats {
+        active_counts,
+        ..PlatRoundStats::default()
+    });
 
     // Separate platform sources (weibo/X) from plain RSS sources:
     // platform sources run serially with random gaps (reducing the chance of
@@ -370,7 +395,21 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     let failed = stats.failed.lock().await.clone();
     let ok_set = stats.ok.lock().await.clone();
     let last_err = stats.last_err.lock().await.clone();
-    for &p in &seen {
+    for (&p, &seen_count) in &seen {
+        // Only judge a platform when every active source was scheduled this
+        // round. With mixed per-source intervals, a single due source (which
+        // happens to fail) is not evidence that the whole platform is down.
+        // If the active-count query failed, fall back to the due sample.
+        let active_count = stats.active_counts.get(p).copied().unwrap_or(seen_count);
+        if seen_count < active_count {
+            tracing::debug!(
+                platform = p,
+                seen = seen_count,
+                active = active_count,
+                "platform health deferred: not all active sources ran this round"
+            );
+            continue;
+        }
         let streak_key = db::setting_key::platform_streak(p);
         let health_key = db::setting_key::platform_health(p);
         let is_down = matches!(
@@ -515,7 +554,7 @@ async fn process_feed(
     // Record the platforms scheduled this round (regardless of outcome), for
     // whole-round recovery evaluation (global criterion).
     if let Some(p) = platform_of_url(&sub.feed_url) {
-        stats.seen.lock().await.insert(p);
+        *stats.seen.lock().await.entry(p).or_insert(0) += 1;
     }
 
     // v1.10.3: debounce retry for transient errors on RSS sources (1 retry,
@@ -1170,6 +1209,29 @@ async fn process_feed(
                         }
                     }
                     Err(e) => {
+                        // Group upgraded to a supergroup: migrate every
+                        // chat-scoped row and skip the outbox insert; the next
+                        // fetch uses the new chat id. Without this, the old
+                        // subscription would keep failing into outbox until
+                        // abandoned after 72h.
+                        if let Some(new_id) = migrated_chat_id_from_error(&e) {
+                            match db::migrate_chat_id(&state.db, &cfg.chat_id, &new_id).await {
+                                Ok(()) => {
+                                    info!(
+                                        old_chat_id = %cfg.chat_id,
+                                        new_chat_id = %new_id,
+                                        "chat id migrated after send error; retrying on the next cycle"
+                                    );
+                                    continue;
+                                }
+                                Err(me) => warn!(
+                                    old_chat_id = %cfg.chat_id,
+                                    new_chat_id = %new_id,
+                                    error = %me,
+                                    "chat id migration after send error failed"
+                                ),
+                            }
+                        }
                         warn!(feed = %cfg.feed_url, error = %e, "send failed, queuing to outbox");
                         // Push failed: write into the outbox persistent retry
                         // queue (exponential backoff, abandon at 72h).
@@ -1560,6 +1622,25 @@ const OUTBOX_ABANDON_SECS: i64 = 72 * 3600;
 /// of the queue.
 const OUTBOX_BATCH_LIMIT: i64 = 25;
 
+/// Extract the new supergroup id from a send failure. The typed teloxide
+/// variant is preferred; media paths stringify errors, so the Display text
+/// ("migrated to a supergroup with ID #-100…") is the fallback.
+fn migrated_chat_id_from_error(e: &anyhow::Error) -> Option<String> {
+    if let Some(teloxide::RequestError::MigrateToChatId(id)) =
+        e.downcast_ref::<teloxide::RequestError>()
+    {
+        return Some(id.0.to_string());
+    }
+    let text = format!("{:#}", e);
+    let marker = "supergroup with ID #";
+    let start = text.find(marker)? + marker.len();
+    let id: String = text[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    (!id.is_empty()).then_some(id)
+}
+
 /// Whether a queue row is past its 72h retry window. The clock starts at the
 /// first actual attempt, not at enqueue time; a row that has never been tried
 /// is never abandoned (it may simply have been behind a long backlog). Legacy
@@ -1604,7 +1685,12 @@ async fn abandon_outbox_row(bot: &Bot, state: &AppState, row: &db::OutboxRow, re
     );
     notify_owner_html(bot, state, &row.chat_id, &msg).await;
     if let Err(e) = db::mark_entry_sent(&state.db, &row.chat_id, &row.feed_url, &row.entry_id).await {
-        warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to mark abandoned entry as sent");
+        // Keep the row: deleting it without the sent marker would let the
+        // next fetch re-push the entry, fail again, and re-enqueue it, turning
+        // the abandon path into a periodic notification loop. The next retry
+        // attempts the mark again before abandoning.
+        warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to mark abandoned entry as sent; keeping the row");
+        return;
     }
     if let Err(e) = db::outbox_delete(&state.db, row.id).await {
         warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete abandoned entry");
@@ -1726,8 +1812,12 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
 
         // Check if 72h elapsed since the first actual attempt -> abandon.
         // Measuring from created_at silently abandoned rows that sat behind a
-        // long outage backlog and were never retried even once.
-        if outbox_abandon_due(row.created_at, row.first_attempt_at, row.attempts, now) {
+        // long outage backlog and were never retried even once. Use a per-row
+        // clock: a batch of large uploads can outlive several backoff steps,
+        // and the round-start timestamp would make the next retry look due
+        // immediately.
+        let row_now = chrono::Utc::now().timestamp();
+        if outbox_abandon_due(row.created_at, row.first_attempt_at, row.attempts, row_now) {
             warn!(
                 entry_id = %row.entry_id,
                 feed = %row.feed_url,
@@ -1911,6 +2001,32 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         match result {
             Ok(send_outcome) => {
                 info!(entry_id = %row.entry_id, feed = %row.feed_url, "outbox retry succeeded");
+                // The retry may deliver the text while its media is
+                // permanently lost (expired/rejected). Surface the same
+                // media_failed notice as the main path; otherwise the owner
+                // only sees the earlier "queued" message and never learns that
+                // the media was dropped.
+                if send_outcome.media_failed {
+                    let chat_title = db::get_chat(&state.db, &row.chat_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|c| c.title.or(c.username))
+                        .unwrap_or_else(|| row.chat_id.clone());
+                    let lang = match db::get_chat_owner(&state.db, &row.chat_id).await {
+                        Ok(Some(owner)) => owner_lang(state, owner).await,
+                        _ => Lang::En,
+                    };
+                    let mut msg = i18n::t(lang, "notif_media_failed")
+                        .replacen("{}", &push::escape_html(&chat_title), 1);
+                    if let Some(tg) = &send_outcome.delivered_tg_link {
+                        push_line(&mut msg, lang, "label_message", tg);
+                    }
+                    if let Some(el) = &send_outcome.entry_link {
+                        push_line(&mut msg, lang, "label_entry", el);
+                    }
+                    notify_owner_html(bot, state, &row.chat_id, &msg).await;
+                }
                 if let Some(mid) = send_outcome.delivered_message_id {
                     db::record_sent_message(
                         &state.db,
@@ -1935,9 +2051,28 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     .ok();
             }
             Err(e) => {
+                if let Some(new_id) = migrated_chat_id_from_error(&e) {
+                    match db::migrate_chat_id(&state.db, &row.chat_id, &new_id).await {
+                        Ok(()) => {
+                            info!(
+                                old_chat_id = %row.chat_id,
+                                new_chat_id = %new_id,
+                                "outbox row migrated after send error"
+                            );
+                            continue;
+                        }
+                        Err(me) => warn!(
+                            old_chat_id = %row.chat_id,
+                            new_chat_id = %new_id,
+                            error = %me,
+                            "outbox chat id migration failed"
+                        ),
+                    }
+                }
                 let attempts = row.attempts + 1;
                 let backoff = outbox_backoff_secs(attempts);
-                let next_retry = now + backoff;
+                let retry_now = chrono::Utc::now().timestamp();
+                let next_retry = retry_now + backoff;
                 warn!(
                     entry_id = %row.entry_id,
                     feed = %row.feed_url,
@@ -1951,7 +2086,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     row.id,
                     attempts,
                     next_retry,
-                    now,
+                    retry_now,
                     &format!("{:#}", e),
                 )
                 .await

@@ -61,12 +61,21 @@ async fn outbox_protected_paths(db_pool: &Db) -> anyhow::Result<std::collections
     let mut set = std::collections::HashSet::new();
     let mut media_jsons = db::outbox_media_json_stream(db_pool);
     while let Some(mj) = media_jsons.try_next().await? {
-        if let Ok(items) = serde_json::from_str::<Vec<crate::media::MediaItem>>(&mj) {
-            for item in &items {
-                set.insert(item.path.clone());
-                if let Some(tp) = &item.thumb_path {
-                    set.insert(tp.clone());
+        match serde_json::from_str::<Vec<crate::media::MediaItem>>(&mj) {
+            Ok(items) => {
+                for item in &items {
+                    set.insert(item.path.clone());
+                    if let Some(tp) = &item.thumb_path {
+                        set.insert(tp.clone());
+                    }
                 }
+            }
+            Err(e) => {
+                // Fail closed: without the paths this row's media would look
+                // unreferenced and could be deleted while the retry still
+                // needs it. Skipping the media passes this round is safer.
+                warn!(error = %e, "outbox media_json parse failed; skipping media cleanup to protect retry media");
+                anyhow::bail!("outbox media_json parse failed: {}", e);
             }
         }
     }
@@ -326,30 +335,64 @@ pub async fn cleanup_logs(config: &Config) -> anyhow::Result<u64> {
 
 /// Clean up database tables.
 pub async fn cleanup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()> {
+    // Each step is independent: a transient DB error in one sweep must not
+    // cancel the remaining maintenance for this round.
+    async fn step<F, Fut>(name: &'static str, f: F) -> u64
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<u64>>,
+    {
+        match f().await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(step = name, error = %e, "database cleanup step failed; continuing");
+                0
+            }
+        }
+    }
+
     // Only orphaned markers expire; markers for existing subscriptions are
     // kept regardless of age (see db::cleanup_sent_entries).
-    let r1 = db::cleanup_sent_entries(db_pool, config.sent_entries_retention_days).await?;
+    let r1 = step("sent_entries", || {
+        db::cleanup_sent_entries(db_pool, config.sent_entries_retention_days)
+    })
+    .await;
     // The file_id cache is cleaned by retention period (default 30 days);
     // sent_messages is trimmed by row-count cap, so no time-based cleanup needed.
-    let r2 = db::cleanup_file_id_cache(db_pool, config.file_id_cache_retention_days).await?;
+    let r2 = step("file_id_cache", || {
+        db::cleanup_file_id_cache(db_pool, config.file_id_cache_retention_days)
+    })
+    .await;
     // media_dl_fail: keys are only removed at two points — "download
     // succeeded" and "gave up after hitting the limit". If an entry rolls
     // out of the source's rolling window before hitting the limit, neither
     // point ever fires and the key lingers forever. A retention-period
     // cleanup on updated_at acts as the safety net (keys actively being
     // retried refresh updated_at on every failed round, so they're unaffected).
-    let r3 = db::cleanup_stale_settings(db_pool, "media_dl_fail:", 7).await?;
+    let r3 = step("media_dl_fail", || {
+        db::cleanup_stale_settings(db_pool, "media_dl_fail:", 7)
+    })
+    .await;
     // stale_zero: streak counters refresh updated_at on every zero round and
     // vanish with the unsubscribe cascade; this retention sweep only mops up
     // orphans left by subscriptions removed outside those paths.
-    let r4 = db::cleanup_stale_settings(db_pool, "stale_zero:", 14).await?;
+    let r4 = step("stale_zero", || {
+        db::cleanup_stale_settings(db_pool, "stale_zero:", 14)
+    })
+    .await;
     // outbox_media_lost: one-shot notice flags keyed by outbox row id. The
     // normal success/abandon paths delete them; this sweep catches rows
     // removed outside those paths.
-    let r5 = db::cleanup_stale_settings(db_pool, "outbox_media_lost:", 7).await?;
+    let r5 = step("outbox_media_lost", || {
+        db::cleanup_stale_settings(db_pool, "outbox_media_lost:", 7)
+    })
+    .await;
     // sent_messages is capped by row count; trim here instead of on every
     // delivered message (the old per-insert COUNT was a full scan).
-    let r6 = db::trim_sent_messages(db_pool, config.sent_messages_max_rows).await?;
+    let r6 = step("sent_messages", || {
+        db::trim_sent_messages(db_pool, config.sent_messages_max_rows)
+    })
+    .await;
     // Note: teloxide_dialogues table has no timestamp column.
     // Dialogue cleanup is handled via chat purge events instead.
     info!(
@@ -508,9 +551,26 @@ pub async fn dir_size(path: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let mut entries = fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let meta = entry.metadata().await?;
+        let mut entries = match fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            // A directory disappearing (cleanup) or not existing yet is not a
+            // failure; per-entry races below are skipped for the same reason.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(_) => break,
+            };
+            // A file can be renamed/deleted between readdir and metadata;
+            // skipping it avoids turning a normal cleanup race into a failed
+            // whole-directory scan (which would fail-close the media budget).
+            let meta = match entry.metadata().await {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
             if meta.is_dir() {
                 stack.push(entry.path());
             } else if !entry.file_name().to_string_lossy().starts_with(".tmp_") {

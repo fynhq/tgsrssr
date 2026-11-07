@@ -53,6 +53,20 @@ pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) {
     // Unified blockquote folding rule (fold when >200 characters), consistent
     // with message pushing.
     let html_msg = push::normalize_blockquote_fold(html_msg);
+    // Notifications are assembled from externally controlled values (feed
+    // titles, error chains, download warnings). Keep them within Telegram's
+    // limit; an over-long alert would fail both the HTML send and the plain
+    // fallback, losing exactly the failure notice the owner needs.
+    const NOTIFY_MAX_VISIBLE: usize = 4000;
+    let html_msg = if push::visible_len(&html_msg) > NOTIFY_MAX_VISIBLE {
+        let (cut, _) = crate::htmltext::truncate_html_keep_links(
+            &html_msg,
+            NOTIFY_MAX_VISIBLE.saturating_sub(1),
+        );
+        format!("{cut}…")
+    } else {
+        html_msg
+    };
     // Notifications uniformly disable link previews: they often contain
     // source/message links, and preview cards are noise.
     let no_preview = push::no_preview();
@@ -82,6 +96,12 @@ pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) {
             error = %first_err,
             "notification outcome uncertain; skipping plain-text fallback to avoid duplication"
         );
+        return;
+    }
+    if first_err.contains("message is too long") {
+        // The cap above should make this unreachable; do not send a second
+        // equally over-long plain-text copy.
+        error!(user = user_id, "notification still too long after truncation; dropping fallback");
         return;
     }
     // Downgrade to plain text: first restore <a href="URL">text</a> to

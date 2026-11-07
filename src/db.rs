@@ -568,6 +568,21 @@ pub async fn can_manage_chat(db: &Db, user_id: i64, chat_id: &str) -> anyhow::Re
     Ok(chat.added_by.as_deref() == Some(&user_id.to_string()))
 }
 
+/// Feed URLs of every active subscription in an enabled chat. Used by the
+/// scheduler's platform-health check to distinguish "all active sources ran"
+/// from "only the one source that happens to be due this round ran".
+pub async fn active_subscription_urls(db: &Db) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT s.feed_url
+           FROM subscriptions s
+           JOIN chats ch ON ch.chat_id = s.chat_id AND ch.enabled = 1
+          WHERE s.active = 1",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
 /// Count subscriptions per chat (for the channel list page display).
 pub async fn count_subscriptions_per_chat(db: &Db) -> anyhow::Result<std::collections::HashMap<String, i64>> {
     let rows = sqlx::query("SELECT chat_id, COUNT(*) AS cnt FROM subscriptions GROUP BY chat_id")
