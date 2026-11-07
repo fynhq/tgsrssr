@@ -17,6 +17,13 @@ use serde_json::{json, Map, Value};
 use teloxide::prelude::Bot;
 use teloxide::types::{Message, MessageId};
 
+/// Process-wide latch: a Bot API server that does not implement
+/// `sendRichMessage` answers 404/Not Found. Retrying every rich-eligible entry
+/// would upload the whole payload again for nothing, so disable the rich path
+/// for the rest of the process after the first such response.
+static RICH_UNSUPPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
     ok: bool,
@@ -29,6 +36,28 @@ struct TelegramResponse<T> {
 #[derive(Debug, Deserialize)]
 struct TelegramResponseParameters {
     retry_after: Option<u64>,
+}
+
+/// True after the endpoint reported that `sendRichMessage` is unavailable.
+pub fn is_unsupported() -> bool {
+    RICH_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record a rich-send failure and latch the endpoint as unsupported when the
+/// error means the method itself does not exist. Callers should only pass
+/// errors produced by this module.
+pub fn note_send_error(err_str: &str) {
+    let lower = err_str.to_ascii_lowercase();
+    let unsupported = lower.contains("telegram api error 404")
+        || lower.contains("unknown method")
+        || lower.contains("method not found")
+        || (lower.contains("not found") && lower.contains("sendrichmessage"));
+    if unsupported && !RICH_UNSUPPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            error = %err_str,
+            "rich message endpoint is unsupported; disabling the rich path for this process"
+        );
+    }
 }
 
 async fn parse_response<T: for<'de> Deserialize<'de>>(

@@ -71,26 +71,51 @@ pub fn is_net_error(err_str: &str) -> bool {
         && !err_str.contains("timed out")
 }
 
-/// Transient internal errors on the Telegram server side (added in v1.10.2).
-/// Typical scenario: during a file upload the TG backend returns 400
-/// "internal Server Error during file upload" — the HTTP status is 400 but
-/// the description clearly indicates a server-side internal exception rather
-/// than a request-parameter problem, and it usually recovers on its own
-/// within seconds to minutes.
-/// The matched substrings never appear in parameter-class 400 errors (such
-/// as "file is too big" or "wrong type of the web-page content"), so the
-/// false-positive risk is extremely low.
-fn is_tg_transient_error(err_str: &str) -> bool {
-    err_str.contains("internal Server Error")
-        || err_str.contains("Internal Server Error")
+/// Render an error and its full source chain. Wrapper Display impls (notably
+/// teloxide's `RequestError::Network`) hide the reqwest source detail, so
+/// substring classification must walk the chain instead of calling
+/// `to_string()` alone.
+pub fn error_chain_string(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(e) = source {
+        out.push_str(": ");
+        out.push_str(&e.to_string());
+        source = e.source();
+    }
+    out
 }
 
-/// Unified retryable-error determination (v1.10.2): connection-class errors
-/// and transient TG server-side errors. All send retry points (rich ops /
-/// text chunks / documents) use this function uniformly to keep retry
-/// criteria consistent.
-pub fn is_retryable_error(err_str: &str) -> bool {
-    is_net_error(err_str) || is_tg_transient_error(err_str)
+/// True when a send failure is explicitly known to be undelivered, so an
+/// inline retry cannot duplicate a message. Only the connect/DNS subset of
+/// the explicit list qualifies: Telegram may have processed a request that
+/// failed after the request bytes were written (timeout, reset, closed,
+/// interrupted response, 5xx), so those must not be retried inline.
+pub fn is_send_retryable_error(err_str: &str) -> bool {
+    err_str.contains("dns resolve failed")
+        || err_str.contains("tcp connect error")
+        || err_str.contains("client error (Connect)")
+        || err_str.contains("connection refused")
+}
+
+/// Failures that prove the request was rejected before delivery: a Telegram
+/// parameter-class 400/401/403/429 response, a DNS/connect failure, or a
+/// refused connection. A 400 whose description is "internal Server Error"
+/// intentionally does not match this list, so it falls through to the
+/// ambiguous checks below.
+fn is_explicitly_undelivered(err_str: &str) -> bool {
+    err_str.contains("Too Many Requests")
+        || err_str.contains("Retry after")
+        || err_str.contains("HTTP 400")
+        || err_str.contains("Bad Request")
+        || err_str.contains("HTTP 401")
+        || err_str.contains("HTTP 403")
+        || err_str.contains("Unauthorized")
+        || err_str.contains("Forbidden")
+        || err_str.contains("dns resolve failed")
+        || err_str.contains("tcp connect error")
+        || err_str.contains("client error (Connect)")
+        || err_str.contains("connection refused")
 }
 
 /// Classify a rich-message send failure by whether the message may already
@@ -112,19 +137,7 @@ pub fn is_retryable_error(err_str: &str) -> bool {
 ///   source detail is available the delivery state is genuinely unknown, and
 ///   A1 prefers an uncertain-send notification over risking a duplicate.
 pub fn is_ambiguous_send_error(err_str: &str) -> bool {
-    let explicit = err_str.contains("Too Many Requests")
-        || err_str.contains("Retry after")
-        || err_str.contains("HTTP 400")
-        || err_str.contains("Bad Request")
-        || err_str.contains("HTTP 401")
-        || err_str.contains("HTTP 403")
-        || err_str.contains("Unauthorized")
-        || err_str.contains("Forbidden")
-        || err_str.contains("dns resolve failed")
-        || err_str.contains("tcp connect error")
-        || err_str.contains("client error (Connect)")
-        || err_str.contains("connection refused");
-    if explicit {
+    if is_explicitly_undelivered(err_str) {
         return false;
     }
     err_str.contains("timed out")
@@ -199,7 +212,31 @@ pub async fn pace(chat_id: i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_ambiguous_send_error;
+    use super::{is_ambiguous_send_error, is_send_retryable_error};
+
+    #[test]
+    fn only_connect_phase_failures_are_retried_inline() {
+        for err in [
+            "dns resolve failed: https://example.com",
+            "tcp connect error: Connection refused (os error 111)",
+            "client error (Connect)",
+            "connection refused",
+        ] {
+            assert!(is_send_retryable_error(err), "{err}");
+        }
+        for err in [
+            "operation timed out",
+            "request timed out",
+            "connection reset by peer",
+            "connection closed before message completed",
+            "error sending request",
+            "HTTP 500 Internal Server Error",
+            "400: internal Server Error during file upload",
+            "request or response body error",
+        ] {
+            assert!(!is_send_retryable_error(err), "{err}");
+        }
+    }
 
     #[test]
     fn explicit_failures_are_not_ambiguous() {

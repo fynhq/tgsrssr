@@ -14,7 +14,8 @@ use crate::htmltext::{
 use crate::media::{MediaItem, MediaKind};
 use crate::richmsg::{self, RichMedia, RichMediaKind, RichMediaSource};
 use crate::sendpolicy::{
-    flood_backoff, flood_retry_secs, is_retryable_error, pace, SEND_BACKOFF_SECS,
+    error_chain_string, flood_backoff, flood_retry_secs, is_send_retryable_error, pace,
+    SEND_BACKOFF_SECS,
 };
 
 // Re-export pure HTML helpers for external callers (commands, callbacks,
@@ -57,7 +58,7 @@ pub fn channel_header_text(
 // Hot-path regexes are compiled statically once (hit on every message/chunk).
 // RE_TAG and the anchor/entity regexes live in crate::htmltext along with the
 // HTML helpers (imported via the `use` at the top).
-// Rate-limiting/backoff policy (pacer, flood_backoff, is_retryable_error,
+// Rate-limiting/backoff policy (pacer, flood_backoff, is_send_retryable_error,
 // SEND_BACKOFF_SECS) moved to crate::sendpolicy (imported via the `use` at
 // the top).
 // The Weibo poll data marker has been migrated to EntryMeta.poll (group-C
@@ -241,16 +242,17 @@ pub async fn send_poll(
         match req.await {
             Ok(m) => break m,
             Err(e) => {
-                let es = e.to_string();
+                let es = error_chain_string(&e);
                 if flood_backoff(&es, &mut flood_tries, chat_id).await {
                     continue;
                 }
                 // v1.10.2: retry on network/TG transient errors (consistent
                 // with the other send sites)
-                if is_retryable_error(&es) && transient_tries < SEND_BACKOFF_SECS.len() {
+                if is_send_retryable_error(&es) && transient_tries < SEND_BACKOFF_SECS.len() {
                     let backoff = SEND_BACKOFF_SECS[transient_tries];
                     tracing::warn!(chat_id = chat_id, backoff = backoff, error = %es, "poll send transient error, backing off");
                     tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    pace(chat_id).await;
                     transient_tries += 1;
                     continue;
                 }
@@ -319,11 +321,13 @@ pub async fn send_text_only(
         entry_id = %fetcher::entry_id(entry),
         text_len = text_len,
         allow_rich = opts.allow_rich,
-        rich_eligible = opts.allow_rich && should_try_rich_text(text_len),
+        rich_eligible = opts.allow_rich
+            && !crate::richmsg::is_unsupported()
+            && should_try_rich_text(text_len),
         "/push: text path decision"
     );
     let mut rich_msg: Option<Message> = None;
-    if opts.allow_rich && should_try_rich_text(text_len) {
+    if opts.allow_rich && !crate::richmsg::is_unsupported() && should_try_rich_text(text_len) {
         match try_send_rich_text(bot, chat_id, &body, &footer).await {
             Ok(m) => {
                 tracing::info!(
@@ -336,6 +340,7 @@ pub async fn send_text_only(
             }
             Err(e) => {
                 let err_str = format!("{:#}", e);
+                crate::richmsg::note_send_error(&err_str);
                 tracing::warn!(
                     chat_id = chat_id,
                     entry_id = %fetcher::entry_id(entry),
@@ -1072,14 +1077,14 @@ fn render_parts(
             // A large limit: splitting into multiple messages happens at send
             // time, so we never want to fall back to plain text here.
             let body = fetcher::entry_body_html(entry, 100_000, meta);
-            if !body.is_empty() {
+            if visible_len(&body) > 0 {
                 parts.push(body);
             }
         }
         ContentMode::TitleOnly => parts.push(head(false)),
         ContentMode::ContentOnly => {
             let body = fetcher::entry_body_html(entry, 100_000, meta);
-            if body.is_empty() {
+            if visible_len(&body) == 0 {
                 // No-content fallback: degrade to a bold title to avoid an
                 // empty message (both text and caption paths).
                 parts.push(head(false));
@@ -1446,10 +1451,12 @@ pub async fn send_entry_with_media(
         gif_count = gifs.len(),
         retweet_images = rt_photos.len(),
         allow_rich = opts.allow_rich,
-        rich_eligible = opts.allow_rich && should_try_rich_media(full_text_len, rich_media_count),
+        rich_eligible = opts.allow_rich
+            && !crate::richmsg::is_unsupported()
+            && should_try_rich_media(full_text_len, rich_media_count),
         "/push: media path decision"
     );
-    if opts.allow_rich && should_try_rich_media(full_text_len, rich_media_count) {
+    if opts.allow_rich && !crate::richmsg::is_unsupported() && should_try_rich_media(full_text_len, rich_media_count) {
         match try_send_rich_media(
             bot,
             db,
@@ -1478,6 +1485,7 @@ pub async fn send_entry_with_media(
             }
             Err(e) => {
                 let err_str = format!("{:#}", e);
+                crate::richmsg::note_send_error(&err_str);
                 tracing::warn!(
                     chat_id = chat_id,
                     entry_id = %fetcher::entry_id(entry),
@@ -1582,7 +1590,6 @@ pub async fn send_entry_with_media(
                             );
                             break;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
                     }
                 } else if let Some((body, footer)) = format_entry_parts(entry, feed_title, author, opts, meta) {
                     match send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await {
@@ -1807,7 +1814,6 @@ pub async fn send_entry_with_media(
                 }
                 return Err(e);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         }
     }
 
@@ -2085,10 +2091,11 @@ where
                 if flood_backoff(&es, &mut flood_tries, chat_id).await {
                     continue;
                 }
-                if is_retryable_error(&es) && transient_tries < SEND_BACKOFF_SECS.len() {
+                if is_send_retryable_error(&es) && transient_tries < SEND_BACKOFF_SECS.len() {
                     let backoff = SEND_BACKOFF_SECS[transient_tries];
                     tracing::warn!(chat_id = chat_id, backoff = backoff, error = %es, "send transient error, backing off");
                     tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    pace(chat_id).await;
                     transient_tries += 1;
                     continue;
                 }
@@ -2192,6 +2199,10 @@ async fn send_rich_ops(
     // When set, the FIRST op replies to this message (used by retweet
     // inline images to quote the main entry message).
     reply_first_to: Option<teloxide::types::MessageId>,
+    // On a resumed call, the already-delivered first message (from a previous
+    // attempt) so later ops keep the original quote anchor instead of losing
+    // it when `first_msg` starts empty.
+    resume_anchor: Option<teloxide::types::MessageId>,
 ) -> Result<(usize, Option<Message>), RichSendFailure> {
     let mut first_msg: Option<Message> = None;
     for (i, op) in ops.iter().enumerate().skip(resume) {
@@ -2202,7 +2213,7 @@ async fn send_rich_ops(
         // first group's message
         let op_caption = if i == 0 { caption } else { "" };
         let reply_to = if i > 0 {
-            first_msg.as_ref().map(|m| m.id)
+            first_msg.as_ref().map(|m| m.id).or(resume_anchor)
         } else {
             reply_first_to
         };
@@ -2235,19 +2246,20 @@ async fn send_rich_ops_with_retry(
     ctx: &str,
 ) -> Result<(usize, Option<Message>), RichSendFailure> {
     let mut first_delivered: Option<Box<Message>> = None;
-    let mut res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, 0, reply_first_to).await;
+    let mut res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, 0, reply_first_to, None).await;
     if let Err((_, first, _)) = &res {
         first_delivered = first.clone();
     }
     for backoff in SEND_BACKOFF_SECS {
         let retry_from = match &res {
-            Err((sent, _, e)) if *sent < ops.len() && is_retryable_error(&e.to_string()) => Some(*sent),
+            Err((sent, _, e)) if *sent < ops.len() && is_send_retryable_error(&e.to_string()) => Some(*sent),
             _ => None,
         };
         let Some(sent) = retry_from else { break };
         tracing::warn!(chat_id = chat_id, ctx = ctx, resume = sent, backoff = backoff, "rich send network error, backing off before retry");
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-        res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, sent, reply_first_to).await;
+        let resume_anchor = first_delivered.as_ref().map(|m| m.id);
+        res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, sent, reply_first_to, resume_anchor).await;
         if first_delivered.is_none() {
             if let Err((_, first, _)) = &res {
                 first_delivered = first.clone();
@@ -2298,7 +2310,7 @@ async fn send_op(
 
     match op {
         RichOp::Photo(p) => {
-            let m = send_with_cache_retry(db, chat_id, op, |cache_enabled| { let use_cache = cache_enabled; async move {
+            let m = send_with_cache_retry(db, chat_id, op, false, |cache_enabled, _attach_thumb| { let use_cache = cache_enabled; async move {
                 let inp = resolve_input(db, p, "photo", use_cache).await?;
                 let mut req = bot
                     .send_photo(chat, inp)
@@ -2314,7 +2326,7 @@ async fn send_op(
             Ok(vec![m])
         }
         RichOp::Gif(g) => {
-            let m = send_with_cache_retry(db, chat_id, op, |cache_enabled| { let use_cache = cache_enabled; async move {
+            let m = send_with_cache_retry(db, chat_id, op, false, |cache_enabled, _attach_thumb| { let use_cache = cache_enabled; async move {
                 let inp = resolve_input(db, g, "gif", use_cache).await?;
                 let mut req = bot
                     .send_animation(chat, inp)
@@ -2330,7 +2342,7 @@ async fn send_op(
             Ok(vec![m])
         }
         RichOp::Video(v) => {
-            let m = send_with_cache_retry(db, chat_id, op, |cache_enabled| { let use_cache = cache_enabled; async move {
+            let m = send_with_cache_retry(db, chat_id, op, v.thumb_path.is_some(), |cache_enabled, attach_thumb| { let use_cache = cache_enabled; async move {
                 let inp = resolve_input(db, v, "video", use_cache).await?;
                 let mut req = bot
                     .send_video(chat, inp)
@@ -2341,9 +2353,11 @@ async fn send_op(
                 if let Some(d) = v.duration_secs {
                     req = req.duration(d);
                 }
-                if let Some(tp) = &v.thumb_path {
-                    if let Ok(tin) = path_input(tp).await {
-                        req = req.thumbnail(tin);
+                if attach_thumb {
+                    if let Some(tp) = &v.thumb_path {
+                        if let Ok(tin) = path_input(tp).await {
+                            req = req.thumbnail(tin);
+                        }
                     }
                 }
                 if let Some(rp) = rp {
@@ -2355,8 +2369,9 @@ async fn send_op(
             Ok(vec![m])
         }
         RichOp::Group(items) => {
-            let msgs = send_with_cache_retry(db, chat_id, op, |cache_enabled| { let use_cache = cache_enabled; async move {
-                let group = build_group_inputs(db, items, caption, caption_above, use_cache).await?;
+            let has_thumb = items.iter().any(|m| m.thumb_path.is_some());
+            let msgs = send_with_cache_retry(db, chat_id, op, has_thumb, |cache_enabled, attach_thumb| { let use_cache = cache_enabled; async move {
+                let group = build_group_inputs(db, items, caption, caption_above, use_cache, attach_thumb).await?;
                 let mut req = bot.send_media_group(chat, group);
                 if let Some(rp) = rp {
                     req = req.reply_parameters(rp.clone());
@@ -2381,24 +2396,32 @@ async fn send_with_cache_retry<T, F, Fut>(
     db: &Db,
     chat_id: i64,
     op: &RichOp<'_>,
+    has_thumb: bool,
     mut attempt: F,
 ) -> anyhow::Result<T>
 where
-    F: FnMut(bool) -> Fut,
+    F: FnMut(bool, bool) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
     let mut use_cache = true;
+    let mut use_thumb = has_thumb;
     let mut flood_tries = 0u32;
     loop {
-        match attempt(use_cache).await {
+        match attempt(use_cache, use_thumb).await {
             Ok(v) => return Ok(v),
-            Err(e) if use_cache && is_file_id_error(&e.to_string()) => {
-                invalidate_op_cache(db, op).await;
-                pace(chat_id).await;
-                use_cache = false;
-            }
             Err(e) => {
-                let es = e.to_string();
+                let es = format!("{:#}", e);
+                if use_thumb && is_thumbnail_error(&es) {
+                    tracing::warn!(chat_id = chat_id, error = %es, "thumbnail rejected, retrying without it");
+                    use_thumb = false;
+                    continue;
+                }
+                if use_cache && is_file_id_error(&es) {
+                    invalidate_op_cache(db, op).await;
+                    pace(chat_id).await;
+                    use_cache = false;
+                    continue;
+                }
                 if flood_backoff(&es, &mut flood_tries, chat_id).await {
                     continue;
                 }
@@ -2416,6 +2439,7 @@ async fn build_group_inputs(
     caption: &str,
     caption_above: bool,
     use_cache: bool,
+    use_thumb: bool,
 ) -> anyhow::Result<Vec<InputMedia>> {
     let mut group: Vec<InputMedia> = Vec::new();
     for (j, m) in items.iter().enumerate() {
@@ -2436,9 +2460,11 @@ async fn build_group_inputs(
                 if let Some(d) = m.duration_secs {
                     im.duration = Some(d.min(65535) as u16);
                 }
-                if let Some(tp) = &m.thumb_path {
-                    if let Ok(tin) = path_input(tp).await {
-                        im.thumbnail = Some(tin);
+                if use_thumb {
+                    if let Some(tp) = &m.thumb_path {
+                        if let Ok(tin) = path_input(tp).await {
+                            im.thumbnail = Some(tin);
+                        }
                     }
                 }
                 group.push(InputMedia::Video(im));
@@ -2524,6 +2550,9 @@ pub async fn send_entry_msg(
     link_preview: bool,
 ) -> anyhow::Result<Message> {
     let (footer, chunks) = plan_text_chunks(html_text, footer);
+    if chunks.is_empty() {
+        anyhow::bail!("refusing to send an empty text message");
+    }
     let mut first_msg: Option<Message> = None;
     let last_idx = chunks.len() - 1;
     for (i, chunk) in chunks.iter().enumerate() {
@@ -2544,10 +2573,7 @@ pub async fn send_entry_msg(
         if first_msg.is_none() {
             first_msg = Some(m.clone());
         }
-        // Small delay between chunks to respect rate limits.
-        if i < last_idx {
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        }
+        // Pacing between chunks is handled by send_single_html's pace().
     }
     Ok(first_msg.expect("at least one chunk"))
 }
@@ -2611,7 +2637,7 @@ async fn send_single_html(
                     let plain = strip_html_tags(&html_text);
                     // The fallback send gets its own flood backoff: a 429
                     // here is not covered by the outer retry layer (429 is
-                    // not is_retryable_error), and losing the chunk over a
+                    // not is_send_retryable_error), and losing the chunk over a
                     // transient flood window would push the entry to outbox
                     // even though the HTML problem itself is permanent.
                     let mut fallback_flood_tries = 0u32;
@@ -2655,11 +2681,12 @@ async fn send_chunk_with_retry(
 ) -> anyhow::Result<Message> {
     let mut send_res = send_single_html(bot, chat_id, text, link_preview, reply_to).await;
     for backoff in SEND_BACKOFF_SECS {
-        if !matches!(&send_res, Err(e) if is_retryable_error(&e.to_string())) {
+        if !matches!(&send_res, Err(e) if is_send_retryable_error(&format!("{:#}", e))) {
             break;
         }
         tracing::warn!(chat_id = chat_id, backoff = backoff, "text chunk send failed, retrying");
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        pace(chat_id).await;
         send_res = send_single_html(bot, chat_id, text, link_preview, reply_to).await;
     }
     send_res
