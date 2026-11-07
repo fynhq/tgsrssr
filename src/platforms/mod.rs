@@ -297,6 +297,11 @@ pub(crate) async fn api_get(
             .await
             .with_context(|| format!("platform request failed: {}", cur_url))?;
 
+        // 304 is a 3xx but not a redirect: it has no Location header. Check it
+        // before the redirection branch (same order as httpfollow.rs).
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(resp);
+        }
         if resp.status().is_redirection() && max_redirects > 0 {
             hops += 1;
             if hops > max_redirects {

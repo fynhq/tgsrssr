@@ -22,6 +22,10 @@ pub const COMMAND_WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKED_USERS: usize = 4096;
 /// Maximum URLs accepted by a single `/sub` invocation (all users).
 pub const MAX_URLS_PER_SUB: usize = 10;
+/// Maximum cookie length accepted by the `/cookies` input flow.
+pub const MAX_COOKIE_CHARS: usize = 4096;
+/// Maximum feed-filter keyword string length accepted by the filter panel.
+pub const MAX_FILTER_KEYWORDS_CHARS: usize = 500;
 
 /// Sliding-window rate limiter keyed by user ID.
 ///

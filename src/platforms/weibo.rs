@@ -183,6 +183,11 @@ pub async fn fetch_weibo_user(
     // 302 redirect (usually to the login page) = cookie expired. The error
     // string must contain the "cookie" substring: the scheduler uses it to set
     // the expiry flag (/cookies panel status + expiry notification).
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        // Not a login redirect: getIndex does not send conditional headers,
+        // so a 304 here is an upstream/proxy anomaly, not cookie expiry.
+        anyhow::bail!("weibo getIndex returned 304 without a conditional request");
+    }
     if status.is_redirection() {
         return Err(crate::platforms::auth_expired(
             "Weibo",
@@ -212,18 +217,24 @@ pub async fn fetch_weibo_user(
 
     let data = &json["data"];
 
-    // screen_name: prefer userInfo, fallback to first mblog.user
+    // screen_name: prefer userInfo, fallback to the first normal timeline
+    // card's author. Do not scan recommendation/hot cards: their mblog.user
+    // can belong to someone else and would label every entry with a wrong
+    // author.
     let screen_name = data["userInfo"]["screen_name"]
         .as_str()
         .or_else(|| {
             data["cards"].as_array()?.iter().find_map(|c| {
-                c["mblog"]["user"]["screen_name"].as_str()
+                (c["card_type"].as_i64() == Some(9))
+                    .then(|| c["mblog"]["user"]["screen_name"].as_str())
+                    .flatten()
             })
         })
         .unwrap_or("weibo")
         .to_string();
 
-    let cards = data["cards"].as_array().cloned().unwrap_or_default();
+    let cards_value = &data["cards"];
+    let cards = cards_value.as_array().cloned().unwrap_or_default();
     let mut entries: Vec<Entry> = Vec::new();
     let mut metas: crate::entrymeta::MetaMap = std::collections::HashMap::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -345,7 +356,7 @@ pub async fn fetch_weibo_user(
     // change (card_type values changed etc.). Must not silently return empty —
     // the scheduler would treat it as success and reset the error count, and
     // the feed would silently stop updating with zero logs.
-    if entries.is_empty() && !cards.is_empty() {
+    if entries.is_empty() && (!cards.is_empty() || !cards_value.is_array()) {
         let types: Vec<i64> = cards
             .iter()
             .map(|c| c["card_type"].as_i64().unwrap_or(0))
@@ -353,8 +364,9 @@ pub async fn fetch_weibo_user(
         warn!(
             uid = %uid,
             cards = cards.len(),
+            cards_is_array = cards_value.is_array(),
             card_types = ?types,
-            "weibo getIndex returned cards but zero entries extracted (card_type may have changed)"
+            "weibo getIndex produced zero entries (cards missing or card_type changed)"
         );
     }
 
@@ -941,7 +953,7 @@ fn mblog_to_entry(
             Some(rt_uid) if !rt_bid.is_empty() => format!(
                 "<a href=\"https://weibo.com/{}/{}\">@{}</a>",
                 rt_uid,
-                rt_bid,
+                crate::push::escape_attr(rt_bid),
                 crate::push::escape_html(rt_user)
             ),
             Some(rt_uid) => format!(
@@ -1039,7 +1051,14 @@ fn mblog_to_entry(
     let plain = crate::fetcher::html_to_plain(&text);
     let title = crate::platforms::make_title(&plain, i18n::t(lang, "weibo_title_fallback"));
 
-    let link = format!("https://weibo.com/{}/{}", uid, bid);
+    // Use the post author's uid when the payload carries it. Timeline cards
+    // can contain posts by other users; falling back to the subscription uid
+    // would produce a link that 404s or points at the wrong account.
+    let link_uid = mblog["user"]["id"]
+        .as_u64()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| uid.to_string());
+    let link = format!("https://weibo.com/{}/{}", link_uid, bid);
 
     // Markdown-rendered posts carry pre-converted Telegram HTML in the body.
     // Group C: now explicitly marked via EntryMeta.prerendered_html (replacing

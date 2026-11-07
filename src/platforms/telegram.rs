@@ -75,7 +75,11 @@ pub fn parse_channel_name(url: &str) -> Option<String> {
         "gifts",
         "username",
     ];
-    if RESERVED.contains(&name) {
+    // Compare in lowercase: canonical_url lowercases the channel name, so
+    // /Joinchat must be rejected here or it would canonicalize into a URL
+    // that no longer routes as a Telegram platform.
+    let name_lower = name.to_ascii_lowercase();
+    if RESERVED.contains(&name_lower.as_str()) {
         return None;
     }
     // Invite links (+abc) are private channels — no web preview.
@@ -325,11 +329,29 @@ fn split_message_blocks(html: &str) -> Vec<(String, &str)> {
         .collect()
 }
 
+/// Whether an extracted title looks like page content rather than a channel
+/// or document name. Guards against the `.*?` in the title regexes crossing
+/// into a later `<span>` when the page structure changes.
+fn plausible_title(s: &str) -> bool {
+    !s.is_empty()
+        && crate::htmltext::utf16_len(s) <= 256
+        && !s.contains('<')
+        && !s.contains('>')
+        && !s.contains("tgme_widget_message")
+}
+
 /// Extract the channel display name from the info header.
 fn extract_channel_title(html: &str) -> Option<String> {
     let caps = RE_CHAN_TITLE.captures(html)?;
     let t = crate::fetcher::html_to_plain(&caps[1]);
-    if t.is_empty() { None } else { Some(t) }
+    if !plausible_title(&t) {
+        tracing::warn!(
+            title_len = crate::htmltext::utf16_len(&t),
+            "channel title extraction looks invalid; ignoring it"
+        );
+        return None;
+    }
+    Some(t)
 }
 
 /// Convert one message block into a feed-rs Entry.
@@ -375,6 +397,7 @@ fn message_to_entry(data_post: &str, block: &str, feed_title: &str, lang: Lang) 
             let name = RE_DOC_TITLE
                 .captures(block)
                 .map(|c| crate::fetcher::html_to_plain(&c[1]))
+                .filter(|n| plausible_title(n))
                 .unwrap_or_default();
             Some(if name.is_empty() {
                 "📎".to_string()

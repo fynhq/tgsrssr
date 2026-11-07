@@ -97,7 +97,11 @@ pub fn parse_screen_name(url: &str) -> Option<String> {
         "i", "home", "search", "explore", "notifications", "messages",
         "settings", "compose", "login", "signup", "logout", "hashtag",
     ];
-    if RESERVED.contains(&name) {
+    // Paths are case-insensitive in practice and canonical_url lowercases the
+    // name; compare in lowercase so /Home or /I is rejected here too instead
+    // of being canonicalized into a URL that no longer routes as a platform.
+    let name_lower = name.to_ascii_lowercase();
+    if RESERVED.contains(&name_lower.as_str()) {
         return None;
     }
     // Screen names: 1-15 alphanumeric/underscore chars.
@@ -1345,28 +1349,41 @@ fn append_quote_block(body: &mut String, result: &Value, prefix: &str) {
     let result = unwrap_tweet_result(result);
     // Deleted/protected quotes arrive as TweetTombstone/TweetUnavailable with
     // no legacy payload. Rendering them produced an empty quote block and a
-    // bogus link to x.com/unknown (extract_screen_name falls back to
-    // "unknown").
+    // bogus link to x.com/unknown.
     if !quote_renderable(result) {
         return;
     }
     let legacy = &result["legacy"];
     let text = tweet_full_text(result);
-    let screen = extract_screen_name(result);
+    // If the author shape is unavailable, render the quote text without an
+    // author link instead of emitting x.com/unknown.
+    let screen = screen_name_opt(result);
     let mut mentions = extract_mention_names(result);
     // Same as tweet_to_entry: add the author's screen_name so self-mentions
     // also get hyperlinked (v1.10.14).
-    if !mentions.iter().any(|n| n.eq_ignore_ascii_case(screen)) {
-        mentions.push(screen.to_string());
+    if let Some(s) = screen {
+        if !mentions.iter().any(|n| n.eq_ignore_ascii_case(s)) {
+            mentions.push(s.to_string());
+        }
     }
     let mut inner = linkify_hashtags(&linkify_mentions(&tweet_text_to_html(&text), &mentions));
     // Quoted media is always included (QT matches RT): an image-only quote
     // tweet must not degrade to plain text when the main tweet has no media.
     append_media_tags(&mut inner, legacy);
-    // Link to the specific tweet if id is available, else user profile.
-    let link = match legacy["id_str"].as_str() {
-        Some(tid) => format!("https://x.com/{}/status/{}", screen, tid),
-        None => format!("https://x.com/{}", screen),
+    let author = match screen {
+        Some(s) => {
+            // Link to the specific tweet if id is available, else profile.
+            let link = match legacy["id_str"].as_str() {
+                Some(tid) => format!("https://x.com/{}/status/{}", s, tid),
+                None => format!("https://x.com/{}", s),
+            };
+            format!(
+                "<a href=\"{}\">@{}</a>: ",
+                crate::push::escape_attr(&link),
+                crate::push::escape_html(s)
+            )
+        }
+        None => String::new(),
     };
     // Consistent with weibo.rs: when body is non-empty, separate the original
     // text from the quote block with \n — otherwise </a> sits flush against
@@ -1377,11 +1394,8 @@ fn append_quote_block(body: &mut String, result: &Value, prefix: &str) {
         body.push('\n');
     }
     body.push_str(&format!(
-        "<blockquote>{} <a href=\"{}\">@{}</a>: {}</blockquote>",
-        prefix,
-        crate::push::escape_attr(&link),
-        crate::push::escape_html(screen),
-        inner
+        "<blockquote>{} {}{}</blockquote>",
+        prefix, author, inner
     ));
 }
 
@@ -1492,40 +1506,29 @@ fn quote_renderable(tr: &Value) -> bool {
 
 /// Extract screen_name from a tweet result object, trying multiple API paths.
 /// Handles TweetWithVisibilityResults wrapper transparently.
-fn extract_screen_name(tweet_result: &Value) -> &str {
+fn screen_name_opt(tweet_result: &Value) -> Option<&str> {
     // Unwrap TweetWithVisibilityResults if present (shared helper).
     let tr = unwrap_tweet_result(tweet_result);
     // Path 1: core.screen_name (older API shape)
     if let Some(s) = tr["core"]["screen_name"].as_str() {
-        return s;
+        return Some(s);
     }
     // Path 2: core.user_results.result.legacy.screen_name
     if let Some(s) = tr["core"]["user_results"]["result"]["legacy"]["screen_name"].as_str() {
-        return s;
+        return Some(s);
     }
     // Path 3: core.user_results.result.core.screen_name
     if let Some(s) = tr["core"]["user_results"]["result"]["core"]["screen_name"].as_str() {
-        return s;
+        return Some(s);
     }
     // Path 4: user_results.result.legacy.screen_name (some responses nest user at top level)
     if let Some(s) = tr["user_results"]["result"]["legacy"]["screen_name"].as_str() {
-        return s;
+        return Some(s);
     }
     // Path 5: legacy.screen_name (rare fallback)
-    if let Some(s) = tr["legacy"]["screen_name"].as_str() {
-        return s;
-    }
-    // Log the actual structure so we can fix the path next time.
-    let keys: Vec<&str> = tr.as_object().map(|m| m.keys().map(|k| k.as_str()).collect()).unwrap_or_default();
-    let core_keys: Vec<&str> = tr["core"].as_object().map(|m| m.keys().map(|k| k.as_str()).collect()).unwrap_or_default();
-    tracing::warn!(
-        rest_id = ?tr["rest_id"].as_str(),
-        top_keys = ?keys,
-        core_keys = ?core_keys,
-        "extract_screen_name: no path matched, falling back to unknown"
-    );
-    "unknown"
+    tr["legacy"]["screen_name"].as_str()
 }
+
 
 /// Clean tweet text by processing t.co URL entities:
 /// 1) Remove media placeholder t.co URLs (images/videos are sent as attachments).
@@ -2115,7 +2118,7 @@ mod tests {
             },
             "legacy": {}
         });
-        assert_eq!(extract_screen_name(&tweet), "alice");
+        assert_eq!(screen_name_opt(&tweet), Some("alice"));
     }
 
     #[test]

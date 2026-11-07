@@ -401,22 +401,20 @@ pub async fn fetch_feed(
         allow_trusted_private,
         "feed",
         MAX_REDIRECTS,
-        |client, url, hop| {
+        |client, url, _hop| {
             let mut req = client.get(url).header(
                 "Accept",
                 "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
             );
-            // Conditional headers describe the *source* negotiation state and
-            // belong to the first hop only: re-sending them on a redirect hop
-            // lets an intermediate cache answer 304 from the source's etag,
-            // which would be mistaken for "source unchanged".
-            if hop == 0 {
-                if let Some(e) = etag {
-                    req = req.header("If-None-Match", e);
-                }
-                if let Some(lm) = last_modified {
-                    req = req.header("If-Modified-Since", lm);
-                }
+            // The saved ETag/Last-Modified belong to the final resource, so
+            // they must be sent on every hop: a redirected feed (http→https,
+            // short links, RSSHub front pages) would otherwise never receive
+            // its conditional headers and would always transfer the full body.
+            if let Some(e) = etag {
+                req = req.header("If-None-Match", e);
+            }
+            if let Some(lm) = last_modified {
+                req = req.header("If-Modified-Since", lm);
             }
             req
         },
@@ -753,6 +751,12 @@ pub(crate) fn is_video_href(href: &str) -> bool {
 /// Mirrors rsstt's approach (strip media, keep hashtag/topic links).
 pub fn html_to_telegram_html(html: &str) -> String {
     let mut s = html.to_string();
+    // Normalize line endings up front: split_html/blockquote folding split on
+    // "\n\n", so a JSON Feed (or any source that keeps CRLF) would otherwise
+    // never match paragraph boundaries and would retain stray '\r' bytes.
+    if s.contains('\r') {
+        s = s.replace("\r\n", "\n").replace('\r', "\n");
+    }
 
     // 0) Strip sentinel characters already present in the input (U+FFFC object
     //    replacement character / U+FFFE noncharacter). These two characters
@@ -871,12 +875,17 @@ pub fn html_to_telegram_html(html: &str) -> String {
 }
 
 /// Truncate text at a char boundary, appending ellipsis if truncated.
-pub fn truncate_text(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
+pub fn truncate_text(s: &str, max_units: usize) -> String {
+    // Use the same UTF-16 unit as Telegram and visible_len; counting Unicode
+    // chars would under-count emoji and make this helper disagree with the
+    // rest of the display pipeline.
+    if crate::htmltext::utf16_len(s) <= max_units {
         return s.to_string();
     }
-    let truncated: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-    format!("{}…", truncated)
+    format!(
+        "{}…",
+        crate::htmltext::take_utf16_prefix(s, max_units.saturating_sub(1))
+    )
 }
 
 #[cfg(test)]

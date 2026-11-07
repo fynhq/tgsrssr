@@ -886,7 +886,6 @@ pub async fn handle_callback(
                     let panel_msg_id = q.message.as_ref().map(|m| m.id().0).unwrap_or(0);
                     if let Some(chat) = chat {
                         let user_id = q.from.id.0 as i64;
-                        bot.answer_callback_query(qid.clone()).await.ok();
                         // A failed read must abort the flow: showing the
                         // default "(none)" baseline would make the user's
                         // reply overwrite the real keywords.
@@ -901,6 +900,11 @@ pub async fn handle_callback(
                                 return Ok(());
                             }
                         };
+                        // Acknowledge only after the read succeeded, so the
+                        // failure branch's toast is the first answer Telegram
+                        // sees (subsequent answers to the same query are
+                        // ignored).
+                        bot.answer_callback_query(qid.clone()).await.ok();
                         let current = if fc.keywords.is_empty() {
                             i18n::t(lang, "none").to_string()
                         } else {
@@ -1426,12 +1430,16 @@ async fn render_feed_page_impl(
     let status = if sub.active == 1 { i18n::t(lang, "feed_active") } else { i18n::t(lang, "feed_paused") };
 
     let url_attr = crate::push::escape_attr(&sub.feed_url);
-    let name_html = crate::push::escape_html(name);
+    // Panels are sent/edited as one message; an unbounded feed title or long
+    // URL would make both edit and send fail with "message is too long",
+    // leaving the source page permanently unreachable.
+    let name_html = crate::push::escape_html(&crate::fetcher::truncate_text(name, 200));
     let mut text = i18n::fill(i18n::t(lang, "feed_header"), &[&url_attr, &name_html, status]);
     // Show original title when manually renamed
     if sub.title_overridden == 1 {
         if let Some(orig) = &sub.original_title {
-            text.push_str(&i18n::t(lang, "feed_orig_name").replacen("{}", &crate::push::escape_html(orig), 1));
+            let orig = crate::fetcher::truncate_text(orig, 200);
+            text.push_str(&i18n::t(lang, "feed_orig_name").replacen("{}", &crate::push::escape_html(&orig), 1));
         }
     }
 

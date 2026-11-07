@@ -115,7 +115,14 @@ pub async fn handle_command(
             user_id,
         )
     {
-        bot.send_message(msg.chat.id, i18n::t(lang, "cmd_rate_limited")).await?;
+        bot.send_message(
+            msg.chat.id,
+            i18n::fill(
+                i18n::t(lang, "cmd_rate_limited"),
+                &[&crate::limits::COMMANDS_PER_MINUTE.to_string()],
+            ),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -328,6 +335,32 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     Ok(())
 }
 
+/// Reject subscribing a public Telegram channel to its own web preview. The
+/// preview contains the bot's own posts, and every push creates a new msgid
+/// that the next fetch sees as a new entry, forming an endless self-feed.
+async fn is_self_telegram_source(
+    state: &AppState,
+    chat_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<bool> {
+    let Some(p) = crate::platforms::platform_for_url(feed_url) else {
+        return Ok(false);
+    };
+    if p.id != "telegram" {
+        return Ok(false);
+    }
+    let Some(channel) = crate::platforms::telegram::parse_channel_name(feed_url) else {
+        return Ok(false);
+    };
+    let Some(chat) = db::get_chat(&state.db, chat_id).await? else {
+        return Ok(false);
+    };
+    Ok(chat
+        .username
+        .as_deref()
+        .is_some_and(|u| u.eq_ignore_ascii_case(&channel)))
+}
+
 // ===== /sub =====
 
 async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang: Lang) -> ResponseResult<()> {
@@ -510,6 +543,20 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
                 continue;
             }
         }
+        match is_self_telegram_source(state, &chat_id, url_str).await {
+            Ok(true) => {
+                results.push(i18n::t(lang, "sub_self_channel").to_string());
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                results.push(
+                    i18n::t(lang, "sub_check_failed")
+                        .replacen("{}", &push::escape_html(&format!("{:#}", e)), 1),
+                );
+                continue;
+            }
+        }
 
         // Fetch feed first (rsstt-style validation): a feed we cannot fetch now is
         // NOT added. Otherwise the title falls back to the URL and, worse, the
@@ -679,7 +726,10 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 
     // Second token is the full feed URL.
     let raw_feed_url = rest[0].to_string();
-    if !raw_feed_url.starts_with("http://") && !raw_feed_url.starts_with("https://") {
+    // Scheme check is case-insensitive: normalize_feed_url lowercases the
+    // scheme later, so HTTPS://... is valid for /sub and must be for /test too.
+    let scheme_lower = raw_feed_url.to_ascii_lowercase();
+    if !scheme_lower.starts_with("http://") && !scheme_lower.starts_with("https://") {
         bot.send_message(msg.chat.id, i18n::t(lang, "test_bad_url")).await?;
         return Ok(());
     }
@@ -697,6 +747,23 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
                 msg.chat.id,
                 i18n::t(lang, "sub_platform_closed").replacen("{}", p.label, 1),
             ).await?;
+            return Ok(());
+        }
+    }
+    match is_self_telegram_source(state, &chat_id, &feed_url).await {
+        Ok(true) => {
+            bot.send_message(msg.chat.id, i18n::t(lang, "sub_self_channel")).await?;
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(e) => {
+            bot.send_message(
+                msg.chat.id,
+                i18n::t(lang, "sub_check_failed")
+                    .replacen("{}", &push::escape_html(&format!("{:#}", e)), 1),
+            )
+            .parse_mode(ParseMode::Html)
+            .await?;
             return Ok(());
         }
     }
@@ -1405,8 +1472,9 @@ pub async fn handle_pending_op(
                 retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::t(lang, "cookie_empty").replacen("{}", label, 1)).await;
                 return Ok(());
             }
-            if text.chars().count() > 4096 {
-                retire_prompt(bot, msg.chat.id, prompt_msg_id, i18n::t(lang, "cookie_too_long")).await;
+            if text.chars().count() > crate::limits::MAX_COOKIE_CHARS {
+                let limit = crate::limits::MAX_COOKIE_CHARS.to_string();
+                retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::fill(i18n::t(lang, "cookie_too_long"), &[&limit])).await;
                 return Ok(());
             }
             match crate::platforms::update_cookie(state, &platform, text).await {
@@ -1447,8 +1515,9 @@ pub async fn handle_pending_op(
             let keywords = if text == "清空" || text.eq_ignore_ascii_case("clear") {
                 String::new()
             } else {
-                if text.chars().count() > 500 {
-                    retire_prompt(bot, msg.chat.id, prompt_msg_id, i18n::t(lang, "fkw_too_long")).await;
+                if text.chars().count() > crate::limits::MAX_FILTER_KEYWORDS_CHARS {
+                    let limit = crate::limits::MAX_FILTER_KEYWORDS_CHARS.to_string();
+                    retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::fill(i18n::t(lang, "fkw_too_long"), &[&limit])).await;
                     return Ok(());
                 }
                 text.to_string()
