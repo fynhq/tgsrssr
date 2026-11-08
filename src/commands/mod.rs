@@ -1717,7 +1717,7 @@ mod tests {
     #[test]
     fn about_text_links_version_to_repo() {
         let expected = format!(r#"<a href="{REPO_URL}">v{VERSION}</a>"#);
-        for lang in [Lang::Zh, Lang::En] {
+        for lang in Lang::ALL {
             let text = about_text(lang);
             assert!(text.contains(&expected), "missing version link for {lang:?}");
             assert!(!text.contains("{}"), "placeholder left in {lang:?} text");

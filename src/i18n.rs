@@ -11,6 +11,12 @@
 //! `key=value` line per key) and are embedded into the binary at compile time.
 //! `\n`, `\r`, `\t`, `\"` and `\\` escapes are decoded when a language map is
 //! first used.
+//!
+//! To add a language: add a variant, extend `db_value`, `Lang::ALL`,
+//! `source()` and the `strings()` map, then add `locales/<code>.conf`. The
+//! `t()` fallback already routes every non-English language to English. The
+//! locale tests iterate `Lang::ALL`, so the new file is checked automatically
+//! once these pieces are in place.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -23,27 +29,38 @@ pub enum Lang {
 }
 
 impl Lang {
+    /// All supported languages, in UI cycle/picker order. Keep in sync with the
+    /// enum variants.
+    pub const ALL: [Self; 2] = [Self::Zh, Self::En];
+
     /// Parse from Telegram `language_code` (e.g. "zh-hans", "en", "ru").
+    /// A language matches its base code and any regional subtag of it, so
+    /// `zh-hans` -> Zh and `ja-JP` -> Ja.
     pub fn from_language_code(code: Option<&str>) -> Self {
-        match code {
-            Some(c) => {
-                let lower = c.to_lowercase();
-                if lower == "zh" || lower.starts_with("zh-") {
-                    Lang::Zh
-                } else {
-                    Lang::En
-                }
+        let Some(code) = code else {
+            return Lang::En;
+        };
+        let lower = code.to_lowercase();
+        for lang in Self::ALL {
+            let base = lang.db_value();
+            if lower == base
+                || lower
+                    .strip_prefix(base)
+                    .is_some_and(|rest| rest.starts_with('-'))
+            {
+                return lang;
             }
-            None => Lang::En,
         }
+        Lang::En
     }
 
     /// Parse from stored DB value.
     pub fn from_db_value(v: &str) -> Self {
-        match v {
-            "zh" => Lang::Zh,
-            _ => Lang::En,
-        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|lang| lang.db_value() == v)
+            .unwrap_or(Lang::En)
     }
 
     /// DB storage value.
@@ -59,27 +76,34 @@ impl Lang {
         format!("lang:{user_id}")
     }
 
+    fn source(self) -> &'static str {
+        match self {
+            Lang::Zh => include_str!("../locales/zh.conf"),
+            Lang::En => include_str!("../locales/en.conf"),
+        }
+    }
+
     fn strings(self) -> &'static HashMap<&'static str, String> {
         static ZH: OnceLock<HashMap<&'static str, String>> = OnceLock::new();
         static EN: OnceLock<HashMap<&'static str, String>> = OnceLock::new();
         match self {
-            Lang::Zh => ZH.get_or_init(|| parse(include_str!("../locales/zh.conf"))),
-            Lang::En => EN.get_or_init(|| parse(include_str!("../locales/en.conf"))),
+            Lang::Zh => ZH.get_or_init(|| parse(self.source())),
+            Lang::En => EN.get_or_init(|| parse(self.source())),
         }
     }
 }
 
 /// Translate a static string by key.
-/// A missing Chinese key falls back to the English text; a missing English key
-/// returns the "[?]" marker. The locale tests compare both files and scan every
-/// literal key used in the crate.
+/// A missing non-English key falls back to the English text; a missing English
+/// key returns the "[?]" marker. The locale tests compare all files and scan
+/// every literal key used in the crate.
 pub fn t(lang: Lang, key: &str) -> &'static str {
     if let Some(value) = lang.strings().get(key) {
         return value.as_str();
     }
     match lang {
-        Lang::Zh => t(Lang::En, key),
         Lang::En => "[?]",
+        _ => t(Lang::En, key),
     }
 }
 
@@ -159,9 +183,6 @@ mod tests {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
-    const ZH_SOURCE: &str = include_str!("../locales/zh.conf");
-    const EN_SOURCE: &str = include_str!("../locales/en.conf");
-
     fn raw_keys(source: &str) -> Vec<&str> {
         let mut keys = Vec::new();
         for line in source.lines() {
@@ -195,27 +216,64 @@ mod tests {
     }
 
     #[test]
+    fn missing_keys_fall_back_to_marker() {
+        for lang in Lang::ALL {
+            assert_eq!(t(lang, "__missing_key__"), "[?]");
+        }
+    }
+
+    #[test]
     fn setting_key_format() {
         assert_eq!(Lang::setting_key(12345), "lang:12345");
     }
 
     #[test]
+    fn all_language_codes_roundtrip() {
+        let codes: HashSet<_> = Lang::ALL.iter().map(|lang| lang.db_value()).collect();
+        assert_eq!(
+            codes.len(),
+            Lang::ALL.len(),
+            "duplicate language code in Lang::ALL"
+        );
+        for lang in Lang::ALL {
+            assert_eq!(
+                Lang::from_db_value(lang.db_value()),
+                lang,
+                "db roundtrip failed for {lang:?}"
+            );
+            assert_eq!(
+                Lang::from_language_code(Some(lang.db_value())),
+                lang,
+                "client-code roundtrip failed for {lang:?}"
+            );
+        }
+    }
+
+    #[test]
     fn locale_files_have_matching_non_empty_keys() {
-        let zh = Lang::Zh.strings();
-        let en = Lang::En.strings();
-        assert!(zh.len() > 200, "only {} zh keys", zh.len());
-        assert_eq!(zh.len(), en.len(), "zh/en key count differ");
-        let zh_keys: HashSet<_> = zh.keys().copied().collect();
-        let en_keys: HashSet<_> = en.keys().copied().collect();
-        assert_eq!(zh_keys, en_keys, "zh/en key sets differ");
-        for (key, value) in zh.iter().chain(en.iter()) {
-            assert!(!value.is_empty(), "empty translation for {key}");
+        let baseline = Lang::En.strings();
+        assert!(baseline.len() > 200, "only {} en keys", baseline.len());
+        let baseline_keys: HashSet<_> = baseline.keys().copied().collect();
+        for lang in Lang::ALL {
+            let strings = lang.strings();
+            assert_eq!(
+                strings.len(),
+                baseline.len(),
+                "{lang:?} key count differs from en"
+            );
+            let keys: HashSet<_> = strings.keys().copied().collect();
+            assert_eq!(keys, baseline_keys, "{lang:?} key set differs from en");
+            for (key, value) in strings {
+                assert!(!value.is_empty(), "empty {lang:?} translation for {key}");
+            }
         }
     }
 
     #[test]
     fn locale_files_have_no_duplicate_keys_and_use_lf() {
-        for (name, source) in [("zh.conf", ZH_SOURCE), ("en.conf", EN_SOURCE)] {
+        for lang in Lang::ALL {
+            let name = format!("{}.conf", lang.db_value());
+            let source = lang.source();
             assert!(!source.contains('\r'), "{name} contains CR; use LF");
             let keys = raw_keys(source);
             let unique: HashSet<_> = keys.iter().copied().collect();
@@ -270,8 +328,6 @@ mod tests {
 
     #[test]
     fn locale_keys_referenced_in_source_exist() {
-        let zh = Lang::Zh.strings();
-        let en = Lang::En.strings();
         let source = source_text();
         for key in DYNAMIC_KEYS {
             assert!(
@@ -284,17 +340,22 @@ mod tests {
             literal_count > 300,
             "only {literal_count} literal i18n::t calls scanned"
         );
-        for key in &referenced {
-            assert!(zh.contains_key(key.as_str()), "missing zh key {key}");
-            assert!(en.contains_key(key.as_str()), "missing en key {key}");
+        for lang in Lang::ALL {
+            let strings = lang.strings();
+            for key in &referenced {
+                assert!(
+                    strings.contains_key(key.as_str()),
+                    "missing {lang:?} key {key}"
+                );
+            }
         }
     }
 
     #[test]
     fn locale_files_have_no_unused_keys() {
-        let zh = Lang::Zh.strings();
+        let baseline = Lang::En.strings();
         let (referenced, _) = referenced_keys();
-        let mut unused: Vec<&str> = zh
+        let mut unused: Vec<&str> = baseline
             .keys()
             .copied()
             .filter(|key| !referenced.contains(*key))
@@ -310,23 +371,27 @@ mod tests {
 
     #[test]
     fn placeholders_match_between_languages() {
-        let zh = Lang::Zh.strings();
-        let en = Lang::En.strings();
-        for (key, zh_value) in zh {
-            let key = *key;
-            let en_value = en
-                .get(key)
-                .unwrap_or_else(|| panic!("missing en key {key}"));
-            assert_eq!(
-                zh_value.matches("{}").count(),
-                en_value.matches("{}").count(),
-                "placeholder count differs for {key}"
-            );
-            assert_eq!(
-                zh_value.matches("{:#}").count(),
-                en_value.matches("{:#}").count(),
-                "error placeholder count differs for {key}"
-            );
+        let baseline = Lang::En.strings();
+        for lang in Lang::ALL {
+            if lang == Lang::En {
+                continue;
+            }
+            for (key, value) in lang.strings() {
+                let key = *key;
+                let base = baseline
+                    .get(key)
+                    .unwrap_or_else(|| panic!("missing en key {key}"));
+                assert_eq!(
+                    value.matches("{}").count(),
+                    base.matches("{}").count(),
+                    "{lang:?} placeholder count differs for {key}"
+                );
+                assert_eq!(
+                    value.matches("{:#}").count(),
+                    base.matches("{:#}").count(),
+                    "{lang:?} error placeholder count differs for {key}"
+                );
+            }
         }
     }
 
