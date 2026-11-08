@@ -44,6 +44,7 @@ RUN rm -rf src
 
 # Copy real source
 COPY src ./src
+COPY locales ./locales
 COPY migrations ./migrations
 COPY build.rs ./
 RUN touch src/main.rs

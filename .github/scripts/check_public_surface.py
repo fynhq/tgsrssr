@@ -60,7 +60,7 @@ TREE_ALLOW = {
     "compose.example.yaml": {"cjk", "env-narration"},
     ".github/workflows/ci.yml": {"env-narration"},
     ".github/scripts/check_public_surface.py": {"all"},
-    "src/i18n.rs": {"cjk"},
+    "locales/zh.conf": {"cjk"},
     "src/commands/mod.rs": {"cjk"},
     "src/db.rs": {"cjk"},
     "src/fetcher.rs": {"cjk"},
