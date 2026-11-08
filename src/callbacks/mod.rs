@@ -410,32 +410,23 @@ pub async fn handle_callback(
             render_channel_list(&bot, PageTarget::Edit(&q), &state, user_id, page, lang).await?;
         }
         Some("lang") => {
-            // Toggle language preference and re-render channel list.
+            // c|lang opens the picker; c|lang|<code> selects a language.
+            let Some(code) = parts.get(2).copied() else {
+                render_language_picker(&bot, PageTarget::Edit(&q), lang).await?;
+                return Ok(());
+            };
+            let Some(next) = Lang::from_code(code) else {
+                bot.answer_callback_query(qid.clone())
+                    .text(i18n::t(lang, "op_failed_retry"))
+                    .await
+                    .ok();
+                return Ok(());
+            };
+            // Write strictly: only announce + re-render from `next` once it is
+            // actually persisted, so the toast and the panel never disagree.
             let key = Lang::setting_key(user_id);
-            // Read the current preference strictly: a transient DB error must
-            // abort with a retry toast rather than resolve to the fallback and
-            // *write* a toggle computed from it (the "DB read error must not be
-            // treated as a neutral value" contract — here it would silently
-            // clamp an unset user to a stored language).
-            let cur = match db::get_setting(&state.db, &key).await {
-                Ok(Some(v)) => Lang::from_db_value(&v),
-                Ok(None) => Lang::from_language_code(q.from.language_code.as_deref()),
-                Err(e) => {
-                    tracing::warn!(user_id = user_id, error = %e, "lang toggle: preference read failed, aborted");
-                    bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed_retry")).await.ok();
-                    return Ok(());
-                }
-            };
-            let next = match cur {
-                Lang::Zh => Lang::En,
-                Lang::En => Lang::Zh,
-            };
-            // Write strictly too: only announce + re-render from `next` once it
-            // is actually persisted, so the toast and the panel never disagree
-            // (a swallowed write error used to render the old language while
-            // the toast claimed the switch succeeded).
             if let Err(e) = db::set_setting(&state.db, &key, next.db_value()).await {
-                tracing::warn!(user_id = user_id, error = %e, "lang toggle: preference write failed");
+                tracing::warn!(user_id = user_id, error = %e, "language picker: preference write failed");
                 bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed_retry")).await.ok();
                 return Ok(());
             }
@@ -1263,7 +1254,7 @@ pub async fn render_channel_list(
     if let Some(nav) = nav_row(page, total_pages, lang, |p| format!("c|chlist|{}", p)) {
         buttons.push(nav);
     }
-    // Language switch button (shows current language, toggles on tap)
+    // Language picker entry (shows current language; opens the picker on tap)
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "lang_btn"),
         "c|lang",
@@ -1273,6 +1264,36 @@ pub async fn render_channel_list(
     let kb = InlineKeyboardMarkup::new(buttons);
     deliver(bot, &target, &text, Some(kb)).await?;
     Ok(())
+}
+
+/// Render the language picker. Every supported language is one button; the
+/// current one is marked with a check. Selecting a language writes the user
+/// preference and returns to the channel list in that language.
+async fn render_language_picker(
+    bot: &Bot,
+    target: PageTarget<'_>,
+    lang: Lang,
+) -> ResponseResult<()> {
+    let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+    for option in Lang::ALL {
+        let label = match option {
+            Lang::Zh => i18n::t(lang, "language.zh"),
+            Lang::En => i18n::t(lang, "language.en"),
+        };
+        let mark = if option == lang { "✓ " } else { "" };
+        buttons.push(vec![InlineKeyboardButton::callback(
+            format!("{mark}{label}"),
+            format!("c|lang|{}", option.db_value()),
+        )]);
+    }
+    buttons.push(back_close_row(lang, "back", "c|chlist|0".to_string()));
+    deliver(
+        bot,
+        &target,
+        i18n::t(lang, "lang_title"),
+        Some(InlineKeyboardMarkup::new(buttons)),
+    )
+    .await
 }
 
 /// Render the channel page (subscription list + management buttons).

@@ -54,13 +54,17 @@ impl Lang {
         Lang::En
     }
 
-    /// Parse from stored DB value.
-    pub fn from_db_value(v: &str) -> Self {
+    /// Parse a stored or callback language code strictly.
+    pub fn from_code(code: &str) -> Option<Self> {
         Self::ALL
             .iter()
             .copied()
-            .find(|lang| lang.db_value() == v)
-            .unwrap_or(Lang::En)
+            .find(|lang| lang.db_value() == code)
+    }
+
+    /// Parse from stored DB value.
+    pub fn from_db_value(v: &str) -> Self {
+        Self::from_code(v).unwrap_or(Lang::En)
     }
 
     /// DB storage value.
@@ -213,6 +217,9 @@ mod tests {
         assert_eq!(Lang::from_db_value(Lang::Zh.db_value()), Lang::Zh);
         assert_eq!(Lang::from_db_value(Lang::En.db_value()), Lang::En);
         assert_eq!(Lang::from_db_value("unknown"), Lang::En);
+        assert_eq!(Lang::from_code("zh"), Some(Lang::Zh));
+        assert_eq!(Lang::from_code("en"), Some(Lang::En));
+        assert_eq!(Lang::from_code("unknown"), None);
     }
 
     #[test]
@@ -316,7 +323,7 @@ mod tests {
 
     fn referenced_keys() -> (HashSet<String>, usize) {
         let source = source_text();
-        let re = regex::Regex::new(r#"i18n::t\s*\(\s*[^,]+,\s*"([a-z0-9_]+)""#).unwrap();
+        let re = regex::Regex::new(r#"i18n::t\s*\(\s*[^,]+,\s*"([a-z0-9_.]+)""#).unwrap();
         let mut keys: HashSet<String> = DYNAMIC_KEYS.iter().map(|key| (*key).to_string()).collect();
         let mut literal_count = 0;
         for caps in re.captures_iter(&source) {
