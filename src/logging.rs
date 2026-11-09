@@ -27,7 +27,8 @@ pub fn init_logging(log_dir: &Path) -> anyhow::Result<WorkerGuard> {
                 .with_ansi(false)
                 .with_target(true),
         )
-        .init();
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("failed to initialize tracing subscriber: {}", e))?;
 
     Ok(guard)
 }

@@ -130,10 +130,48 @@ pub fn ssrf_check_literal(url: &str) -> SsrfOutcome {
         };
     }
     let lower = host_no_dot.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") {
+    if lower == "localhost" || lower.ends_with(".localhost") || proxy_host_denied(&lower) {
         return SsrfOutcome::Private;
     }
     SsrfOutcome::Allowed
+}
+
+/// Hostnames that must never be reached through a proxy. The proxy resolves
+/// the name itself, so a local NXDOMAIN is not evidence that the name is
+/// public: single-label names, common internal suffixes and cloud metadata
+/// aliases are exactly what a local resolver often cannot resolve while the
+/// proxy (or its network) can.
+pub fn proxy_host_denied(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return true;
+    }
+    // Single-label names (consul, redis, kubernetes, ...) only resolve inside
+    // a private DNS zone in practice.
+    if !host.contains('.') {
+        return true;
+    }
+    const EXACT: &[&str] = &[
+        "metadata.google.internal",
+        "metadata.goog",
+        "instance-data",
+    ];
+    if EXACT.contains(&host.as_str()) {
+        return true;
+    }
+    const SUFFIXES: &[&str] = &[
+        ".localhost",
+        ".local",
+        ".internal",
+        ".lan",
+        ".corp",
+        ".home.arpa",
+        ".svc",
+        ".cluster.local",
+        ".consul",
+        ".localdomain",
+    ];
+    SUFFIXES.iter().any(|suffix| host.ends_with(suffix))
 }
 
 /// Connection-layer DNS guard closing the rebinding window of the pre-check.
@@ -194,6 +232,13 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
                 || o[0] == 0                     // 0.0.0.0/8
                 || (o[0] == 100 && o[1] >= 64 && o[1] <= 127) // 100.64/10 CGNAT
                 || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // 198.18/15 benchmarking
+                // 192.0.0.0/24 IETF protocol assignments (incl. 192.0.0.170/171 NAT64 discovery)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 TEST-NET-1/2/3
+                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 192.88.99/24 6to4 relay anycast
                 || o[0] >= 224                   // 224/4 multicast + 240/4 reserved + broadcast
         }
         std::net::IpAddr::V6(v6) => {
@@ -315,6 +360,42 @@ mod tests {
         // Public IPv6 literal passes (DNS guard is not involved).
         assert_eq!(ssrf_check_literal("https://[2606:4700::1111]/"), SsrfOutcome::Allowed);
         assert_eq!(ssrf_check_literal("file:///etc/passwd"), SsrfOutcome::Private);
+    }
+
+    #[test]
+    fn proxy_denylist_covers_internal_and_metadata_names() {
+        for host in [
+            "consul",
+            "redis",
+            "metadata.google.internal",
+            "metadata.goog",
+            "instance-data",
+            "kubernetes.default.svc",
+            "api.cluster.local",
+            "printer.local",
+            "foo.internal",
+            "nas.lan",
+        ] {
+            assert!(proxy_host_denied(host), "{host} should be denied");
+        }
+        assert!(!proxy_host_denied("example.com"));
+        assert!(!proxy_host_denied("cdn.example.com."));
+    }
+
+    #[test]
+    fn special_use_ipv4_ranges_are_private() {
+        for ip in [
+            "192.0.0.1",
+            "192.0.0.170",
+            "192.0.0.171",
+            "192.0.2.1",
+            "198.51.100.7",
+            "203.0.113.9",
+            "192.88.99.1",
+        ] {
+            assert!(is_private_ip(&ip.parse().unwrap()), "{ip} should be blocked");
+        }
+        assert!(!is_private_ip(&"8.8.8.8".parse().unwrap()));
     }
 
     #[test]

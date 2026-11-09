@@ -90,7 +90,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 | X / Twitter | `https://x.com/<screen_name>` | 需 `auth_token` cookie；长推文全文、原图、最高码率视频，@/#/$ 自动超链，转推/引用以引用块呈现 |
 | Telegram | `https://t.me/<channel>` | 仅公开频道、免登录；保留超链接，回复以引用块呈现 |
 
-本地 RSSHub：SSRF 防护默认拒绝私网/回环地址，需在 `RSS_TRUSTED_PRIVATE_HOSTS` 精确配置 `host:port`（如 `rsshub:1200`）；该 allowlist 仅对管理员/受信用户生效（scope 默认 `admin`），不是通用私网白名单，`RSS_NO_PROXY` 只影响路由。
+本地 RSSHub：SSRF 防护默认拒绝私网/回环地址，需在 `RSS_TRUSTED_PRIVATE_HOSTS` 精确配置 `host:port`（如 `rsshub:1200`）；该 allowlist 仅对管理员/受信用户生效（scope 默认 `admin`），不是通用私网白名单，`RSS_NO_PROXY` 只影响路由。条目内媒体仅在与订阅 feed 同源（scheme+host+port）时继承该 allowlist，公网 feed 无法借它访问内网。
 
 ## 频道管理面板（/set）
 
@@ -112,7 +112,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 - Outbox 持久化重试：1 分钟→2 小时指数退避，72 小时放弃；支持分段/op 级续发。
 - 平台级健康监控：连续 2 轮全部源失败通知管理员，恢复后再次通知；媒体下载 5xx 重试（间隔 5 秒）、4xx 不重试，失败随条目最多重试 3 轮后降级发送。
 - 定时任务：抓取（默认 5 分钟，按源间隔）、outbox 重试（5 分钟）、自愈（每小时）、清理（默认 60 分钟）。
-- 通知对象：频道属主（源停用、媒体失败/视频超限、入队/72h 放弃）、管理员（cookie 失效、平台异常与恢复）；Bot 被移出频道时清空该频道数据。
+- 通知对象：频道属主（源停用、媒体失败/视频超限、入队/72h 放弃）、管理员（cookie 失效、平台异常与恢复）；Bot 被移出频道时软停用该频道并保留数据，重新添加后恢复（属主不变）。
 
 ## 配置参考（compose.yaml environment）
 
@@ -264,7 +264,7 @@ Any RSS 2.0 / Atom feed (with ETag / Last-Modified conditional requests), plus t
 | X / Twitter | `https://x.com/<screen_name>` | `auth_token` cookie required; full long tweets, original images, highest-bitrate video, auto-linked @/#/$, retweets/quotes as blockquotes |
 | Telegram | `https://t.me/<channel>` | Public channels only, no login; hyperlinks preserved, replies as blockquotes |
 
-Local RSSHub: SSRF protection rejects private/loopback addresses by default; add the exact `host:port` to `RSS_TRUSTED_PRIVATE_HOSTS` (e.g. `rsshub:1200`). This allowlist applies only to the admin/trusted users (scope defaults to `admin`) and is not a general private-network allowlist; `RSS_NO_PROXY` only affects routing.
+Local RSSHub: SSRF protection rejects private/loopback addresses by default; add the exact `host:port` to `RSS_TRUSTED_PRIVATE_HOSTS` (e.g. `rsshub:1200`). This allowlist applies only to the admin/trusted users (scope defaults to `admin`) and is not a general private-network allowlist; `RSS_NO_PROXY` only affects routing. Entry media inherits the allowlist only when it is same-origin with the subscribed feed (scheme+host+port); a public feed cannot use it to reach the internal network.
 
 ## Channel Management Panel (/set)
 
@@ -286,7 +286,7 @@ Local RSSHub: SSRF protection rejects private/loopback addresses by default; add
 - Persistent outbox retry: 1 min → 2 h exponential backoff, abandoned after 72 h; segment/op-level resumption.
 - Platform health monitoring: two consecutive all-source failure rounds notify the admin, and recovery notifies again; media downloads retry on 5xx (5 s interval) but not 4xx, and failed entries are retried up to 3 fetch rounds before being sent degraded.
 - Scheduled jobs: fetch (default 5 min, per-source interval), outbox retry (5 min), self-heal (hourly), cleanup (default 60 min).
-- Notifications: channel owner (source disabled, media failure/oversized video, queued/72h abandoned) and admin (cookie expiry, platform errors/recovery); removing the bot from a channel purges that channel's data.
+- Notifications: channel owner (source disabled, media failure/oversized video, queued/72h abandoned) and admin (cookie expiry, platform errors/recovery); removing the bot from a channel soft-disables it and keeps its data, so re-adding restores the original owner and subscriptions.
 
 ## Configuration Reference (compose.yaml environment)
 

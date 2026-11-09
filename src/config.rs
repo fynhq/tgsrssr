@@ -383,13 +383,33 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 /// True when `host` equals a list entry or is a subdomain of it. Entries are
-/// normalized like the env parsers (trim whitespace, drop a leading dot,
-/// lowercase). Shared by proxy/insecure/img-relay host matching.
+/// normalized like the env parsers (trim whitespace, drop a leading/trailing
+/// dot, lowercase). Shared by proxy/no_proxy/img-relay host matching.
 pub(crate) fn host_in_list(host: &str, list: &[String]) -> bool {
-    let host = host.to_lowercase();
+    let host = host.trim_end_matches('.').to_lowercase();
     list.iter().any(|entry| {
-        let entry = entry.trim().trim_start_matches('.').to_lowercase();
+        let entry = entry
+            .trim()
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_lowercase();
         !entry.is_empty() && (host == entry || host.ends_with(&format!(".{}", entry)))
+    })
+}
+
+/// Exact host match (no subdomain inheritance), normalized like
+/// [`host_in_list`]. Used for TLS-verification exemptions: listing
+/// `example.com` must not silently disable certificate validation for every
+/// `*.example.com`.
+pub(crate) fn host_matches_exact(host: &str, list: &[String]) -> bool {
+    let host = host.trim_end_matches('.').to_lowercase();
+    list.iter().any(|entry| {
+        let entry = entry
+            .trim()
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_lowercase();
+        !entry.is_empty() && host == entry
     })
 }
 
@@ -482,7 +502,17 @@ fn validate_aspect_ratio(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_in_list, is_allowed_by_ids, validate_single_admin};
+    use super::{host_in_list, host_matches_exact, is_allowed_by_ids, validate_single_admin};
+
+    #[test]
+    fn insecure_host_matching_is_exact_but_no_proxy_inherits_subdomains() {
+        let list = vec!["example.com".to_string()];
+        assert!(host_matches_exact("example.com", &list));
+        assert!(host_matches_exact("EXAMPLE.COM.", &list));
+        assert!(!host_matches_exact("cdn.example.com", &list));
+        assert!(host_in_list("cdn.example.com", &list));
+        assert!(host_in_list("example.com.", &list));
+    }
 
     #[test]
     fn single_admin_accepted() {

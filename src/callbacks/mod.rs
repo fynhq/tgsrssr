@@ -3,7 +3,7 @@ use teloxide::types::{
     CallbackQuery, ChatId, ChatMemberStatus, InlineKeyboardButton,
     InlineKeyboardMarkup, ParseMode,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::db;
 use crate::i18n::{self, Lang};
@@ -435,7 +435,10 @@ pub async fn handle_callback(
                 // is fetched on every 5-minute tick — easily tripping source
                 // rate limits / IP bans. Clamp to a sane minimum (1 minute).
                 if field == "interval_minutes" {
-                    let ok = val.parse::<i64>().map(|n| n >= 1).unwrap_or(false);
+                    let ok = val
+                        .parse::<i64>()
+                        .map(|n| (1..=crate::db::MAX_INTERVAL_MINUTES).contains(&n))
+                        .unwrap_or(false);
                     if !ok {
                         bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "invalid_interval")).await.ok();
                         return Ok(());
@@ -744,7 +747,10 @@ pub async fn handle_callback(
                 // always true, hammering the source every tick (rate-limit /
                 // IP-ban risk). "inherit" clears the override and is allowed.
                 if parts[1] == "srcfi" && *val != "inherit" {
-                    let ok = val.parse::<i64>().map(|n| n >= 1).unwrap_or(false);
+                    let ok = val
+                        .parse::<i64>()
+                        .map(|n| (1..=crate::db::MAX_INTERVAL_MINUTES).contains(&n))
+                        .unwrap_or(false);
                     if !ok {
                         bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "invalid_interval")).await.ok();
                         return Ok(());
@@ -943,12 +949,25 @@ pub async fn handle_my_chat_member(
     }
     let chat_type = crate::db::chat_type_str(chat.is_channel(), chat.is_group(), chat.is_supergroup());
     // Record the inviter (the user who performed the add/remove action) as the channel owner.
-    let inviter_id = update.from.id.0.to_string();
+    let inviter = update.from.id.0 as i64;
+    let inviter_id = inviter.to_string();
 
     match update.new_chat_member.status() {
         ChatMemberStatus::Member
         | ChatMemberStatus::Administrator
         | ChatMemberStatus::Owner => {
+            // Anyone can add a bot to a chat they administer. Registering the
+            // chat for an unapproved inviter would both pollute chats and let
+            // that stranger become the permanent owner (blocking the intended
+            // owner from ever managing the channel). Ignore such adds.
+            if !state.config.is_allowed(inviter) {
+                warn!(
+                    chat_id = %chat_id,
+                    inviter = %inviter,
+                    "ignoring bot add by a non-whitelisted user"
+                );
+                return Ok(());
+            }
             let title = chat.title().map(|t| t.to_string());
             let username = chat.username().map(|u| u.to_string());
             if let Err(e) = db::upsert_chat(&state.db, &chat_id, chat_type, title.as_deref(), username.as_deref(), Some(&inviter_id)).await {
@@ -958,11 +977,30 @@ pub async fn handle_my_chat_member(
             }
         }
         ChatMemberStatus::Left | ChatMemberStatus::Banned => {
-            // Bot removed: purge all data for this chat
-            if let Err(e) = db::purge_chat(&state.db, &chat_id).await {
-                error!(chat_id = %chat_id, error = %e, "failed to purge chat");
-            } else {
-                info!(chat_id = %chat_id, "bot removed — chat data purged");
+            // The bot was removed (or banned) by a chat administrator. That
+            // actor is not necessarily the owner or a whitelisted user, so a
+            // destructive purge here is an unauthenticated data-loss path
+            // (and, after the row is gone, a re-add can steal ownership).
+            // Soft-disable instead: keep subscriptions/history and the owner,
+            // stop scheduling/outbox retries, and let a later re-add revive
+            // the chat with its data intact.
+            match db::set_chat_enabled(&state.db, &chat_id, false).await {
+                Ok(true) => {
+                    if let Err(e) = db::delete_outbox_for_chat(&state.db, &chat_id).await {
+                        warn!(chat_id = %chat_id, error = %e, "bot removed: failed to clear outbox");
+                    }
+                    info!(
+                        chat_id = %chat_id,
+                        actor = %inviter_id,
+                        "bot removed — chat soft-disabled, data retained"
+                    );
+                }
+                Ok(false) => {
+                    debug!(chat_id = %chat_id, actor = %inviter_id, "bot removed from an unregistered chat");
+                }
+                Err(e) => {
+                    error!(chat_id = %chat_id, error = %e, "failed to soft-disable chat");
+                }
             }
         }
         _ => {}

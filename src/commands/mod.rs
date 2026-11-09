@@ -224,7 +224,6 @@ async fn handle_set(
     } else {
         // Direct channel page
         let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, args, user_id, lang).await);
-        try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(state, &chat_id).await);
         crate::ui::render_channel_page(
             bot,
             crate::ui::PageTarget::Send(msg.chat.id),
@@ -252,7 +251,6 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     };
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, &target, user_id, lang).await);
-    try_register_chat(state, &chat_id).await;
     let subs = try_or_reply!(bot, msg.chat.id, lang, db::get_subscriptions(&state.db, &chat_id).await);
 
     let chat = try_or_reply!(bot, msg.chat.id, lang, db::get_chat(&state.db, &chat_id).await);
@@ -389,16 +387,21 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     let allow_trusted_private = state.config.trusted_private_allowed(user_id);
     let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, &channel_input, user_id, lang).await);
-    try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(state, &chat_id).await);
     try_or_reply!(bot, msg.chat.id, lang, db::ensure_chat_config(&state.db, &chat_id).await);
 
     // Normalize + dedupe once: quota checks must count distinct URLs (a URL
     // repeated in one command is a single subscription), and the 10-URL cap
     // applies to the deduped list.
     let mut normalized: Vec<String> = Vec::new();
+    let mut scheme_rejected = false;
     for url_raw in urls {
         let url_raw = url_raw.trim();
         if url_raw.is_empty() {
+            continue;
+        }
+        let lower = url_raw.to_ascii_lowercase();
+        if !lower.starts_with("http://") && !lower.starts_with("https://") {
+            scheme_rejected = true;
             continue;
         }
         let normalized_url = fetcher::normalize_feed_url(url_raw);
@@ -407,7 +410,8 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
         }
     }
     if normalized.is_empty() {
-        bot.send_message(msg.chat.id, i18n::t(lang, "sub_no_valid")).await?;
+        let key = if scheme_rejected { "test_bad_url" } else { "sub_no_valid" };
+        bot.send_message(msg.chat.id, i18n::t(lang, key)).await?;
         return Ok(());
     }
     if normalized.len() > crate::limits::MAX_URLS_PER_SUB {
@@ -728,7 +732,6 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     let allow_trusted_private = state.config.trusted_private_allowed(user_id);
     let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, &channel_input, user_id, lang).await);
-    try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(state, &chat_id).await);
 
     // Second token is the full feed URL.
     let raw_feed_url = rest[0].to_string();
@@ -1010,6 +1013,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
             &transport,
             meta,
             lang,
+            &feed_url,
             opts.mode.single_media(),
             allow_trusted_private,
         )
@@ -1583,16 +1587,6 @@ fn resolve_target_input(_msg: &Message, args: &str) -> Option<String> {
     (!args.is_empty()).then(|| args.to_string())
 }
 
-/// Best-effort chat registration: try getChat, but never fail the command.
-/// Used by /list so that orphan subscriptions (chat no longer registered /
-/// bot removed) can still be listed and managed.
-async fn try_register_chat(state: &AppState, chat_id: &str) {
-    if let Err(e) = ensure_chat_registered(state, chat_id).await {
-        tracing::debug!(chat_id = %chat_id, error = %e, "soft registration skipped");
-    }
-}
-
-/// Resolve a chat identifier (numeric ID or @username) to a chat_id string.
 /// Resolve a channel reference (numeric ID or @username) to a chat_id string.
 /// Pure ownership isolation: only channels where added_by == user_id are accessible.
 /// Unregistered numeric IDs are rejected (ownership comes from MyChatMember invitation).
@@ -1632,25 +1626,6 @@ async fn resolve_chat_id(state: &AppState, input: &str, user_id: i64, lang: Lang
     }
 
     anyhow::bail!("{}", i18n::t(lang, "resolve_not_found").replacen("{}", input, 1))
-}
-
-/// Ensure a chat is registered in the DB.
-///
-/// Under the current permission model (since v0.9.0), channel ownership is determined by
-/// `chats.added_by` recorded from MyChatMember events, and every call site goes through
-/// resolve_chat_id first — unregistered channels are already rejected there
-/// (can_manage_chat=false → bail). Therefore by the time we reach this function the channel
-/// is necessarily already registered; the former "auto-register via getChat" branch (which
-/// handled the case where the bot was already in the channel before startup) is unreachable
-/// and has been removed (~30 lines of dead code). Only a defensive existence check remains
-/// here: if a registration is genuinely missing due to an anomaly, leave a warn instead of
-/// staying silent.
-async fn ensure_chat_registered(state: &AppState, chat_id: &str) -> anyhow::Result<()> {
-    let existing = db::get_chat(&state.db, chat_id).await?;
-    if existing.is_none() {
-        tracing::warn!(chat_id = %chat_id, "chat not registered (unexpected under current ownership model)");
-    }
-    Ok(())
 }
 
 // ===== /loget =====
@@ -1708,6 +1683,18 @@ async fn handle_loget(bot: &Bot, msg: &Message, state: &AppState, args: &str, la
     if len == 0 {
         bot.send_message(msg.chat.id, i18n::t(lang, "loget_empty").replacen("{}", date, 1))
             .await?;
+        return Ok(());
+    }
+    // Official Bot API caps documents at 50MB; a multi-GB log day would fail
+    // the upload with no explanation. Report the size instead.
+    const MAX_LOG_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
+    if len > MAX_LOG_UPLOAD_BYTES {
+        bot.send_message(
+            msg.chat.id,
+            i18n::t(lang, "loget_too_large")
+                .replacen("{}", &(len / (1024 * 1024)).to_string(), 1),
+        )
+        .await?;
         return Ok(());
     }
 

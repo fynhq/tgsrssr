@@ -9,6 +9,19 @@ use anyhow::Context;
 
 use crate::state::AppState;
 
+/// Same-origin check (scheme + host + effective port). Used to keep the
+/// RSS_TRUSTED_PRIVATE_HOSTS bypass scoped to media served by the feed
+/// itself: a public feed embedding `http://rsshub:1200/...` must not inherit
+/// the admin's trusted-host bypass, including after a redirect.
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    let (Ok(ua), Ok(ub)) = (url::Url::parse(a), url::Url::parse(b)) else {
+        return false;
+    };
+    ua.scheme() == ub.scheme()
+        && ua.host_str() == ub.host_str()
+        && ua.port_or_known_default() == ub.port_or_known_default()
+}
+
 /// Manually follow up to `max_redirects` hops on a GET-like request.
 ///
 /// `build_request` runs for every hop with the client selected for that
@@ -26,6 +39,7 @@ pub(crate) async fn get_follow_redirects<F>(
     state: &AppState,
     start_url: &str,
     allow_trusted_private: bool,
+    trusted_origin: Option<&str>,
     scope: &'static str,
     max_redirects: u32,
     mut build_request: F,
@@ -36,11 +50,16 @@ where
     let mut cur_url = start_url.to_string();
     let mut hops = 0u32;
     loop {
+        // The trusted-private bypass is per-hop and, when an origin is given,
+        // limited to that origin. A redirect from a trusted origin to a
+        // different (even allowlisted) host is re-checked as normal traffic.
+        let allow_trusted = allow_trusted_private
+            && trusted_origin.is_none_or(|origin| same_origin(&cur_url, origin));
         // Substring contract: "dns resolve failed" (produced on the direct
         // route) is matched by sendpolicy::is_net_error as a transient
         // network error.
-        state.check_target(&cur_url, allow_trusted_private, scope).await?;
-        let client = state.media_client_for_url_trusted(&cur_url, allow_trusted_private);
+        state.check_target(&cur_url, allow_trusted, scope).await?;
+        let client = state.media_client_for_url_trusted(&cur_url, allow_trusted);
         let resp = build_request(client, &cur_url, hops)
             .send()
             .await

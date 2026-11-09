@@ -19,6 +19,16 @@ fn main() {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default()
         });
+    // The value is spliced into a cargo:rustc-env directive; a newline or
+    // arbitrary text from a hostile build environment must not be able to
+    // inject additional directives.
+    let hash = if (7..=40).contains(&hash.len())
+        && hash.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        hash
+    } else {
+        String::new()
+    };
 
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
     let full = if hash.is_empty() {

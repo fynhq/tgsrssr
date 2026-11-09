@@ -14,6 +14,17 @@ use crate::push::{self, ContentMode};
 use crate::sendpolicy;
 use crate::state::AppState;
 
+/// Consecutive send failures for one source before it is auto-disabled.
+/// Fetch failures already have their own counter; this covers the
+/// "fetch succeeds, every send fails" case (removed from channel, missing
+/// posting rights), which previously kept enqueueing until the 72h abandon.
+const MAX_SEND_FAILURES: i64 = 3;
+
+/// Upper bound of queued outbox rows per (chat, feed). Reaching it disables
+/// the source instead of letting an unreachable chat grow the queue without
+/// bound.
+const OUTBOX_PER_FEED_LIMIT: i64 = 20;
+
 /// Register the RSS fetch job on the scheduler.
 pub async fn register_fetch_job(
     sched: &JobScheduler,
@@ -535,6 +546,20 @@ async fn process_feed(
             None
         }
     };
+    // Removing a user from ALLOWED_USER_IDS must revoke the data channel too,
+    // not just interactive commands. Their subscriptions stop before any
+    // fetch/media work; the row is kept so re-adding the user resumes it.
+    if let Some(owner) = owner_id {
+        if !state.config.is_allowed(owner) {
+            info!(
+                chat_id = %sub.chat_id,
+                owner,
+                feed = %sub.feed_url,
+                "subscription owner is no longer whitelisted; skipping feed"
+            );
+            return Ok(FeedStatus::Ok);
+        }
+    }
 
     // Owner's language preference (for notification copy i18n); no owner
     // defaults to English.
@@ -706,17 +731,15 @@ async fn process_feed(
                 .unwrap_or_else(|| cfg.chat_id.clone());
 
             // Content filter config (feed level): takes effect when the switch
-            // is on and the keywords are non-empty.
-            // Distinguish "DB error" from "no filter configured": treating an
-            // error as default (empty filter) means every entry passes and the
-            // blocklist silently stops working (a DB read error must not
-            // unwrap_or to a neutral value). Fail-open here is
-            // preferable to aborting the whole round, but must leave a trace.
+            // is on and the keywords are non-empty. A DB error must not be
+            // treated as "no filter": that would push blocked content and mark
+            // it sent, making the blocklist silently lose an entry. Defer the
+            // whole feed this round, consistent with the sent/outbox reads.
             let filter_cfg = match db::get_feed_filter(&state.db, &cfg.chat_id, &cfg.feed_url).await {
                 Ok(cfg) => cfg,
                 Err(e) => {
-                    warn!(feed = %cfg.feed_url, error = %e, "feed filter read failed, treating as no-filter for this round");
-                    Default::default()
+                    warn!(feed = %cfg.feed_url, error = %e, "feed filter read failed, deferring feed");
+                    return Ok(FeedStatus::Failed);
                 }
             };
             // Parse the keyword list once per feed, not once per entry.
@@ -875,6 +898,7 @@ async fn process_feed(
                         &transport,
                         meta,
                         lang,
+                        &cfg.feed_url,
                         opts.mode.single_media(),
                         allow_trusted_private,
                     )
@@ -1141,6 +1165,20 @@ async fn process_feed(
                             }
                             notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
                         }
+                        if send_outcome.text_partial {
+                            let mut msg = i18n::t(lang, "notif_text_partial")
+                                .replacen("{}", &push::escape_html(&chat_title), 1);
+                            if let Some(tg) = &send_outcome.delivered_tg_link {
+                                push_line(&mut msg, lang, "label_message", tg);
+                            }
+                            if let Some(el) = &send_outcome.entry_link {
+                                push_line(&mut msg, lang, "label_entry", el);
+                            }
+                            notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+                        }
+                        // A successful send resets the per-source failure
+                        // streak; the next isolated failure starts from 1.
+                        clear_send_failure(state, &cfg.chat_id, &cfg.feed_url).await;
                         // Download failures: notify the owner immediately
                         // (including the delivered-message link and the source
                         // entry link).
@@ -1232,6 +1270,49 @@ async fn process_feed(
                                 ),
                             }
                         }
+                        // A broken chat (bot removed / no posting rights) would
+                        // otherwise succeed at fetching forever while every
+                        // entry is queued and abandoned after 72h. Count
+                        // consecutive send failures and disable the source or
+                        // chat once the threshold is reached.
+                        if record_send_failure(bot, state, &sub, &cfg, lang, &feed_title, &e).await {
+                            deferred = true;
+                            break;
+                        }
+
+                        // Per-source queue cap: even intermittent failures can
+                        // accumulate rows indefinitely. Stop fetching before
+                        // the queue grows without bound; the source is
+                        // auto-disabled and can be resumed after fixing it.
+                        let queued = match db::outbox_count_for_feed(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+                            Ok(n) => n,
+                            Err(err) => {
+                                warn!(feed = %cfg.feed_url, error = %err, "outbox count failed, deferring entry");
+                                deferred = true;
+                                continue;
+                            }
+                        };
+                        if queued >= OUTBOX_PER_FEED_LIMIT {
+                            warn!(
+                                feed = %cfg.feed_url,
+                                queued,
+                                "outbox queue reached the per-source limit; disabling source"
+                            );
+                            match db::auto_disable_subscription(&state.db, sub.id).await {
+                                Ok(true) => {
+                                    let name = if feed_title.is_empty() { &cfg.feed_url } else { &feed_title };
+                                    let msg = i18n::t(lang, "notif_outbox_full")
+                                        .replacen("{}", &push::escape_html(name), 1)
+                                        .replacen("{}", &OUTBOX_PER_FEED_LIMIT.to_string(), 1);
+                                    notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+                                }
+                                Ok(false) => {}
+                                Err(err) => warn!(feed = %cfg.feed_url, error = %err, "outbox-full auto-disable failed"),
+                            }
+                            deferred = true;
+                            break;
+                        }
+
                         warn!(feed = %cfg.feed_url, error = %e, "send failed, queuing to outbox");
                         // Push failed: write into the outbox persistent retry
                         // queue (exponential backoff, abandon at 72h).
@@ -1253,7 +1334,7 @@ async fn process_feed(
                                     lang,
                                     i18n::t(lang, "notif_serialize_failed"),
                                     &feed_title,
-                                    &push::escape_html(&format!("{:#}", e)),
+                                    &format!("{:#}", e),
                                     "label_source",
                                     &elink,
                                 );
@@ -1301,7 +1382,7 @@ async fn process_feed(
                                     lang,
                                     i18n::t(lang, "notif_queued"),
                                     &feed_title,
-                                    &push::escape_html(&format!("{:#}", e)),
+                                    &format!("{:#}", e),
                                     "label_source",
                                     &entry_link,
                                 );
@@ -1353,7 +1434,7 @@ async fn process_feed(
                                     lang,
                                     i18n::t(lang, "notif_enqueue_failed"),
                                     &feed_title,
-                                    &push::escape_html(&format!("{:#}", e)),
+                                    &format!("{:#}", e),
                                     "label_source",
                                     &entry_link,
                                 );
@@ -1520,11 +1601,22 @@ async fn maybe_notify_platform_down(bot: &Bot, state: &AppState, platform: &str,
     // Unified format: title + detailed error wrapped in a blockquote.
     // Whether it is folded is decided by the unified rule inside
     // notify_user_html (fold when >200 characters).
-    notify_admins_html(bot, state, |lang| {
+    let delivered = notify_admins_html(bot, state, |lang| {
         i18n::t(lang, "notif_platform_down")
             .replacen("{}", label, 1)
             .replacen("{}", &crate::push::escape_html(err_msg), 1)
-    }).await;
+    })
+    .await;
+    if !delivered {
+        // The health bit was flipped before delivery; without reverting it,
+        // this edge would never fire again and the alert would be lost for
+        // the whole outage. Restore "ok" so the next qualifying round retries.
+        if let Err(e) = db::set_setting(&state.db, &health_key, "ok").await {
+            warn!(platform = platform, error = %e, "failed to restore health bit after undelivered alert");
+        } else {
+            warn!(platform = platform, "platform-down alert undelivered; will retry next round");
+        }
+    }
 }
 
 /// Platform-level health detection (recovery direction): called by
@@ -1616,6 +1708,10 @@ fn outbox_backoff_secs(attempts: i64) -> i64 {
 /// received a turn during a long backlog are retried instead of being silently
 /// abandoned.
 const OUTBOX_ABANDON_SECS: i64 = 72 * 3600;
+/// Hard cap for rows whose attempts counter never advanced (persistent DB
+/// write failures). Without it, `attempts <= 0` made the 72h abandon guard
+/// unreachable and the row was retried every cron tick forever.
+const OUTBOX_UNATTEMPTED_MAX_SECS: i64 = 7 * 24 * 3600;
 
 /// Rows fetched per retry round (every 5 minutes). Raised from 10 to 25 so a
 /// long Telegram outage cannot leave the oldest rows permanently at the back
@@ -1641,6 +1737,71 @@ fn migrated_chat_id_from_error(e: &anyhow::Error) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
+/// Record one send failure for a source. Returns true when the caller must not
+/// enqueue the current entry (the source/chat has just been disabled).
+async fn record_send_failure(
+    bot: &Bot,
+    state: &AppState,
+    sub: &db::SubRow,
+    cfg: &db::EffectiveConfig,
+    lang: Lang,
+    feed_title: &str,
+    err: &anyhow::Error,
+) -> bool {
+    let key = db::setting_key::send_fail(&cfg.chat_id, &cfg.feed_url);
+    let stored = match db::get_setting(&state.db, &key).await {
+        Ok(v) => v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+        Err(e) => {
+            warn!(feed = %cfg.feed_url, error = %e, "send-failure counter read failed");
+            return false;
+        }
+    };
+    let count = stored + 1;
+    if let Err(e) = db::set_setting(&state.db, &key, &count.to_string()).await {
+        warn!(feed = %cfg.feed_url, error = %e, "send-failure counter write failed");
+        return false;
+    }
+    if count < MAX_SEND_FAILURES {
+        return false;
+    }
+
+    let err_str = format!("{:#}", err);
+    // A permanent chat error (bot removed / no rights / chat gone) cannot be
+    // fixed by retrying this source, but disabling the chat row would also
+    // hide it from `/set` and block the owner from inspecting/resuming after
+    // fixing permissions. Disable only this source; a real bot removal is
+    // handled by my_chat_member (which soft-disables the whole chat).
+    let permanent = sendpolicy::is_permanent_chat_error(&err_str);
+    match db::auto_disable_subscription(&state.db, sub.id).await {
+        Ok(true) => {
+            let name = if feed_title.is_empty() { &cfg.feed_url } else { feed_title };
+            let msg = i18n::t(lang, "notif_send_failed_disabled")
+                .replacen("{}", &push::escape_html(name), 1)
+                .replacen("{}", &count.to_string(), 1);
+            notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+            warn!(
+                feed = %cfg.feed_url,
+                failures = count,
+                permanent,
+                error = %err_str,
+                "source auto-disabled after repeated send failures"
+            );
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            warn!(feed = %cfg.feed_url, error = %e, "failed to auto-disable after send failures");
+            false
+        }
+    }
+}
+
+async fn clear_send_failure(state: &AppState, chat_id: &str, feed_url: &str) {
+    if let Err(e) = db::delete_setting(&state.db, &db::setting_key::send_fail(chat_id, feed_url)).await {
+        debug!(feed = %feed_url, error = %e, "failed to clear send-failure counter");
+    }
+}
+
 /// Whether a queue row is past its 72h retry window. The clock starts at the
 /// first actual attempt, not at enqueue time; a row that has never been tried
 /// is never abandoned (it may simply have been behind a long backlog). Legacy
@@ -1656,7 +1817,10 @@ fn outbox_abandon_due(
     now: i64,
 ) -> bool {
     if attempts <= 0 {
-        return false;
+        // A never-attempted row is usually behind a backlog and should not be
+        // abandoned early. But if the attempts update itself keeps failing,
+        // this branch would otherwise be permanent; apply a long hard cap.
+        return now - created_at >= OUTBOX_UNATTEMPTED_MAX_SECS;
     }
     let anchor = first_attempt_at.unwrap_or(created_at);
     now - anchor >= OUTBOX_ABANDON_SECS
@@ -2001,6 +2165,28 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         match result {
             Ok(send_outcome) => {
                 info!(entry_id = %row.entry_id, feed = %row.feed_url, "outbox retry succeeded");
+                clear_send_failure(state, &row.chat_id, &row.feed_url).await;
+                if send_outcome.text_partial {
+                    let chat_title = db::get_chat(&state.db, &row.chat_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|c| c.title.or(c.username))
+                        .unwrap_or_else(|| row.chat_id.clone());
+                    let lang = match db::get_chat_owner(&state.db, &row.chat_id).await {
+                        Ok(Some(owner)) => owner_lang(state, owner).await,
+                        _ => Lang::En,
+                    };
+                    let mut msg = i18n::t(lang, "notif_text_partial")
+                        .replacen("{}", &push::escape_html(&chat_title), 1);
+                    if let Some(tg) = &send_outcome.delivered_tg_link {
+                        push_line(&mut msg, lang, "label_message", tg);
+                    }
+                    if let Some(el) = &send_outcome.entry_link {
+                        push_line(&mut msg, lang, "label_entry", el);
+                    }
+                    notify_owner_html(bot, state, &row.chat_id, &msg).await;
+                }
                 // The retry may deliver the text while its media is
                 // permanently lost (expired/rejected). Surface the same
                 // media_failed notice as the main path; otherwise the owner
@@ -2117,8 +2303,15 @@ mod tests {
     #[test]
     fn outbox_abandon_requires_an_attempt_and_uses_first_attempt() {
         let now = 1_000_000_000;
-        // Never attempted: never abandoned, regardless of age.
-        assert!(!outbox_abandon_due(now - 10 * 24 * 3600, None, 0, now));
+        // Never attempted: held for a long grace period, then hard-capped so a
+        // persistently failing attempts update cannot retry forever.
+        assert!(!outbox_abandon_due(now - 5 * 24 * 3600, None, 0, now));
+        assert!(outbox_abandon_due(
+            now - OUTBOX_UNATTEMPTED_MAX_SECS,
+            None,
+            0,
+            now
+        ));
         // First attempt past 72h, even if retries kept happening since:
         // this is the regression the last_attempt_at anchor missed.
         assert!(outbox_abandon_due(

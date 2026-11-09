@@ -239,18 +239,17 @@ async fn fetch_x_user_with_ct0(
 
 /// Visit x.com with the auth_token cookie to obtain ct0 (CSRF token).
 async fn obtain_ct0(state: &AppState, auth_token: &str) -> anyhow::Result<String> {
-    // Use a client with auto-redirect disabled: when the cookie is invalid
-    // x.com 302-redirects to the login page, and a redirect-following client
-    // ends up with the final page so is_redirection() never fires
-    // (same lesson as Weibo's getIndex; see the comment on the
-    // fetch_client_no_redirect_for_url call inside fetch_weibo_user in weibo.rs).
-    let client = state.media_client_for_url("https://x.com");
-    let resp = client
-        .get("https://x.com")
-        .header("Cookie", format!("auth_token={}", auth_token))
-        .send()
-        .await
-        .context("x.com request failed")?;
+    // Same contract as Weibo's getIndex: zero redirects, so an invalid cookie
+    // surfaces as a 302 to the login page instead of being followed into an
+    // HTML page. api_get also applies the shared literal/SSRF checks.
+    let resp = crate::platforms::api_get(
+        state,
+        "https://x.com",
+        &[("Cookie", format!("auth_token={}", auth_token))],
+        0,
+    )
+    .await
+    .context("x.com request failed")?;
 
     // Extract ct0 from Set-Cookie headers.
     let mut ct0 = String::new();
@@ -270,10 +269,7 @@ async fn obtain_ct0(state: &AppState, auth_token: &str) -> anyhow::Result<String
         // such response wrongly notified the admin and counted toward
         // auto-disable).
         let status = resp.status();
-        if status.is_redirection()
-            || status == reqwest::StatusCode::UNAUTHORIZED
-            || resp.url().path().contains("/i/flow/login")
-        {
+        if status.is_redirection() || status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(crate::platforms::auth_expired(
                 "X",
                 format!("ct0 missing (HTTP {})", status),
@@ -353,6 +349,10 @@ const QUERY_ID_TTL: Duration = Duration::from_secs(6 * 3600);
 /// call (up to 4 per feed per round) retry the document request and burn its
 /// 30s client timeout on the serial platform channel.
 const QUERY_ID_NEGATIVE_TTL: Duration = Duration::from_secs(300);
+/// Minimum spacing between forced query-ID document downloads. A persistent
+/// 404 that is not caused by a stale ID would otherwise re-download the
+/// document for every op, on every feed, every round.
+const QUERY_ID_FORCE_MIN_INTERVAL: Duration = Duration::from_secs(300);
 
 const OP_USER_BY_SCREEN_NAME: &str = "UserByScreenName";
 const OP_USER_TWEETS: &str = "UserTweets";
@@ -361,6 +361,7 @@ struct QueryIdCache {
     ids: HashMap<String, String>,
     fetched_at: Option<Instant>,
     last_failure: Option<Instant>,
+    last_forced: Option<Instant>,
 }
 
 static QUERY_IDS: OnceLock<Mutex<QueryIdCache>> = OnceLock::new();
@@ -371,6 +372,7 @@ fn query_id_cache() -> &'static Mutex<QueryIdCache> {
             ids: HashMap::new(),
             fetched_at: None,
             last_failure: None,
+            last_forced: None,
         })
     })
 }
@@ -394,7 +396,7 @@ async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
     // cache) — retrying the document on every GraphQL call would amplify an
     // outage into multi-second stalls on the serial platform channel.
     {
-        let cache = query_id_cache().lock().await;
+        let mut cache = query_id_cache().lock().await;
         if !force {
             if cache.last_failure.is_some_and(|t| t.elapsed() < QUERY_ID_NEGATIVE_TTL) {
                 return cache
@@ -410,6 +412,21 @@ async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
                     }
                 }
             }
+        } else {
+            // Throttle forced refreshes: a 404 that is not a stale ID (e.g.
+            // protected content) would otherwise download the document for
+            // every op/feed/round on the serial platform channel.
+            if cache
+                .last_forced
+                .is_some_and(|t| t.elapsed() < QUERY_ID_FORCE_MIN_INTERVAL)
+            {
+                return cache
+                    .ids
+                    .get(op)
+                    .cloned()
+                    .unwrap_or_else(|| fallback_query_id(op).to_string());
+            }
+            cache.last_forced = Some(Instant::now());
         }
     }
 
@@ -514,6 +531,17 @@ impl std::fmt::Display for StaleCt0Error {
 }
 impl std::error::Error for StaleCt0Error {}
 
+/// Whether a 403 body carries the CSRF/ct0 signature. X's GraphQL uses error
+/// code 353 ("requires a matching csrf cookie and header"); some endpoints
+/// also mention ct0 directly.
+fn is_stale_ct0_response(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("csrf")
+        || lower.contains("ct0")
+        || lower.contains("\"code\":353")
+        || lower.contains("\"code\": 353")
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
@@ -593,10 +621,22 @@ async fn gql_request_once(
         return Err(crate::platforms::auth_expired("X", "HTTP 401"));
     }
     if status == reqwest::StatusCode::FORBIDDEN {
-        // 403 may be an expired cached ct0 (rather than a dead cookie): throw
-        // the marker so the caller clears the cache, re-fetches ct0 and retries
-        // once; only a second 403 means the cookie is dead.
-        return Err(anyhow::Error::new(StaleCt0Error));
+        // Only a CSRF/ct0-shaped 403 is a stale-token signal. Protected or
+        // restricted content also returns 403; treating every one as a dead
+        // cookie refreshed ct0 and then raised a global "cookie expired"
+        // alert, disabling unrelated feeds. Read the small error body and
+        // fall through to a source-level error otherwise.
+        let body = crate::fetcher::read_body_capped(resp, "X API 403 body")
+            .await
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&body);
+        if is_stale_ct0_response(&text) {
+            return Err(anyhow::Error::new(StaleCt0Error));
+        }
+        anyhow::bail!(
+            "X API forbidden (HTTP 403, not a ct0/cookie problem): {}",
+            text.chars().take(200).collect::<String>()
+        );
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(crate::platforms::rate_limited("X", status.as_u16()));
@@ -613,11 +653,22 @@ async fn gql_request_once(
 
     let json: Value = crate::fetcher::read_json_capped(resp, "X API").await?;
 
-    // GraphQL errors can come with HTTP 200.
+    // GraphQL errors can come with HTTP 200. X also returns partial data
+    // alongside per-entry errors (e.g. one protected tweet); discarding the
+    // whole response loses the rest of the timeline. Only fail when there is
+    // no usable `data`.
     if let Some(errors) = json.get("errors").filter(|e| e.is_array()) {
-        if let Some(msg) = errors.as_array().and_then(|a| a.first()) {
-            let message = msg["message"].as_str().unwrap_or("unknown");
-            anyhow::bail!("X GraphQL error: {}", message);
+        let has_data = json.get("data").is_some_and(|d| !d.is_null());
+        if !has_data {
+            if let Some(msg) = errors.as_array().and_then(|a| a.first()) {
+                let message = msg["message"].as_str().unwrap_or("unknown");
+                anyhow::bail!("X GraphQL error: {}", message);
+            }
+        } else if let Some(msg) = errors.as_array().and_then(|a| a.first()) {
+            tracing::warn!(
+                error = msg["message"].as_str().unwrap_or("unknown"),
+                "X GraphQL returned partial data with errors; continuing"
+            );
         }
     }
     Ok(json)
@@ -1640,6 +1691,18 @@ fn parse_twitter_time(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forbidden_body_classification() {
+        assert!(is_stale_ct0_response(
+            r#"{"errors":[{"code":353,"message":"This request requires a matching csrf cookie and header."}]}"#
+        ));
+        assert!(is_stale_ct0_response("ct0 is invalid"));
+        assert!(!is_stale_ct0_response(
+            "This account is protected and you are not authorized to view it"
+        ));
+        assert!(!is_stale_ct0_response(""));
+    }
 
     #[test]
     fn parse_screen_name_valid() {

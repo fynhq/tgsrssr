@@ -8,7 +8,7 @@ use teloxide::types::{
 use crate::db::{self, Db};
 use crate::fetcher;
 use crate::i18n::Lang;
-use crate::htmltext::{merge_adjacent_blockquotes, split_html, strip_html_tags};
+use crate::htmltext::{merge_adjacent_blockquotes, split_html};
 use crate::media::{MediaItem, MediaKind};
 use crate::richmsg::{self, RichMedia, RichMediaKind, RichMediaSource};
 use crate::sendpolicy::{
@@ -116,6 +116,10 @@ pub struct SendOutcome {
     /// Callers must mark the entry sent and notify the owner instead of
     /// falling back or queueing an outbox retry (A1 policy).
     pub uncertain: bool,
+    /// The first text chunk was delivered but a later chunk failed. The entry
+    /// is marked sent and never sent to the outbox (a retry would replay the
+    /// delivered prefix); the owner is told that the tail is missing.
+    pub text_partial: bool,
 }
 
 /// Extract Weibo poll data from EntryMeta (group-C sidecar explicit protocol,
@@ -332,9 +336,12 @@ pub async fn send_text_only(
             }
         }
     }
-    let m = match rich_msg {
-        Some(m) => m,
-        None => send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await?,
+    let (m, text_partial) = match rich_msg {
+        Some(m) => (m, false),
+        None => {
+            let sent = send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await?;
+            (sent.first, sent.partial)
+        }
     };
     let poll_failed = try_send_poll(bot, chat_id, Some(m.id), meta).await;
     Ok(SendOutcome {
@@ -344,6 +351,7 @@ pub async fn send_text_only(
         delivered_message_id: Some(m.id.0 as i64),
         text_only: true,
         uncertain: false,
+        text_partial,
     })
 }
 
@@ -1055,6 +1063,7 @@ pub async fn send_entry_with_media(
                 let mut fallback_msg_id: Option<teloxide::types::MessageId> =
                     delivered.as_ref().map(|m| m.id);
                 let mut text_delivered = false;
+                let mut text_partial = false;
                 if sent > 0 {
                     // The first op (which carries the caption) was delivered
                     // before the failure. Re-sending the full title+body would
@@ -1074,10 +1083,12 @@ pub async fn send_entry_with_media(
                     }
                 } else if let Some((body, footer)) = format_entry_parts(entry, feed_title, author, opts, meta) {
                     match send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await {
-                        Ok(m) => {
+                        Ok(sent) => {
+                            let m = sent.first;
                             delivered_tg_link = tg_message_link(&m);
                             fallback_msg_id = Some(m.id);
                             text_delivered = true;
+                            text_partial = sent.partial;
                         }
                         Err(te) => {
                             // Text fallback also failed: the entry was not
@@ -1143,6 +1154,7 @@ pub async fn send_entry_with_media(
                     // sent == 0: the full text fallback carries the entry.
                     text_only: sent == 0,
                     uncertain: false,
+                    text_partial,
                 });
             }
         }
@@ -1298,20 +1310,6 @@ pub async fn send_entry_with_media(
         }
     }
 
-    // Weibo poll: after the body is delivered, convert the poll data into a
-    // native Telegram poll and send it.
-    // A poll failure does not affect entry completeness (the body is already
-    // delivered); it only sets media_failed to notify the owner.
-    {
-        let poll_reply_to = anchor
-            .as_ref()
-            .or(first_doc_msg.as_ref())
-            .map(|m| m.id);
-        if try_send_poll(bot, chat_id, poll_reply_to, meta).await {
-            media_failed = true;
-        }
-    }
-
     // P1-1 fix (v1.10.21): the first caption chunk is attached to the first
     // carrier (document/retweet images). If all carriers fail (both anchor
     // and first_doc_msg are None), the first 1024 characters of the body
@@ -1335,6 +1333,18 @@ pub async fn send_entry_with_media(
         ));
     }
 
+    // Weibo poll: after body completeness is established, convert the poll
+    // data into a native Telegram poll. Sending it before the carrier check
+    // meant "all documents failed -> return Err" retried the poll on every
+    // outbox backoff (polls cannot be recalled).
+    let poll_reply_to = anchor
+        .as_ref()
+        .or(first_doc_msg.as_ref())
+        .map(|m| m.id);
+    if try_send_poll(bot, chat_id, poll_reply_to, meta).await {
+        media_failed = true;
+    }
+
     let delivered_tg_link = anchor
         .as_ref()
         .and_then(tg_message_link)
@@ -1351,6 +1361,7 @@ pub async fn send_entry_with_media(
         delivered_message_id,
         text_only: false,
         uncertain: false,
+        text_partial: false,
     })
 }
 
@@ -1391,10 +1402,10 @@ fn build_rich_ops<'a>(
     pool.extend_from_slice(videos);
     pool.extend_from_slice(photos);
 
-    // chunks(10) never yields an empty slice, so len is always ≥1.
+    // ALBUM_LIMIT never yields an empty slice, so len is always ≥1.
     // A single item cannot form an album (sendMediaGroup requires 2–10), so
     // dispatch it to the dedicated single-media op by kind.
-    for chunk in pool.chunks(10) {
+    for chunk in pool.chunks(ALBUM_LIMIT) {
         if chunk.len() == 1 {
             if chunk[0].kind == MediaKind::Video {
                 ops.push(RichOp::Video(chunk[0]));
@@ -1448,8 +1459,7 @@ async fn send_doc_group(
     let mut all_msgs: Vec<Message> = Vec::new();
     let mut first_msg_id: Option<teloxide::types::MessageId> = None;
 
-    for (gi, chunk) in docs.chunks(10).enumerate() {
-        pace(chat_id).await;
+    for (gi, chunk) in docs.chunks(ALBUM_LIMIT).enumerate() {
         // The caption goes only on the first document of the first group;
         // follow-up groups carry no caption
         let group_caption = if gi == 0 { caption } else { "" };
@@ -1459,6 +1469,7 @@ async fn send_doc_group(
 
         // sendMediaGroup requires 2-10 items; a trailing single document
         // (11/21/31 docs) must go through sendDocument instead of a group.
+        // send_doc_msg does its own pacing, so do not pace twice here.
         if chunk.len() == 1 {
             let m = send_doc_msg(bot, db, chat_id, chunk[0], group_caption, reply_msg_id)
                 .await
@@ -1470,6 +1481,7 @@ async fn send_doc_group(
             continue;
         }
 
+        pace(chat_id).await;
         let keys: Vec<String> = chunk
             .iter()
             .map(|d| format!("{}:doc", d.content_hash))
@@ -1972,20 +1984,32 @@ async fn build_group_inputs(
     Ok(group)
 }
 
+/// Result of sending one entry's text chunks.
+pub struct TextSendOutcome {
+    /// The first delivered message (anchor / /find registration).
+    pub first: Message,
+    /// True when the first chunk was delivered but a later chunk failed. The
+    /// caller must not queue the entry for an outbox retry (that would replay
+    /// the delivered prefix); it marks the entry sent and warns the owner.
+    pub partial: bool,
+}
+
 /// Send an entry and return the FIRST sent message (used to build the
 /// Telegram message link for owner failure notices).
 /// When split into multiple messages, each subsequent message replies to the
 /// previous one for easy navigation. The footer is placed on the last message.
 ///
-/// Chunk-level retry is bounded within this call. A whole-entry outbox retry
-/// re-runs this function from chunk zero; chunk progress is not persisted.
+/// Chunk-level retry is bounded within this call. If a later chunk still
+/// fails after the first chunk was delivered, the function returns
+/// `partial = true` instead of an error: a whole-entry outbox retry would
+/// re-send the already delivered chunks every backoff until the 72h abandon.
 pub async fn send_entry_msg(
     bot: &Bot,
     chat_id: i64,
     html_text: &str,
     footer: &str,
     link_preview: bool,
-) -> anyhow::Result<Message> {
+) -> anyhow::Result<TextSendOutcome> {
     let (footer, chunks) = plan_text_chunks(html_text, footer);
     if chunks.is_empty() {
         anyhow::bail!("refusing to send an empty text message");
@@ -2006,13 +2030,32 @@ pub async fn send_entry_msg(
         let reply_to = first_msg.as_ref().map(|m| m.id);
         // Chunk-level bounded backoff retry: on failure only the current
         // chunk is re-sent.
-        let m = send_chunk_with_retry(bot, chat_id, &text, lp, reply_to).await?;
-        if first_msg.is_none() {
-            first_msg = Some(m.clone());
+        match send_chunk_with_retry(bot, chat_id, &text, lp, reply_to).await {
+            Ok(m) => {
+                if first_msg.is_none() {
+                    first_msg = Some(m);
+                }
+            }
+            Err(e) => {
+                if let Some(first) = first_msg {
+                    tracing::warn!(
+                        chat_id = chat_id,
+                        failed_chunk = i,
+                        total_chunks = chunks.len(),
+                        error = %e,
+                        "text chunk failed after an earlier chunk was delivered; not retrying the whole entry"
+                    );
+                    return Ok(TextSendOutcome { first, partial: true });
+                }
+                return Err(e);
+            }
         }
         // Pacing between chunks is handled by send_single_html's pace().
     }
-    Ok(first_msg.expect("at least one chunk"))
+    Ok(TextSendOutcome {
+        first: first_msg.expect("at least one chunk"),
+        partial: false,
+    })
 }
 
 /// Send a single HTML message (must already fit within Telegram's limit).
@@ -2067,7 +2110,7 @@ async fn send_single_html(
                             html_head = %html_text.chars().take(100).collect::<String>(),
                             "HTML parse failed, falling back to plain text"
                         );
-                        plain_text = Some(strip_html_tags(&html_text));
+                        plain_text = Some(crate::htmltext::strip_html_keep_links(&html_text));
                         continue;
                     }
                     _ => return Err(e.into()),

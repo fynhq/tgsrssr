@@ -312,6 +312,13 @@ pub async fn cleanup_logs(config: &Config) -> anyhow::Result<u64> {
             Err(_) => continue, // A single failure does not abort the whole round
         };
         if meta.is_file() {
+            // Never delete arbitrary files that happen to sit in LOG_DIR: a
+            // misconfigured LOG_DIR pointing at the data directory would
+            // otherwise remove the DB or backups.
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with("rss-bot.log") {
+                continue;
+            }
             if let Ok(modified) = meta.modified() {
                 if now.duration_since(modified).unwrap_or_default() > ttl {
                     let size = meta.len();

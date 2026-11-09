@@ -351,6 +351,17 @@ impl AppState {
                 anyhow::bail!("blocked: private/loopback address: {}", url)
             }
             crate::ssrf::SsrfOutcome::LookupFailed if via_proxy => {
+                // The proxy resolves the name; a local NXDOMAIN can actually
+                // mean an internal-only name that the proxy can reach. Deny
+                // the common internal/metadata shapes explicitly instead of
+                // handling every unresolved host to the proxy.
+                let host = url::Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+                    .unwrap_or_default();
+                if crate::ssrf::proxy_host_denied(&host) {
+                    anyhow::bail!("blocked: internal-looking host via proxy: {}", host)
+                }
                 tracing::warn!(
                     url = %url,
                     kind = kind,
@@ -387,7 +398,7 @@ impl AppState {
                 .ok()
                 .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
                 .unwrap_or_default();
-            if crate::config::host_in_list(&host, &self.config.rss_insecure_hosts) {
+            if crate::config::host_matches_exact(&host, &self.config.rss_insecure_hosts) {
                 return (&self.media_trusted_insecure, false);
             }
             return (&self.media_trusted, false);
@@ -445,7 +456,7 @@ impl AppState {
         // The insecure client is built with the proxy whenever RSS_PROXY is
         // set (even for a host also listed in RSS_NO_PROXY), so via_proxy
         // follows that construction.
-        if crate::config::host_in_list(&host, &self.config.rss_insecure_hosts) {
+        if crate::config::host_matches_exact(&host, &self.config.rss_insecure_hosts) {
             return (RouteKind::Insecure, self.config.rss_proxy.is_some());
         }
 

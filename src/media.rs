@@ -551,6 +551,7 @@ async fn upgrade_weibo_video_hd(
         state,
         &api,
         false,
+        None,
         "weibo",
         5,
         |client, cur_url, hop| {
@@ -657,6 +658,7 @@ async fn fetch_visitor_cookie(state: &AppState) -> Option<String> {
         state,
         gen_url,
         false,
+        None,
         "weibo",
         5,
         |client, cur_url, _hop| {
@@ -701,6 +703,7 @@ async fn fetch_visitor_cookie(state: &AppState) -> Option<String> {
         state,
         &incarnate_url,
         false,
+        None,
         "weibo",
         5,
         |client, cur_url, _hop| client.get(cur_url).header("Referer", "https://weibo.com/"),
@@ -1001,6 +1004,7 @@ async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -
         state,
         &api,
         false,
+        None,
         "weibo",
         5,
         |client, cur_url, hop| {
@@ -1347,11 +1351,13 @@ pub fn extract_video_posters(entry: &Entry) -> Vec<(String, String)> {
 /// regular image, avoiding a plain-text entry (#5 fix).
 /// Used when a video exceeds the limit or fails to download. On failure it
 /// returns silently (the entry stays plain text).
+#[allow(clippy::too_many_arguments)]
 async fn download_cover_fallback(
     state: &AppState,
     poster_map: &std::collections::HashMap<String, String>,
     raw_url: &str,
     outbound: &std::path::Path,
+    feed_url: &str,
     allow_trusted_private: bool,
     max_bytes: u64,
     out: &mut PreparedMedia,
@@ -1371,6 +1377,7 @@ async fn download_cover_fallback(
         "image/unknown",
         outbound,
         allow_trusted_private,
+        Some(feed_url),
         max_bytes,
     )
     .await
@@ -1415,12 +1422,14 @@ async fn download_cover_fallback(
 /// suffix-free GIF is dropped after download and the loop moves on. Failure
 /// of the first real candidate still counts as a warning (visible to the
 /// owner) and falls through to the next candidate.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_entry_media(
     state: &AppState,
     entry: &Entry,
     transport: &MediaTransport,
     meta: Option<&crate::entrymeta::EntryMeta>,
     lang: crate::i18n::Lang,
+    feed_url: &str,
     single_media: bool,
     allow_trusted_private: bool,
 ) -> PreparedMedia {
@@ -1503,14 +1512,14 @@ pub async fn prepare_entry_media(
         // (previously the relay/direct result handling was duplicated
         // verbatim and the cover-fallback call was copied in 4 places —
         // high risk of fixing one and missing another).
-        let (result, relay_err) = match download_one(state, &url, &kind, &mime, &outbound, allow_trusted_private, download_cap).await {
+        let (result, relay_err) = match download_one(state, &url, &kind, &mime, &outbound, allow_trusted_private, Some(feed_url), download_cap).await {
             // A relay 200 with an empty body is a relay failure, not evidence
             // that the origin has no media. The direct URL may still work;
             // previously only Err triggered the fallback and the media was
             // dropped with a misleading "empty response" warning.
             Ok(DownloadOutcome::Empty) if via_relay => {
                 warn!(relay_url = %url, direct_url = %direct_url, "relay returned an empty response, retrying direct");
-                let r = download_one(state, &direct_url, &kind, &mime, &outbound, allow_trusted_private, download_cap).await;
+                let r = download_one(state, &direct_url, &kind, &mime, &outbound, allow_trusted_private, Some(feed_url), download_cap).await;
                 (r, Some("relay returned an empty response".to_string()))
             }
             Err(e) if via_relay => {
@@ -1524,7 +1533,7 @@ pub async fn prepare_entry_media(
                 // root cause (Worker 502 / connect / SOCKS layer) is visible,
                 // not just the outer "error sending request for url (...)" wrapper.
                 warn!(relay_url = %url, direct_url = %direct_url, error = format!("{:#}", e), "relay download failed, retrying direct");
-                let r = download_one(state, &direct_url, &kind, &mime, &outbound, allow_trusted_private, download_cap).await;
+                let r = download_one(state, &direct_url, &kind, &mime, &outbound, allow_trusted_private, Some(feed_url), download_cap).await;
                 (r, Some(format!("{:#}", e)))
             }
             other => (other, None),
@@ -1625,6 +1634,7 @@ pub async fn prepare_entry_media(
                 &poster_map,
                 &raw_url,
                 &outbound,
+                feed_url,
                 allow_trusted_private,
                 cover_cap,
                 &mut out,
@@ -1702,7 +1712,17 @@ pub async fn prepare_entry_media(
             // sendDocument (AVIF/SVG/HEIC/TIFF) both need a preview thumbnail.
             // The old condition only looked at dimensions, leaving
             // format-converted documents without one.
-            item.thumb_path = make_image_thumb(&item.path, allow_thumb).await;
+            if !thumb_pixels_allowed(item.width, item.height) {
+                warn!(
+                    path = %item.path.display(),
+                    width = item.width,
+                    height = item.height,
+                    "image too large for a safe thumbnail decode; sending document without preview"
+                );
+                item.thumb_path = None;
+            } else {
+                item.thumb_path = make_image_thumb(&item.path, allow_thumb).await;
+            }
         }
     }
     if let Some(reservation) = thumb_reservation.as_mut() {
@@ -1719,6 +1739,7 @@ pub async fn prepare_entry_media(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_one(
     state: &AppState,
     url: &str,
@@ -1726,6 +1747,7 @@ async fn download_one(
     mime: &str,
     outbound: &std::path::Path,
     allow_trusted_private: bool,
+    trusted_origin: Option<&str>,
     download_cap: u64,
 ) -> anyhow::Result<DownloadOutcome> {
     // Per-host concurrency limit: prevents opening too many connections to a
@@ -1779,6 +1801,7 @@ async fn download_one(
                 state,
                 url,
                 allow_trusted_private,
+                trusted_origin,
                 "media",
                 MAX_REDIRECTS,
                 |client, cur_url, _hop| {
@@ -2015,6 +2038,21 @@ pub fn photo_format_compatible(path: &std::path::Path) -> bool {
 /// are converted to sendDocument to preserve the original. Large images with
 /// normal aspect ratios (16:9 etc.) are usually acceptable after compression
 /// and still go through sendPhoto.
+/// Hard ceiling for generating a local thumbnail. A compressed 30000×30000
+/// PNG can be a few hundred KB yet force ffmpeg to allocate multiple GB while
+/// decoding; the 30s timeout does not protect against an OOM kill. Images above
+/// this are still sent as documents, just without a preview.
+pub const MAX_THUMB_PIXELS: u64 = 40_000_000;
+
+/// Whether a decoded image is small enough to hand to ffmpeg for a thumbnail.
+/// Unknown dimensions (0) are rejected: imagesize could not parse the header,
+/// so the decoder's memory use is unpredictable.
+pub fn thumb_pixels_allowed(width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && (width as u64).saturating_mul(height as u64) <= MAX_THUMB_PIXELS
+}
+
 pub fn image_goes_to_doc(size: u64, width: u32, height: u32, aspect_threshold: f64) -> bool {
     if size > MAX_PHOTO_BYTES {
         return true;
@@ -2040,21 +2078,43 @@ pub fn image_goes_to_doc(size: u64, width: u32, height: u32, aspect_threshold: f
     false
 }
 
-/// Run ffmpeg/ffprobe with a timeout: malformed files can hang the process
-/// and block the push pipeline indefinitely.
-/// kill_on_drop guarantees the child process is killed when the future is
-/// dropped on timeout; timeout/failure returns None, and the caller already
-/// has silent-degradation logic (a missing thumbnail does not affect media
-/// sending).
-/// Failure/timeout leaves a warn — if ffmpeg inside the container is broken
-/// or missing, all videos would silently have no preview, so the logs must
-/// not be trace-free.
-async fn run_tool_with_timeout(tool: &str, mut cmd: tokio::process::Command) -> Option<std::process::Output> {
+/// Feed attacker-controlled bytes to ffmpeg/ffprobe through stdin with the
+/// file protocol disabled. This prevents a crafted container (e.g. a MOV with
+/// external data references) from opening arbitrary local paths while the
+/// process is only supposed to read the downloaded media.
+async fn run_tool_with_stdin_timeout(
+    tool: &str,
+    mut cmd: tokio::process::Command,
+    input: &Path,
+) -> Option<std::process::Output> {
     cmd.kill_on_drop(true);
-    match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(tool = tool, error = %e, "media tool spawn failed (missing binary?)");
+            return None;
+        }
+    };
+    let mut stdin = child.stdin.take()?;
+    let input = input.to_path_buf();
+    let writer = tokio::spawn(async move {
+        let mut file = tokio::fs::File::open(&input).await?;
+        tokio::io::copy(&mut file, &mut stdin).await?;
+        Ok::<(), std::io::Error>(())
+    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        child.wait_with_output(),
+    )
+    .await;
+    let _ = writer.await;
+    match result {
         Ok(Ok(o)) => Some(o),
         Ok(Err(e)) => {
-            tracing::warn!(tool = tool, error = %e, "media tool spawn failed (missing binary?)");
+            tracing::warn!(tool = tool, error = %e, "media tool wait failed");
             None
         }
         Err(_) => {
@@ -2082,7 +2142,12 @@ fn stored_thumb_path(path: &Path) -> PathBuf {
 /// storage suffix instead of a `.jpg` extension. `ss` is the start second
 /// (None = no seek). Returns true on success when the output is non-empty and
 /// under the 200KB thumbnail limit (with a small margin).
-async fn grab_thumb(path: &std::path::Path, ss: Option<&str>, thumb: &std::path::Path) -> bool {
+async fn grab_thumb(
+    path: &std::path::Path,
+    ss: Option<&str>,
+    thumb: &std::path::Path,
+    input_format: &str,
+) -> bool {
     // Telegram: thumbnail must be JPEG, <= 200 KB, width and height <= 320.
     const MAX_THUMB_BYTES: u64 = 190 * 1024;
     // Fit-inside-box first; if the encoder still overshoots the byte limit,
@@ -2094,21 +2159,23 @@ async fn grab_thumb(path: &std::path::Path, ss: Option<&str>, thumb: &std::path:
     for (scale, quality) in ATTEMPTS {
         let mut cmd = tokio::process::Command::new("ffmpeg");
         cmd.arg("-y")
-            // Input is attacker-controlled bytes: keep ffmpeg from opening
-            // network protocols or reading stdin. `file,pipe` still permits
-            // the local file we pass with `-i` (and stdio), but blocks the
-            // HLS/concat remote-URI path that bypasses the SSRF guard.
+            // Input is attacker-controlled bytes: the file protocol is
+            // disabled entirely and the demuxer is pinned to the sniffed
+            // format. A crafted MOV/MP4 with external dref entries therefore
+            // cannot read arbitrary local files, and HLS/concat remote URIs
+            // have no protocol to use.
             .args(["-nostdin", "-v", "error"])
-            .args(["-protocol_whitelist", "file,pipe"]);
+            .args(["-protocol_whitelist", "pipe"])
+            .args(["-f", input_format]);
         if let Some(s) = ss {
             cmd.args(["-ss", s]);
         }
         cmd.arg("-i")
-            .arg(path)
+            .arg("pipe:0")
             .args(["-frames:v", "1", "-q:v", quality, "-vf", scale])
             .args(["-f", "image2", "-c:v", "mjpeg"])
             .arg(thumb);
-        let ok = run_tool_with_timeout("ffmpeg", cmd)
+        let ok = run_tool_with_stdin_timeout("ffmpeg", cmd, path)
             .await
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -2133,7 +2200,7 @@ async fn make_image_thumb(path: &std::path::Path, allow_thumb: bool) -> Option<P
         return None;
     }
     let thumb = stored_thumb_path(path);
-    if grab_thumb(path, None, &thumb).await {
+    if grab_thumb(path, None, &thumb, "image2pipe").await {
         Some(thumb)
     } else {
         None
@@ -2145,14 +2212,20 @@ async fn make_image_thumb(path: &std::path::Path, allow_thumb: bool) -> Option<P
 /// If either step fails, silently degrade to None — the video is sent as
 /// usual, just without a preview (same behavior as before this change).
 async fn probe_video_meta(path: &std::path::Path, allow_thumb: bool) -> (Option<PathBuf>, Option<u32>) {
+    // The demuxer is pinned to the sniffed container and input comes through
+    // stdin, so ffmpeg/ffprobe never gets the `file` protocol.
+    let Some(input_format) = sniff_video_container(path) else {
+        return (None, None);
+    };
     // Duration
     let mut probe_cmd = tokio::process::Command::new("ffprobe");
     probe_cmd
         .args(["-v", "error"])
-        .args(["-protocol_whitelist", "file,pipe"])
+        .args(["-protocol_whitelist", "pipe"])
+        .args(["-f", input_format])
         .args(["-show_entries", "format=duration", "-of", "csv=p=0"])
-        .arg(path);
-    let duration_secs = run_tool_with_timeout("ffprobe", probe_cmd)
+        .arg("pipe:0");
+    let duration_secs = run_tool_with_stdin_timeout("ffprobe", probe_cmd, path)
         .await
         .filter(|o| o.status.success())
         .and_then(|o| {
@@ -2172,7 +2245,7 @@ async fn probe_video_meta(path: &std::path::Path, allow_thumb: bool) -> (Option<
     let thumb = stored_thumb_path(path);
     let mut made = false;
     for ss in ["1", "0"] {
-        if grab_thumb(path, Some(ss), &thumb).await {
+        if grab_thumb(path, Some(ss), &thumb, input_format).await {
             made = true;
             break;
         }
@@ -2414,6 +2487,16 @@ mod tests {
     }
 
     // ── image_goes_to_doc classification tests ──
+
+    #[test]
+    fn thumbnail_decode_is_bounded_by_pixel_count() {
+        assert!(thumb_pixels_allowed(4000, 3000));
+        assert!(thumb_pixels_allowed(8000, 5000)); // 40 MP exactly
+        assert!(!thumb_pixels_allowed(8001, 5000));
+        assert!(!thumb_pixels_allowed(30000, 30000));
+        // imagesize failed: unknown dimensions must never reach ffmpeg.
+        assert!(!thumb_pixels_allowed(0, 0));
+    }
 
     #[test]
     fn goes_to_doc_oversized_file() {

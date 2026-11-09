@@ -18,6 +18,26 @@ static RE_ANCHOR_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| {
 });
 static RE_ANCHOR_CLOSE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)^</a\s*>").unwrap());
+static RE_HREF_VALUE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?i)\bhref\s*=\s*["']([^"']+)["']"#).unwrap()
+});
+
+/// Protocols Telegram can safely render as a clickable link. Scheme-less and
+/// `javascript:` / `data:` hrefs are dropped by the caller (text is kept).
+pub fn is_safe_href(href: &str) -> bool {
+    let lower = href.trim().to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("tg://")
+        || lower.starts_with("mailto:")
+}
+
+fn anchor_href(tag: &str) -> Option<&str> {
+    RE_HREF_VALUE
+        .captures(tag)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str())
+}
 /// HTML entity reference anchored at the start of a slice.
 static RE_ENTITY_REF: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"^&(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#[1-9][0-9]{0,6}|#[xX][0-9a-fA-F]{1,6});").unwrap()
@@ -164,7 +184,10 @@ pub fn truncate_html_keep_links(html: &str, max_visible: usize) -> (String, bool
                     // Orphan close (or buffered empty anchor): drop it and
                     // the buffered open.
                     pending_open = None;
-                } else if RE_ANCHOR_OPEN.is_match(tag) && !in_link {
+                } else if RE_ANCHOR_OPEN.is_match(tag)
+                    && !in_link
+                    && anchor_href(tag).is_some_and(is_safe_href)
+                {
                     // Replace any still-buffered empty anchor with this one.
                     pending_open = Some(tag.to_string());
                 } else {
@@ -399,6 +422,19 @@ pub fn decode_entities(s: &str) -> String {
 /// entities are decoded uniformly).
 pub fn strip_html_tags(s: &str) -> String {
     decode_entities(&RE_TAG.replace_all(s, ""))
+}
+
+/// Plain-text degradation that keeps anchor destinations as visible URLs.
+/// Used by the HTML-parse fallback so links are not silently lost.
+pub fn strip_html_keep_links(s: &str) -> String {
+    static RE_ANCHOR_ANY: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>"#).unwrap()
+    });
+    static RE_ANCHOR_CLOSE_ANY: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?i)</a\s*>").unwrap());
+    let s = RE_ANCHOR_ANY.replace_all(s, "$1 ");
+    let s = RE_ANCHOR_CLOSE_ANY.replace_all(&s, "");
+    decode_entities(&RE_TAG.replace_all(&s, ""))
 }
 
 /// Decode HTML entities in URLs extracted from HTML attributes.
@@ -831,6 +867,14 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
         chunks.push(current);
     }
     rebalance_chunks(&mut chunks);
+    // Final safety net: upstream feeds can contain an unclosed
+    // <blockquote>/<a> or an orphan close tag. rebalance_chunks handles the
+    // chunk seam, but the last chunk has no following chunk to re-open into;
+    // Telegram would reject it with "can't find end tag" and the whole entry
+    // would go to outbox. Drop orphan closers and append missing closers.
+    for chunk in &mut chunks {
+        *chunk = balance_html_tags(chunk);
+    }
     // Tags-only fragments (e.g. an image-only blockquote whose image was
     // stripped upstream) have zero visible text. Telegram rejects an empty
     // message, and a failed chunk would send the whole entry to outbox, so
@@ -838,6 +882,50 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
     // tags that need to continue).
     chunks.retain(|c| visible_len(c) > 0);
     chunks
+}
+
+/// Close unmatched open tags and drop orphan closing tags. This is a
+/// last-resort sanitizer for malformed feed HTML; it does not try to repair
+/// nesting beyond closing the current stack.
+pub fn balance_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut stack: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < html.len() {
+        let rest = &html[i..];
+        if rest.starts_with('<') {
+            if let Some(gt) = rest.find('>') {
+                let tag = &rest[..gt + 1];
+                if let Some(name) = tag_name(tag) {
+                    if tag.starts_with("</") {
+                        if stack.last().is_some_and(|open| open == &name) {
+                            stack.pop();
+                            out.push_str(tag);
+                        }
+                        // Orphan close: drop it.
+                    } else {
+                        out.push_str(tag);
+                        if !VOID_TAGS.contains(&name.as_str()) && !tag.ends_with("/>") {
+                            stack.push(name);
+                        }
+                    }
+                } else {
+                    out.push_str(tag);
+                }
+                i += gt + 1;
+                continue;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    for name in stack.iter().rev() {
+        out.push_str("</");
+        out.push_str(name);
+        out.push('>');
+    }
+    out
 }
 
 /// Close tags left open at the end of each chunk and re-open them at the
@@ -1267,6 +1355,38 @@ pub fn merge_adjacent_blockquotes(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balance_html_tags_closes_unclosed_and_drops_orphans() {
+        assert_eq!(
+            balance_html_tags("<blockquote>hello"),
+            "<blockquote>hello</blockquote>"
+        );
+        assert_eq!(balance_html_tags("hello</blockquote>"), "hello");
+        assert_eq!(
+            balance_html_tags("<a href=\"https://x\">text</a>"),
+            "<a href=\"https://x\">text</a>"
+        );
+    }
+
+    #[test]
+    fn plain_fallback_keeps_anchor_destinations() {
+        assert_eq!(
+            strip_html_keep_links(r#"before <a href="https://example.com/a?x=1&amp;y=2">link</a> after"#),
+            "before https://example.com/a?x=1&y=2 link after"
+        );
+    }
+
+    #[test]
+    fn safe_href_allows_only_telegram_renderable_schemes() {
+        assert!(is_safe_href("https://example.com/a"));
+        assert!(is_safe_href("http://example.com/a"));
+        assert!(is_safe_href("tg://resolve?domain=x"));
+        assert!(is_safe_href("mailto:a@example.com"));
+        assert!(!is_safe_href("javascript:alert(1)"));
+        assert!(!is_safe_href("data:text/html,x"));
+        assert!(!is_safe_href("/relative"));
+    }
 
     // ===== utf16_len =====
 

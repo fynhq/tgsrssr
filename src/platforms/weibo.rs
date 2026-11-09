@@ -120,7 +120,10 @@ pub fn parse_uid(url: &str) -> Option<String> {
     // /u/<uid>
     if segs.len() >= 2 && segs[0] == "u" {
         let uid = segs[1];
-        if !uid.is_empty() && uid.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if !uid.is_empty()
+            && uid.len() <= 32
+            && uid.chars().all(|c| c.is_ascii_alphanumeric())
+        {
             return Some(uid.to_string());
         }
     }
@@ -194,6 +197,29 @@ pub async fn fetch_weibo_user(
             format!("getIndex redirected to login (HTTP {})", status),
         ));
     }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(crate::platforms::auth_expired("Weibo", "HTTP 401"));
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        // 403 is ambiguous: expired login state or risk control. Only a
+        // login/verify body is an auth signal; otherwise treat it as a
+        // transient platform rejection so a risk-control round does not
+        // invalidate the global cookie flag.
+        let body = crate::fetcher::read_body_capped(resp, "weibo 403 body")
+            .await
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&body);
+        if text.contains("登录") || text.contains("验证") || text.to_ascii_lowercase().contains("login") {
+            return Err(crate::platforms::auth_expired(
+                "Weibo",
+                format!("HTTP 403: {}", text.chars().take(200).collect::<String>()),
+            ));
+        }
+        return Err(crate::platforms::rate_limited("Weibo", 403));
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(crate::platforms::rate_limited("Weibo", 429));
+    }
     if !status.is_success() {
         anyhow::bail!("weibo HTTP {}", status);
     }
@@ -238,6 +264,11 @@ pub async fn fetch_weibo_user(
     let mut entries: Vec<Entry> = Vec::new();
     let mut metas: crate::entrymeta::MetaMap = std::collections::HashMap::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Bound per-round detail/vote enrichment. A slow upstream would otherwise
+    // spend up to ~3 calls per entry on the serial platform channel; the
+    // timeline data is still pushed when the budget is exhausted.
+    const MAX_DETAIL_FETCHES_PER_FEED: usize = 20;
+    let mut detail_budget = MAX_DETAIL_FETCHES_PER_FEED;
 
     for card in &cards {
         // Only process normal timeline cards (card_type 9). Other types
@@ -299,7 +330,8 @@ pub async fn fetch_weibo_user(
         // the complete list.
         // The long-text full content and the extra images share this single
         // request; on failure fall back to the list data without losing the entry.
-        if !known_entry && status_needs_detail(&mblog) {
+        if !known_entry && detail_budget > 0 && status_needs_detail(&mblog) {
+            detail_budget -= 1;
             if let Some(detail) = fetch_status_show(state, &cookies, &mblog_id).await {
                 if mblog["isLongText"].as_bool() == Some(true) {
                     full_text = detail["text"]
@@ -311,7 +343,8 @@ pub async fn fetch_weibo_user(
             }
         }
         // The retweeted status can also be long text / pic-truncated; same fix.
-        if !known_entry && status_needs_detail(&mblog["retweeted_status"]) {
+        if !known_entry && detail_budget > 0 && status_needs_detail(&mblog["retweeted_status"]) {
+            detail_budget -= 1;
             let rt_mid = status_id_str(&mblog["retweeted_status"]).unwrap_or_default();
             if let Some(detail) = fetch_status_show(state, &cookies, &rt_mid).await {
                 if mblog["retweeted_status"]["isLongText"].as_bool() == Some(true) {
@@ -327,7 +360,8 @@ pub async fn fetch_weibo_user(
         // details (question/options/multi-select) must be fetched via the
         // desktop ajax/statuses/show endpoint. A failure does not block the
         // entry push (it degrades to plain text).
-        let vote_obj = if !known_entry && mblog["is_vote"].as_i64() == Some(1) {
+        let vote_obj = if !known_entry && detail_budget > 0 && mblog["is_vote"].as_i64() == Some(1) {
+            detail_budget -= 1;
             fetch_vote_object(state, &cookies, &mblog_id).await
         } else {
             None
@@ -645,7 +679,16 @@ fn absolutize_hrefs(html: &str) -> String {
 fn decode_sinaurl(url: &str) -> Option<String> {
     let u = url::Url::parse(url).ok()?;
     let decoded = u.query_pairs().find(|(k, _)| k == "u")?.1.to_string();
-    if !(decoded.starts_with("http://") || decoded.starts_with("https://")) {
+    // The link comes from post text and is fully author-controlled. Require
+    // HTTPS and a Weibo-owned host: otherwise any attacker-controlled
+    // `https://evil/x.jpg` would be downloaded (tracking / request forgery),
+    // even though the download layer's SSRF guard blocks private targets.
+    if !decoded.starts_with("https://") {
+        return None;
+    }
+    let parsed = url::Url::parse(&decoded).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if !is_weibo_image_host(&host) {
         return None;
     }
     // Filter non-image URLs: only accept sinaimg.cn (weibo image CDN) or
@@ -656,6 +699,15 @@ fn decode_sinaurl(url: &str) -> Option<String> {
         return None;
     }
     Some(decoded)
+}
+
+fn is_weibo_image_host(host: &str) -> bool {
+    host == "sinaimg.cn"
+        || host.ends_with(".sinaimg.cn")
+        || host == "weibo.com"
+        || host.ends_with(".weibo.com")
+        || host == "weibo.cn"
+        || host.ends_with(".weibo.cn")
 }
 
 /// Returns true when `url` looks like an image resource:
@@ -949,7 +1001,15 @@ fn mblog_to_entry(
         // (https://weibo.com/<uid>/<bid>); fall back to the user homepage
         // when bid is missing, and to plain text when uid is missing too.
         let rt_bid = rt["bid"].as_str().unwrap_or("");
-        let rt_user_html = match rt["user"]["id"].as_u64() {
+        // User ids are normally numeric but some API responses encode them as
+        // strings; using only as_u64 silently dropped the author link and
+        // pointed it at the subscription uid instead.
+        let rt_uid = rt["user"]["id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .or_else(|| rt["user"]["id"].as_u64().map(|v| v.to_string()))
+            .filter(|s| !s.is_empty());
+        let rt_user_html = match rt_uid {
             Some(rt_uid) if !rt_bid.is_empty() => format!(
                 "<a href=\"https://weibo.com/{}/{}\">@{}</a>",
                 rt_uid,
@@ -968,10 +1028,14 @@ fn mblog_to_entry(
         let rt_text = strip_ui_icons(&absolutize_hrefs(
             rt_full_text.unwrap_or_else(|| rt["text"].as_str().unwrap_or_default()),
         ));
+        // The retweet has its own markdown flag; using the outer post's flag
+        // left raw `**`/<br/> in a markdown retweet under a plain outer post.
+        let rt_is_markdown = rt["md_render_mark"].as_i64() == Some(1)
+            || rt["style_config"]["md_render_mark"].as_i64() == Some(1);
         // Markdown posts bypass html_to_telegram_html in entry_body_html,
         // so the retweet text (raw weibo HTML with <br/>/<a>) must be
         // converted here to avoid leaking unconverted markup into the message.
-        let rt_text = if is_markdown {
+        let rt_text = if rt_is_markdown {
             crate::fetcher::html_to_telegram_html(&rt_text)
         } else {
             rt_text
@@ -1981,11 +2045,12 @@ mod tests {
     }
 
     #[test]
-    fn extract_inline_images_non_sinaimg_with_image_ext_accepted() {
-        // Non-sinaimg hosts with a recognised image extension are accepted.
+    fn extract_inline_images_non_weibo_host_rejected() {
+        // The decoded URL comes from post text; only Weibo-owned hosts are
+        // followed, so arbitrary external image URLs cannot be injected.
         let html = r#"<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fexample.com%2Fphoto.png">查看图片</a>"#;
         let (_text, urls) = extract_inline_images(html, Lang::Zh);
-        assert_eq!(urls, vec!["https://example.com/photo.png"]);
+        assert!(urls.is_empty(), "urls: {:?}", urls);
     }
 
     #[test]
@@ -1994,6 +2059,16 @@ mod tests {
         let html = r#"<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fexample.com%2Fpage">网页链接</a>"#;
         let (_text, urls) = extract_inline_images(html, Lang::Zh);
         assert!(urls.is_empty(), "urls: {:?}", urls);
+    }
+
+    #[test]
+    fn sinaurl_requires_https_and_weibo_host() {
+        assert_eq!(
+            decode_sinaurl("https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2Fabc.jpg"),
+            Some("https://wx2.sinaimg.cn/large/abc.jpg".to_string())
+        );
+        assert!(decode_sinaurl("https://weibo.cn/sinaurl?u=http%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2Fabc.jpg").is_none());
+        assert!(decode_sinaurl("https://weibo.cn/sinaurl?u=https%3A%2F%2Fevil.example%2Fa.jpg").is_none());
     }
 
     #[test]

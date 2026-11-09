@@ -20,12 +20,14 @@ static RE_RETRY_AFTER: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)Retry after (\d+)").unwrap());
 
 /// Extract the flood-control backoff seconds demanded by Telegram from an
-/// error string (capped at 60s). Returns None for non-flood errors. Shared
-/// by both the text and media send paths.
+/// error string (capped at 300s). Telegram can request longer waits; capping
+/// at 60s previously sent a retry too early and pushed the entry to the
+/// minute-level outbox instead of waiting once. Returns None for non-flood
+/// errors. Shared by both the text and media send paths.
 pub fn flood_retry_secs(err_str: &str) -> Option<u64> {
     RE_RETRY_AFTER
         .captures(err_str)
-        .map(|caps| caps[1].parse().unwrap_or(5).min(60))
+        .map(|caps| caps[1].parse().unwrap_or(5).min(300))
 }
 
 /// Only retry on connection-class errors that are definitely undelivered;
@@ -66,6 +68,20 @@ pub fn error_chain_string(err: &(dyn std::error::Error + 'static)) -> String {
         source = e.source();
     }
     out
+}
+
+/// A send failure that is caused by the chat itself (bot removed, no posting
+/// rights, chat deleted). Retrying the source or another entry cannot help;
+/// the caller disables the chat immediately and keeps its data for a later
+/// re-add.
+pub fn is_permanent_chat_error(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("chat not found")
+        || lower.contains("bot was kicked")
+        || lower.contains("bot is not a member")
+        || lower.contains("not enough rights")
+        || lower.contains("chat_write_forbidden")
+        || lower.contains("have no rights to send")
 }
 
 /// True when a send failure is explicitly known to be undelivered, so an

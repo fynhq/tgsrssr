@@ -17,12 +17,39 @@ use serde_json::{json, Map, Value};
 use teloxide::prelude::Bot;
 use teloxide::types::{Message, MessageId};
 
-/// Process-wide latch: a Bot API server that does not implement
+/// Process-wide cooldown: a Bot API server that does not implement
 /// `sendRichMessage` answers 404/Not Found. Retrying every rich-eligible entry
-/// would upload the whole payload again for nothing, so disable the rich path
-/// for the rest of the process after the first such response.
-static RICH_UNSUPPORTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// would upload the whole payload again for nothing, so the rich path is
+/// disabled for a while. A bare gateway 404 is often transient, so it uses a
+/// short cooldown instead of latching until the next restart.
+static RICH_UNSUPPORTED_UNTIL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Cooldown after a rich-send failure that indicates the endpoint is
+/// unavailable. `None` means the error is not an availability signal.
+fn unsupported_cooldown(err_str: &str) -> Option<std::time::Duration> {
+    let lower = err_str.to_ascii_lowercase();
+    let method_missing = lower.contains("unknown method")
+        || lower.contains("method not found")
+        || (lower.contains("not found") && lower.contains("sendrichmessage"));
+    if method_missing {
+        // The method does not exist on this Bot API version; re-probe once a
+        // day so an upgrade eventually restores the rich path.
+        return Some(std::time::Duration::from_secs(24 * 3600));
+    }
+    if lower.contains("telegram api error 404") {
+        // A gateway/proxy 404 is frequently a temporary deployment issue.
+        return Some(std::time::Duration::from_secs(30 * 60));
+    }
+    None
+}
 
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
@@ -38,24 +65,26 @@ struct TelegramResponseParameters {
     retry_after: Option<u64>,
 }
 
-/// True after the endpoint reported that `sendRichMessage` is unavailable.
+/// True while the endpoint is in a failure cooldown.
 pub fn is_unsupported() -> bool {
-    RICH_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
+    now_ms() < RICH_UNSUPPORTED_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Record a rich-send failure and latch the endpoint as unsupported when the
-/// error means the method itself does not exist. Callers should only pass
-/// errors produced by this module.
+/// Record a rich-send failure and start a cooldown when the error means the
+/// endpoint is unavailable. Callers should only pass errors produced by this
+/// module.
 pub fn note_send_error(err_str: &str) {
-    let lower = err_str.to_ascii_lowercase();
-    let unsupported = lower.contains("telegram api error 404")
-        || lower.contains("unknown method")
-        || lower.contains("method not found")
-        || (lower.contains("not found") && lower.contains("sendrichmessage"));
-    if unsupported && !RICH_UNSUPPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    let Some(cooldown) = unsupported_cooldown(err_str) else {
+        return;
+    };
+    let now = now_ms();
+    let until = now.saturating_add(cooldown.as_millis() as u64);
+    let previous = RICH_UNSUPPORTED_UNTIL_MS.swap(until, std::sync::atomic::Ordering::Relaxed);
+    if previous <= now {
         tracing::warn!(
             error = %err_str,
-            "rich message endpoint is unsupported; disabling the rich path for this process"
+            cooldown_secs = cooldown.as_secs(),
+            "rich message endpoint unavailable; temporarily disabling the rich path"
         );
     }
 }
@@ -524,6 +553,23 @@ mod tests {
             .await
             .expect("server timed out")
             .unwrap();
+    }
+
+    #[test]
+    fn rich_unavailable_cooldowns_are_scoped_by_error_kind() {
+        assert_eq!(
+            unsupported_cooldown("Telegram API error 404: Not Found")
+                .unwrap()
+                .as_secs(),
+            30 * 60
+        );
+        assert_eq!(
+            unsupported_cooldown("Telegram API error 404: unknown method")
+                .unwrap()
+                .as_secs(),
+            24 * 3600
+        );
+        assert!(unsupported_cooldown("Telegram API error 400: bad request").is_none());
     }
 
     #[test]

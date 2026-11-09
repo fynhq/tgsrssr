@@ -56,7 +56,7 @@ async fn send_message_with_pace_flood(
 
 /// Send an HTML notification to a single user (falls back to plain text
 /// when HTML parsing fails, so the notice is never lost).
-pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) {
+pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) -> bool {
     // Unified blockquote folding rule (fold when >200 characters), consistent
     // with message pushing.
     let html_msg = push::normalize_blockquote_fold(html_msg);
@@ -81,7 +81,7 @@ pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) {
     // alerts (media failures / disabled sources) can otherwise hit Telegram's
     // flood control. Flood errors back off and retry the notification once.
     let first_err = send_message_with_pace_flood(bot, user_id, &html_msg, true, &no_preview).await;
-    let Some(first_err) = first_err else { return };
+    let Some(first_err) = first_err else { return true };
     // 403 = the owner never /start'ed the bot (or blocked it): the plain-
     // text fallback would also inevitably 403, so log a prominent warn and
     // skip the fallback, saving one wasted API call.
@@ -91,7 +91,7 @@ pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) {
             "NOTIFICATION UNDELIVERABLE: user has not started a private chat with the bot (or blocked it). \
              All alerts for this user are silently lost. Ask the user to send /start to the bot."
         );
-        return;
+        return false;
     }
     // Uncertain outcome (timeout / connection reset / lost response): the
     // HTML notice may already be delivered. Resending as plain text would
@@ -103,25 +103,26 @@ pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) {
             error = %first_err,
             "notification outcome uncertain; skipping plain-text fallback to avoid duplication"
         );
-        return;
+        // The message may already be delivered; treat it as delivered to
+        // avoid a duplicate retry.
+        return true;
     }
     if first_err.contains("message is too long") {
         // The cap above should make this unreachable; do not send a second
         // equally over-long plain-text copy.
         error!(user = user_id, "notification still too long after truncation; dropping fallback");
-        return;
+        return false;
     }
-    // Downgrade to plain text: first restore <a href="URL">text</a> to
-    // "URL text" (link information in notifications must not be lost),
-    // then strip tags uniformly (reusing fetcher::strip_tags).
-    let plain = html_msg
-        .replace("<a href=\"", "")
-        .replace("\">", " ")
-        .replace("</a>", "");
-    let plain = crate::fetcher::strip_tags(&plain);
+    // Downgrade to plain text while keeping anchor destinations visible:
+    // link information in notifications must not be lost.
+    let plain = crate::htmltext::strip_html_keep_links(&html_msg);
     let fallback_err = send_message_with_pace_flood(bot, user_id, &plain, false, &no_preview).await;
-    if let Some(err_str) = fallback_err {
-        error!(user = user_id, error = %err_str, "failed to notify user (html fallback also failed, first error: {})", first_err);
+    match fallback_err {
+        None => true,
+        Some(err_str) => {
+            error!(user = user_id, error = %err_str, "failed to notify user (html fallback also failed, first error: {})", first_err);
+            false
+        }
     }
 }
 
@@ -129,7 +130,15 @@ pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) {
 /// If the chat has no owner (shouldn't happen post-migration), log and skip.
 pub(crate) async fn notify_owner_html(bot: &Bot, state: &AppState, chat_id: &str, html_msg: &str) {
     match db::get_chat_owner(&state.db, chat_id).await {
-        Ok(Some(owner)) => notify_user_html(bot, owner, html_msg).await,
+        Ok(Some(owner)) => {
+            // Whitelist revocation also stops owner-routed alerts; otherwise a
+            // removed user would keep receiving feed titles, URLs and errors.
+            if !state.config.is_allowed(owner) {
+                warn!(chat_id = chat_id, owner, "cannot notify: owner is no longer whitelisted");
+                return;
+            }
+            notify_user_html(bot, owner, html_msg).await;
+        }
         Ok(None) => warn!(chat_id = chat_id, "cannot notify: chat has no owner"),
         Err(e) => warn!(chat_id = chat_id, error = %e, "cannot notify: get_chat_owner failed"),
     }
@@ -143,10 +152,10 @@ pub(crate) async fn notify_admins_html(
     bot: &Bot,
     state: &AppState,
     build_msg: impl Fn(Lang) -> String,
-) {
+) -> bool {
     let admin = state.config.admin_user_id;
     let lang = owner_lang(state, admin).await;
-    notify_user_html(bot, admin, &build_msg(lang)).await;
+    notify_user_html(bot, admin, &build_msg(lang)).await
 }
 
 /// Resolve the owner's language preference from DB.
@@ -177,7 +186,10 @@ pub(crate) fn push_line(msg: &mut String, lang: Lang, label_key: &str, value: &s
 pub(crate) fn push_fail_msg(lang: Lang, header: &str, feed_title: &str, reason: &str, link_label_key: &str, link_url: &str) -> String {
     let template = i18n::t(lang, "notif_push_failed");
     let title = push::escape_html(feed_title);
-    let mut msg = i18n::fill(template, &[header, &title, reason]);
+    // `reason` often carries platform response text or an error chain; escape
+    // it here so a future caller cannot inject HTML into the owner notice.
+    let reason = push::escape_html(reason);
+    let mut msg = i18n::fill(template, &[header, &title, &reason]);
     if !link_url.is_empty() {
         push_line(&mut msg, lang, link_label_key, link_url);
     }

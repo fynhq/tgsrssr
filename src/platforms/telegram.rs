@@ -123,8 +123,13 @@ static RE_MSG_TEXT_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// reply text — a non-greedy `(.*?)</a>` regex would truncate at the first
 /// inner `</a>`.
 static RE_REPLY_BLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?is)<a[^>]*tgme_widget_message_reply[^>]*href="([^"]*)"[^>]*>"#).unwrap()
+    // Match by class only: the previous pattern required `href` to appear
+    // after the class and failed completely when Telegram emitted attributes
+    // in a different order or omitted the link.
+    regex::Regex::new(r#"(?is)<a[^>]*tgme_widget_message_reply[^>]*>"#).unwrap()
 });
+static RE_REPLY_HREF: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"(?is)\bhref="([^"]*)""#).unwrap());
 /// Reply author name.
 static RE_REPLY_AUTHOR: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?is)tgme_widget_message_author_name[^>]*>(.*?)</span>"#).unwrap()
@@ -212,61 +217,104 @@ pub async fn fetch_telegram_channel(
     channel: &str,
     lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
-    let url = format!("https://t.me/s/{}", channel);
-    let resp = crate::platforms::api_get(
-        state,
-        &url,
-        &[("Accept", "text/html,application/xhtml+xml".to_string())],
-        5,
-    )
-    .await
-    .with_context(|| format!("Telegram channel request failed: {}", url))?;
-
-    let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        anyhow::bail!("Telegram channel does not exist or is private (no public web preview): @{}", channel);
-    }
-    if !status.is_success() {
-        anyhow::bail!("Telegram channel preview HTTP {}", status);
-    }
-    // Response body size cap (20MB): shares read_body_capped with the RSS
-    // fetch path (M8 fix: the two former call sites repeated the same
-    // bytes_stream loop verbatim). Streamed read; aborts as soon as the
-    // limit is exceeded.
-    let ctx = format!("Telegram channel @{}", channel);
-    let body_buf = crate::fetcher::read_body_capped(resp, &ctx).await?;
-    let html = String::from_utf8_lossy(&body_buf).into_owned();
-
-    // Channel title extraction: a missing title is not fatal (we fall back to
-    // the channel slug) but IS a structural signal — the info header has been
-    // a stable part of the t.me/s/<channel> layout for years, so its absence
-    // usually means the preview page was redesigned. Log it so operators can
-    // correlate "titles all became @slug" reports with a specific fetch round.
-    let feed_title = match extract_channel_title(&html) {
-        Some(t) => t,
-        None => {
-            tracing::warn!(
-                channel = %channel,
-                body_len = body_buf.len(),
-                "telegram channel title not found in preview page (falling back to channel slug; page structure may have changed)"
-            );
-            channel.to_string()
-        }
-    };
-
-    // Locate message blocks by finding all data-post positions and slicing
-    // between consecutive ones (Rust regex has no lookahead).
-    let blocks = split_message_blocks(&html);
-
+    const MAX_PAGES: usize = 3;
+    let base_url = format!("https://t.me/s/{}", channel);
     let mut entries: Vec<Entry> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (post, block) in &blocks {
-        if let Some(e) = message_to_entry(post, block, &feed_title, lang) {
-            // Dedup by entry id within the batch, matching the Weibo/X
-            // convention (fix for #8)
-            crate::platforms::push_unique_entry(&mut entries, &mut seen_ids, e);
+    let mut feed_title: Option<String> = None;
+    let mut total_blocks = 0usize;
+    let mut before: Option<String> = None;
+
+    for page in 0..MAX_PAGES {
+        if page > 0 {
+            // Space out preview requests; the platform channel is serialized,
+            // but back-to-back page hits still look bursty.
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
+        let url = match &before {
+            Some(id) => format!("{}?before={}", base_url, id),
+            None => base_url.clone(),
+        };
+        let resp = match crate::platforms::api_get(
+            state,
+            &url,
+            &[("Accept", "text/html,application/xhtml+xml".to_string())],
+            5,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) if page == 0 => {
+                return Err(e).with_context(|| format!("Telegram channel request failed: {}", url));
+            }
+            Err(e) => {
+                tracing::warn!(channel = %channel, url = %url, error = %e, "telegram page fetch failed; stopping pagination");
+                break;
+            }
+        };
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            if page == 0 {
+                anyhow::bail!("Telegram channel does not exist or is private (no public web preview): @{}", channel);
+            }
+            break;
+        }
+        if !status.is_success() {
+            if page == 0 {
+                anyhow::bail!("Telegram channel preview HTTP {}", status);
+            }
+            tracing::warn!(channel = %channel, status = %status, "telegram page HTTP error; stopping pagination");
+            break;
+        }
+        // Response body size cap (20MB): shares read_body_capped with the RSS
+        // fetch path (M8 fix: the two former call sites repeated the same
+        // bytes_stream loop verbatim). Streamed read; aborts as soon as the
+        // limit is exceeded.
+        let ctx = format!("Telegram channel @{} page {}", channel, page + 1);
+        let body_buf = crate::fetcher::read_body_capped(resp, &ctx).await?;
+        let html = String::from_utf8_lossy(&body_buf).into_owned();
+
+        if feed_title.is_none() {
+            feed_title = extract_channel_title(&html).or_else(|| {
+                tracing::warn!(
+                    channel = %channel,
+                    body_len = body_buf.len(),
+                    "telegram channel title not found in preview page (falling back to channel slug; page structure may have changed)"
+                );
+                Some(channel.to_string())
+            });
+        }
+
+        // Locate message blocks by finding all data-post positions and slicing
+        // between consecutive ones (Rust regex has no lookahead).
+        let blocks = split_message_blocks(&html);
+        total_blocks += blocks.len();
+        let before_len = entries.len();
+        for (post, block) in &blocks {
+            if let Some(e) = message_to_entry(post, block, feed_title.as_deref().unwrap_or(channel), lang) {
+                // Dedup by entry id within the batch, matching the Weibo/X
+                // convention (fix for #8)
+                crate::platforms::push_unique_entry(&mut entries, &mut seen_ids, e);
+            }
+        }
+
+        // Oldest message id on this page; t.me/s accepts `?before=<id>`.
+        let oldest = blocks
+            .iter()
+            .filter_map(|(post, _)| post.rsplit('/').next()?.parse::<i64>().ok())
+            .min();
+        if entries.len() == before_len {
+            // No new entries: a server that ignores `before` returns the same
+            // page; stop instead of re-parsing it MAX_PAGES times.
+            break;
+        }
+        match oldest {
+            Some(id) if id > 1 => before = Some(id.to_string()),
+            _ => break,
         }
     }
+    let feed_title = feed_title.unwrap_or_else(|| channel.to_string());
 
     // Per-round parse summary (aligned with weibo.rs / x.rs debug counters):
     // lets an operator eyeball "blocks found but zero entries" vs "zero
@@ -274,7 +322,7 @@ pub async fn fetch_telegram_channel(
     // level — the warn below covers the anomalous case.
     tracing::debug!(
         channel = %channel,
-        blocks = blocks.len(),
+        blocks = total_blocks,
         entries = entries.len(),
         "telegram preview parsed"
     );
@@ -287,10 +335,10 @@ pub async fn fetch_telegram_channel(
     // Must not silently return empty — the scheduler would treat it as
     // success, reset the error count, and the feed would silently stop
     // updating with zero logs.
-    if entries.is_empty() && !blocks.is_empty() {
+    if entries.is_empty() && total_blocks > 0 {
         tracing::warn!(
             channel = %channel,
-            posts = blocks.len(),
+            posts = total_blocks,
             "telegram preview has message blocks but zero entries extracted (page structure may have changed)"
         );
     }
@@ -439,7 +487,12 @@ fn extract_reply_blockquote(block: &str) -> String {
         Some(c) => c,
         None => return String::new(),
     };
-    let href = &reply_caps[1];
+    let href = reply_caps
+        .get(0)
+        .and_then(|m| RE_REPLY_HREF.captures(m.as_str()))
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
     // Inner content: position-based scan counting <a>/</a> nesting depth,
     // so hyperlinks inside the reply text don't truncate the block.
     let open_end = reply_caps.get(0).map(|m| m.end()).unwrap_or(0);

@@ -217,7 +217,9 @@ fn api_authority(url: &str) -> Option<String> {
     let u = url::Url::parse(url).ok()?;
     let host = u.host_str()?.to_lowercase();
     let port = u.port_or_known_default().unwrap_or(80);
-    Some(format!("{}:{}", host, port))
+    // Include the scheme: `https://h:8080 -> http://h:8080` is a downgrade,
+    // not the same authority, and must not forward cookies/authorization.
+    Some(format!("{}://{}:{}", u.scheme(), host, port))
 }
 
 /// Headers never forwarded across a cross-host redirect.
@@ -502,6 +504,26 @@ pub async fn migrate_legacy_cookies(state: &AppState) {
         }
     }
 
+    // Second pass: three-segment cookie keys whose middle segment is not a
+    // numeric user id (e.g. a hand-written `cookie:admin:weibo`) were not
+    // collected by the migration above and previously stayed forever. They can
+    // be removed once the platform has a global value.
+    for (key, _) in &rows {
+        let parts: Vec<&str> = key.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let platform = parts[2];
+        if crate::db::get_setting(&state.db, &cookie_setting_key(platform))
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            crate::db::delete_setting(&state.db, key).await.ok();
+        }
+    }
+
     // Clean up legacy per-user health/streak/expired keys. Runs unconditionally
     // (even when there were no legacy cookies), so a DB that only has per-user
     // health keys still gets them removed instead of leaking forever.
@@ -543,11 +565,15 @@ mod tests {
     fn authority_normalizes_case_and_default_ports() {
         assert_eq!(
             api_authority("https://X.com/path"),
-            Some("x.com:443".to_string())
+            Some("https://x.com:443".to_string())
         );
         assert_eq!(
             api_authority("http://example.com:8080/x"),
-            Some("example.com:8080".to_string())
+            Some("http://example.com:8080".to_string())
+        );
+        assert_ne!(
+            api_authority("https://example.com:8080/x"),
+            api_authority("http://example.com:8080/x")
         );
         assert_ne!(
             api_authority("https://x.com/a"),

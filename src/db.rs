@@ -73,6 +73,13 @@ pub mod setting_key {
     pub fn outbox_media_lost(outbox_id: i64) -> String {
         format!("outbox_media_lost:{}", outbox_id)
     }
+    /// Consecutive send failures for one (chat, feed):
+    /// `send_fail:<chat_id>:<feed_url>`. Cleared on the next successful send
+    /// and on source resume; reaching the threshold auto-disables the source
+    /// instead of letting a broken chat enqueue entries for 72 hours.
+    pub fn send_fail(chat_id: &str, feed_url: &str) -> String {
+        format!("send_fail:{}:{}", chat_id, feed_url)
+    }
 }
 
 /// Default config values (single source of truth on the Rust side).
@@ -84,6 +91,10 @@ pub const DEFAULT_CONTENT_MODE: &str = "title_link";
 pub const DEFAULT_SOURCE_DISPLAY: &str = "source";
 pub const DEFAULT_CAPTION_ABOVE_MEDIA: i64 = 0;
 pub const DEFAULT_LINK_PREVIEW: i64 = 1;
+/// Upper bound for a per-chat/per-feed fetch interval. A forged or accidental
+/// huge value would make the due comparison never true and silently stop the
+/// source; one day is a generous ceiling.
+pub const MAX_INTERVAL_MINUTES: i64 = 1440;
 
 /// Row types for queries.
 // Some fields (chat_type/enabled etc.) only appear in SQL
@@ -300,7 +311,9 @@ pub async fn flip_setting_once(db: &Db, key: &str, to: &str) -> anyhow::Result<b
 /// (consistent with the project's fail-closed principle); the caller decides
 /// explicitly (startup cleanup / cookie-loading scenarios log a warn and skip).
 pub async fn get_settings_by_prefix(db: &Db, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let rows = sqlx::query("SELECT key, value FROM settings WHERE key LIKE ? || '%'")
+    // `instr` instead of LIKE: key prefixes such as `platform_health:` contain
+    // `_`, which LIKE treats as a single-character wildcard.
+    let rows = sqlx::query("SELECT key, value FROM settings WHERE instr(key, ?) = 1")
         .bind(prefix)
         .fetch_all(db)
         .await?;
@@ -363,6 +376,12 @@ pub async fn upsert_chat(
     .bind(added_by)
     .execute(db)
     .await?;
+    // Re-adding the bot is a fresh start for send health; otherwise the old
+    // failure streak would disable the chat again on the next single failure.
+    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
+        .bind(format!("send_fail:{}:%", chat_id))
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -374,7 +393,7 @@ async fn cleanup_chat_settings_keys(
     conn: &mut sqlx::SqliteConnection,
     chat_id: &str,
 ) -> anyhow::Result<()> {
-    for prefix in ["media_dl_fail", "auto_disable_notified", "stale_zero"] {
+    for prefix in ["media_dl_fail", "auto_disable_notified", "stale_zero", "send_fail"] {
         sqlx::query("DELETE FROM settings WHERE key LIKE ?")
             .bind(format!("{prefix}:{chat_id}:%"))
             .execute(&mut *conn)
@@ -410,6 +429,12 @@ async fn cleanup_feed_settings_keys(
     .bind(sub_id)
     .execute(&mut *conn)
     .await?;
+    sqlx::query(
+        "DELETE FROM settings WHERE key = (SELECT 'send_fail:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
+    )
+    .bind(sub_id)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
@@ -425,23 +450,6 @@ async fn clear_auto_disable_notified(
         .bind(setting_key::auto_disable_notified(chat_id, feed_url))
         .execute(&mut *conn)
         .await?;
-    Ok(())
-}
-
-/// Delete all data for a chat (subscriptions, configs, sent_entries, chat itself).
-/// Wrapped in a transaction: any step failing rolls everything back, avoiding
-/// half-deleted residual state.
-pub async fn purge_chat(db: &Db, chat_id: &str) -> anyhow::Result<()> {
-    let mut tx = db.begin().await?;
-    sqlx::query("DELETE FROM sent_entries WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM sent_messages WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM outbox WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM feed_configs WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM subscriptions WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM chat_configs WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
-    cleanup_chat_settings_keys(&mut tx, chat_id).await?;
-    sqlx::query("DELETE FROM chats WHERE chat_id = ?").bind(chat_id).execute(&mut *tx).await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -559,13 +567,27 @@ pub async fn get_chat(db: &Db, chat_id: &str) -> anyhow::Result<Option<ChatRow>>
     Ok(row)
 }
 
+/// Enable/disable a chat without deleting its subscriptions or history.
+/// Disabled chats are excluded from scheduling and outbox retries; the owner
+/// is preserved so a later re-add keeps the original ownership.
+pub async fn set_chat_enabled(db: &Db, chat_id: &str, enabled: bool) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE chats SET enabled = ?, updated_at = datetime('now') WHERE chat_id = ?",
+    )
+    .bind(if enabled { 1 } else { 0 })
+    .bind(chat_id)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Whether `user_id` can manage `chat_id`. No admin bypass: data always belongs
-/// to the individual who added the bot. Unregistered chats → false.
+/// to the individual who added the bot. Unregistered or disabled chats → false.
 pub async fn can_manage_chat(db: &Db, user_id: i64, chat_id: &str) -> anyhow::Result<bool> {
     let Some(chat) = get_chat(db, chat_id).await? else {
         return Ok(false);
     };
-    Ok(chat.added_by.as_deref() == Some(&user_id.to_string()))
+    Ok(chat.enabled == 1 && chat.added_by.as_deref() == Some(&user_id.to_string()))
 }
 
 /// Feed URLs of every active subscription in an enabled chat. Used by the
@@ -664,12 +686,13 @@ pub async fn add_subscription_with_sent(
     // the due query INNER JOINs chats, and ownership resolution reads chats
     // too, so no command could list, edit or unsubscribe it. Re-check inside
     // the transaction and fail the add instead of persisting the orphan.
-    let chat_exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM chats WHERE chat_id = ?")
-        .bind(chat_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let chat_exists: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM chats WHERE chat_id = ? AND enabled = 1")
+            .bind(chat_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     if chat_exists.is_none() {
-        anyhow::bail!("chat no longer registered (bot removed before the subscription was saved)");
+        anyhow::bail!("chat no longer registered or is disabled (bot removed before the subscription was saved)");
     }
     sqlx::query(
         r#"INSERT INTO subscriptions (chat_id, feed_url, feed_title, title_overridden, active, error_count)
@@ -683,6 +706,10 @@ pub async fn add_subscription_with_sent(
     .bind(feed_title)
     .execute(&mut *tx)
     .await?;
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(setting_key::send_fail(chat_id, feed_url))
+        .execute(&mut *tx)
+        .await?;
     for eid in entry_ids {
         sqlx::query(
             "INSERT OR IGNORE INTO sent_entries (chat_id, feed_url, entry_id) VALUES (?, ?, ?)",
@@ -895,9 +922,12 @@ pub async fn get_subscription_by_url(db: &Db, chat_id: &str, feed_url: &str) -> 
 /// before feed_title is overwritten.
 pub async fn rename_subscription(db: &Db, sub_id: i64, new_title: &str) -> anyhow::Result<()> {
     sqlx::query(
+        // `IS` (not `=`) so a NULL original_title is compared correctly; the
+        // right-hand expressions all read the pre-update row, matching the
+        // single-statement semantics.
         "UPDATE subscriptions SET
-           title_overridden = CASE WHEN ? = original_title THEN 0 ELSE 1 END,
-           original_title = CASE WHEN ? = original_title THEN NULL ELSE COALESCE(original_title, feed_title) END,
+           title_overridden = CASE WHEN ? IS original_title THEN 0 ELSE 1 END,
+           original_title = CASE WHEN ? IS original_title THEN NULL ELSE COALESCE(original_title, feed_title) END,
            feed_title = ?
          WHERE id = ?",
     )
@@ -1022,6 +1052,15 @@ pub async fn set_subscription_active(
         .bind(chat_id)
         .execute(&mut *tx)
         .await?;
+        // A manual resume is a fresh start for send failures too; otherwise a
+        // single new failure would immediately hit the threshold again.
+        sqlx::query(
+            "DELETE FROM settings WHERE key = (SELECT 'send_fail:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ? AND chat_id = ?)",
+        )
+        .bind(sub_id)
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await?;
     } else {
         let res = sqlx::query(
             "UPDATE subscriptions SET active = 0, auto_disabled = 0, disabled_at = NULL WHERE id = ? AND chat_id = ?",
@@ -1062,6 +1101,21 @@ pub async fn auto_disable_subscription(db: &Db, sub_id: i64) -> anyhow::Result<b
 /// and reset their error counts to zero. Returns the number of recovered
 /// sources. Manually paused (auto_disabled=0) sources are not affected.
 pub async fn reenable_due_auto_disabled(db: &Db, cooldown_hours: i64) -> anyhow::Result<u64> {
+    let mut tx = db.begin().await?;
+    // A source retired by repeated send failures must start with a fresh
+    // streak; keeping the old count would make its first post-heal failure
+    // re-disable it immediately.
+    sqlx::query(
+        r#"DELETE FROM settings WHERE key IN (
+             SELECT 'send_fail:' || chat_id || ':' || feed_url FROM subscriptions
+             WHERE active = 0 AND auto_disabled = 1
+               AND disabled_at IS NOT NULL
+               AND (julianday('now') - julianday(disabled_at)) * 24 >= ?
+           )"#,
+    )
+    .bind(cooldown_hours)
+    .execute(&mut *tx)
+    .await?;
     let res = sqlx::query(
         r#"UPDATE subscriptions
            SET active = 1, auto_disabled = 0, disabled_at = NULL, error_count = 0, last_error = NULL
@@ -1070,8 +1124,9 @@ pub async fn reenable_due_auto_disabled(db: &Db, cooldown_hours: i64) -> anyhow:
              AND (julianday('now') - julianday(disabled_at)) * 24 >= ?"#,
     )
     .bind(cooldown_hours)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected())
 }
 
@@ -1093,6 +1148,10 @@ pub async fn resume_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<
     // as the single-subscription resume path).
     sqlx::query("DELETE FROM settings WHERE key LIKE ?")
         .bind(format!("auto_disable_notified:{}:%", chat_id))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM settings WHERE key LIKE ?")
+        .bind(format!("send_fail:{}:%", chat_id))
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -1205,20 +1264,23 @@ pub async fn update_fetch_headers(
     etag: Option<&str>,
     last_modified: Option<&str>,
 ) -> anyhow::Result<()> {
-    if let Some(e) = etag {
-        sqlx::query("UPDATE subscriptions SET http_etag = ? WHERE id = ?")
-            .bind(e)
-            .bind(sub_id)
-            .execute(db)
-            .await?;
+    if etag.is_none() && last_modified.is_none() {
+        return Ok(());
     }
-    if let Some(lm) = last_modified {
-        sqlx::query("UPDATE subscriptions SET http_last_modified = ? WHERE id = ?")
-            .bind(lm)
-            .bind(sub_id)
-            .execute(db)
-            .await?;
-    }
+    // One statement: committing the two negotiation headers separately could
+    // pair this response's ETag with the previous Last-Modified on a partial
+    // failure and make the next conditional request inconsistent.
+    sqlx::query(
+        "UPDATE subscriptions
+            SET http_etag = COALESCE(?, http_etag),
+                http_last_modified = COALESCE(?, http_last_modified)
+          WHERE id = ?",
+    )
+    .bind(etag)
+    .bind(last_modified)
+    .bind(sub_id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -1301,6 +1363,9 @@ pub async fn set_chat_config_field(
         // not assume so).
         let v: i64 = value.parse()
             .map_err(|_| anyhow::anyhow!("interval_minutes must be numeric, got '{}'", value))?;
+        if !(1..=MAX_INTERVAL_MINUTES).contains(&v) {
+            anyhow::bail!("interval_minutes out of range: {}", v);
+        }
         sqlx::query(sql).bind(v).bind(chat_id).execute(db).await?;
     } else {
         validate_config_value(field, value)?;
@@ -1356,6 +1421,9 @@ pub async fn set_feed_config_field(
             // number.
             let n: i64 = v.parse()
                 .map_err(|_| anyhow::anyhow!("interval_minutes must be numeric, got '{}'", v))?;
+            if !(1..=MAX_INTERVAL_MINUTES).contains(&n) {
+                anyhow::bail!("interval_minutes out of range: {}", n);
+            }
             sqlx::query(sql).bind(chat_id).bind(feed_url).bind(n).execute(db).await?;
         } else {
             validate_config_value(field, v)?;
@@ -1649,18 +1717,54 @@ pub async fn outbox_insert(
     Ok(result.rows_affected() > 0)
 }
 
-/// Ids of outbox rows due for retry (oldest first). The caller fetches each
-/// full row one at a time, so a batch of large `entry_json` values is never
-/// loaded into memory at once.
+/// Ids of outbox rows due for retry (oldest first). Rows belonging to a
+/// paused/disabled subscription or a disabled chat are held: pausing a source
+/// must stop queued deliveries too, and a removed bot must not keep retrying
+/// into a chat it can no longer reach.
+///
+/// The caller fetches each full row one at a time, so a batch of large
+/// `entry_json` values is never loaded into memory at once.
 pub async fn outbox_due_ids(db: &Db, now_ts: i64, limit: i64) -> anyhow::Result<Vec<i64>> {
     let rows = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM outbox WHERE next_retry_at <= ? ORDER BY next_retry_at ASC, id ASC LIMIT ?",
+        r#"SELECT o.id
+             FROM outbox o
+             JOIN chats ch
+               ON ch.chat_id = o.chat_id AND ch.enabled = 1
+             JOIN subscriptions s
+               ON s.chat_id = o.chat_id AND s.feed_url = o.feed_url AND s.active = 1
+            WHERE o.next_retry_at <= ?
+            ORDER BY o.next_retry_at ASC, o.id ASC
+            LIMIT ?"#,
     )
     .bind(now_ts)
     .bind(limit)
     .fetch_all(db)
     .await?;
     Ok(rows)
+}
+
+/// Number of queued outbox rows for one (chat, feed). Used by the enqueue path
+/// to stop an unavailable chat from growing an unbounded 72h retry queue.
+pub async fn outbox_count_for_feed(db: &Db, chat_id: &str, feed_url: &str) -> anyhow::Result<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM outbox WHERE chat_id = ? AND feed_url = ?",
+    )
+    .bind(chat_id)
+    .bind(feed_url)
+    .fetch_one(db)
+    .await?;
+    Ok(count)
+}
+
+/// Drop every queued outbox row for a chat. Called when the bot is removed or
+/// permanently loses posting rights: keeping the rows would either hold them
+/// forever (disabled chat) or flood the channel on re-add.
+pub async fn delete_outbox_for_chat(db: &Db, chat_id: &str) -> anyhow::Result<u64> {
+    let result = sqlx::query("DELETE FROM outbox WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(db)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 /// Fetch one complete outbox row by id. Returns None when the row was removed
@@ -2197,8 +2301,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_chat_and_paused_subscription_hold_outbox_rows() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO chats (chat_id, chat_type, added_by, enabled) VALUES ('1', 'channel', '42', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO subscriptions (chat_id, feed_url, active) VALUES ('1', 'https://example.com/feed', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        outbox_insert(
+            &pool,
+            "1",
+            "https://example.com/feed",
+            "e1",
+            "Feed",
+            "{}",
+            "[]",
+            "",
+            "title_link",
+            "source",
+            true,
+            false,
+            None,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        // Paused source: queued rows are held.
+        assert!(outbox_due_ids(&pool, 1, 10).await.unwrap().is_empty());
+        sqlx::query("UPDATE subscriptions SET active = 1 WHERE chat_id = '1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(outbox_due_ids(&pool, 1, 10).await.unwrap().len(), 1);
+
+        // Disabled chat: queued rows are held again.
+        assert!(set_chat_enabled(&pool, "1", false).await.unwrap());
+        assert!(outbox_due_ids(&pool, 1, 10).await.unwrap().is_empty());
+        assert!(!can_manage_chat(&pool, 42, "1").await.unwrap());
+        assert!(set_chat_enabled(&pool, "1", true).await.unwrap());
+        assert!(can_manage_chat(&pool, 42, "1").await.unwrap());
+        assert_eq!(outbox_due_ids(&pool, 1, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn outbox_retry_records_first_attempt_only() {
         let pool = test_pool().await;
+        sqlx::query("INSERT INTO chats (chat_id, chat_type, enabled) VALUES ('1', 'channel', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subscriptions (chat_id, feed_url, active) VALUES ('1', 'https://example.com/feed', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
         outbox_insert(
             &pool,
             "1",

@@ -300,6 +300,12 @@ fn normalize_plain_feed_url(url: &str) -> String {
 /// fetching share this same criterion.
 pub const MAX_BODY_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Upper bound on entries retained from one RSS/Atom body. A hostile or
+/// excessively large feed otherwise keeps a huge Vec alive through the whole
+/// media/send loop (up to `RSS_PROCESS_CONCURRENCY` feeds at once). Newest
+/// entries are kept after the normal newest-first sort.
+pub const MAX_ENTRIES_PER_FEED: usize = 500;
+
 /// Stream-read a response body while enforcing the size cap (M8 fix: the
 /// fetcher and telegram.rs previously duplicated the same bytes_stream loop
 /// verbatim in two places). Checks while reading and aborts as soon as the
@@ -399,6 +405,7 @@ pub async fn fetch_feed(
         state,
         feed_url,
         allow_trusted_private,
+        None,
         "feed",
         MAX_REDIRECTS,
         |client, url, _hop| {
@@ -465,9 +472,21 @@ pub async fn fetch_feed(
 
     let feed_title = feed.title.map(|t| t.content).filter(|s| !s.trim().is_empty());
 
-    // Sort entries newest first by published/updated date.
+    // Sort entries newest first by published/updated date, then bound the
+    // retained set. The parser has already built the full Vec (feed-rs is not
+    // streaming), but truncating here keeps the send loop and the pending
+    // batch small instead of retaining every historical entry.
     let mut entries = feed.entries;
     crate::platforms::sort_entries_newest_first(&mut entries);
+    if entries.len() > MAX_ENTRIES_PER_FEED {
+        tracing::warn!(
+            feed = %feed_url,
+            total = entries.len(),
+            kept = MAX_ENTRIES_PER_FEED,
+            "feed has too many entries; keeping the newest window"
+        );
+        entries.truncate(MAX_ENTRIES_PER_FEED);
+    }
 
     Ok(FetchResult {
         feed_title,
@@ -852,8 +871,12 @@ pub fn html_to_telegram_html(html: &str) -> String {
     // 5) Restore anchors as Telegram hyperlinks (skip empty-text links).
     for (i, (href, text)) in links.iter().enumerate() {
         let token = format!("\u{FFFC}{}\u{FFFC}", i);
-        let replacement = if text.is_empty() || href.is_empty() {
+        let replacement = if text.is_empty() {
             String::new()
+        } else if href.is_empty() || !crate::htmltext::is_safe_href(href) {
+            // Unsupported scheme (javascript:/data:/relative): keep the
+            // visible text but never emit an unsafe Telegram anchor.
+            crate::htmltext::escape_html(text)
         } else {
             format!("<a href=\"{}\">{}</a>", crate::htmltext::escape_attr(href), crate::htmltext::escape_html(text))
         };
