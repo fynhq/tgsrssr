@@ -400,8 +400,8 @@ pub(super) fn entry_summary(entry: &Entry, max_chars: usize, meta: Option<&crate
     }
     // Truncate on the Telegram-HTML the body pipeline already produced:
     // image media hrefs were dropped upstream, while video links are kept, so
-    // surviving anchors are real content/video links (e.g. the WeChat article
-    // behind "本文来自微信公众号：账号名") and stay clickable in the summary.
+    // surviving anchors are real content/video links (e.g. the WeChat account
+    // attribution) and stay clickable in the summary.
     // The cut counts display characters only — href text never eats into the
     // budget.
     // Whitespace at the edges comes from flattened block tags (the old
