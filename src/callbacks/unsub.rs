@@ -1,13 +1,16 @@
 //! Unsubscribe flow: single unsub, unsub panel, unsub-all confirmation.
-//! Split out of callbacks/mod.rs (batch-3 refactor). Uses the parent module's
-//! private helpers (`deliver`, `nav_row`, `PageTarget`, `PAGE_SIZE`) via
-//! `super::`.
+//! Split out of callbacks/mod.rs (batch-3 refactor). Uses shared panel
+//! helpers from `crate::ui`; callback-only toast/guard helpers stay in
+//! `super`.
 
 use teloxide::prelude::*;
 use teloxide::types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use tracing::{info, warn};
 
-use super::{deliver, deliver_error_page, fetch_sub_or_toast, nav_row, paginate, toast_text, PageTarget};
+use super::{fetch_sub_or_toast, toast_text};
+use crate::ui::{
+    chat_display_title, deliver, deliver_error_page, nav_row, paginate, PageTarget,
+};
 use crate::push::no_preview;
 use crate::db;
 use crate::i18n::{self, Lang};
@@ -179,7 +182,7 @@ pub(super) async fn render_unsub_all_confirm(
     }
 
     let chat = db::get_chat(&state.db, chat_id).await.ok().flatten();
-    let title = super::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
+    let title = chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
 
     let title_html = crate::push::format_chat_title_html(&title, chat_id);
     let chat_html = crate::push::format_chat_id_html(chat_id);
@@ -289,7 +292,7 @@ pub(super) async fn handle_unsub_all_callback(
         }
     };
     let chat = db::get_chat(&state.db, chat_id).await.ok().flatten();
-    let title = super::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
+    let title = chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
 
     // Delete first; there is no file backup to gate the operation anymore.
     let count = match db::delete_all_subscriptions(&state.db, chat_id).await {

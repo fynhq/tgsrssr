@@ -1,11 +1,14 @@
 //! Settings pages: channel-level config, feed-level overrides, option pages.
 //! Split out of callbacks/mod.rs (batch-B3 refactor); behavior unchanged.
-//! Uses the parent module's private helpers via `super::`.
+//! Uses shared panel helpers from `crate::ui`.
 
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-use super::{back_close_row, deliver, deliver_error_page, load_sub_or_deliver, PageTarget};
+use crate::ui::{
+    back_close_row, chat_display_title, deliver, deliver_error_page, fmt_content_mode,
+    fmt_interval, fmt_source_display, load_sub_or_deliver, PageTarget,
+};
 use crate::db;
 use crate::i18n::{self, Lang};
 use crate::push::{ContentMode, SourceDisplay};
@@ -25,7 +28,7 @@ pub(super) async fn render_settings_page(
 ) -> ResponseResult<()> {
     let cfg = load_chat_config(&state.db, chat_id).await;
     let chat = db::get_chat(&state.db, chat_id).await.ok().flatten();
-    let title = super::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
+    let title = chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), chat_id);
 
     let iv_label = fmt_interval(lang, cfg.interval_minutes);
     let cm_label = fmt_content_mode(lang, &cfg.content_mode);
@@ -255,28 +258,6 @@ fn default_chat_config(chat_id: String) -> db::ChatConfigRow {
     }
 }
 
-pub(super) fn fmt_interval(lang: Lang, min: i64) -> String {
-    match min {
-        180 => i18n::t(lang, "3h").to_string(),
-        360 => i18n::t(lang, "6h").to_string(),
-        720 => i18n::t(lang, "12h").to_string(),
-        m => i18n::t(lang, "n_min").replacen("{}", &m.to_string(), 1),
-    }
-}
-
-pub(super) fn fmt_content_mode(lang: Lang, m: &str) -> &'static str {
-    // Normalize through the same legacy-tolerant parser used by rendering, so
-    // an old `TitleSummary`/`MediaOnly` value does not display as Title+Link.
-    match ContentMode::from_str(m) {
-        ContentMode::TitleSummary => i18n::t(lang, "mode_title_summary"),
-        ContentMode::TitleContent => i18n::t(lang, "mode_title_content"),
-        ContentMode::TitleOnly => i18n::t(lang, "mode_title_only"),
-        ContentMode::ContentOnly => i18n::t(lang, "mode_content_only"),
-        ContentMode::MediaOnly => i18n::t(lang, "mode_media_only"),
-        ContentMode::TitleLink => i18n::t(lang, "mode_title_link"),
-    }
-}
-
 /// Canonical stored value for the option page's ✓ comparison.
 fn content_mode_value(m: &str) -> &'static str {
     match ContentMode::from_str(m) {
@@ -286,14 +267,6 @@ fn content_mode_value(m: &str) -> &'static str {
         ContentMode::ContentOnly => "content_only",
         ContentMode::MediaOnly => "media_only",
         ContentMode::TitleLink => "title_link",
-    }
-}
-
-pub(super) fn fmt_source_display(lang: Lang, s: &str) -> &'static str {
-    match SourceDisplay::from_str(s) {
-        SourceDisplay::Author => i18n::t(lang, "src_author"),
-        SourceDisplay::None => i18n::t(lang, "src_none"),
-        SourceDisplay::Source => i18n::t(lang, "src_title"),
     }
 }
 
@@ -410,76 +383,6 @@ pub(super) async fn render_feed_source(
         show_inherit: true,
     };
     render_option_page(bot, &target, &spec, lang).await
-}
-
-/// Second-level page: content filter settings for a feed.
-///
-/// Public entry point kept for the command path (filter-keyword reply refresh).
-/// PendingOp stores both page positions now, so the refresh preserves the
-/// channel-list page instead of resetting it.
-pub async fn render_feed_filter(
-    bot: &Bot,
-    target: PageTarget<'_>,
-    sub_id: i64,
-    state: &AppState,
-    ch_page: usize,
-    chlist_page: usize,
-    lang: Lang,
-) -> ResponseResult<()> {
-    render_feed_filter_impl(bot, target, sub_id, state, ch_page, chlist_page, lang).await
-}
-
-/// Internal filter renderer carrying `chlist_page` through every button.
-pub(super) async fn render_feed_filter_impl(
-    bot: &Bot,
-    target: PageTarget<'_>,
-    sub_id: i64,
-    state: &AppState,
-    ch_page: usize,
-    chlist_page: usize,
-    lang: Lang,
-) -> ResponseResult<()> {
-    let Some(sub) = load_sub_or_deliver(bot, &target, &state.db, sub_id, lang).await? else {
-        return Ok(());
-    };
-    let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await {
-        Ok(fc) => fc,
-        Err(e) => {
-            tracing::warn!(sub_id, error = %e, "filter page read failed");
-            return deliver_error_page(bot, &target, lang, &format!("{:#}", e)).await;
-        }
-    };
-
-    let status = if fc.is_active() {
-        i18n::t(lang, "filter_on")
-    } else if fc.enabled {
-        // The switch is on but no keywords are configured: say so instead of
-        // claiming "off" while the toggle button says "disable".
-        i18n::t(lang, "filter_on_no_keywords")
-    } else {
-        i18n::t(lang, "filter_off")
-    };
-    let mode_label = if fc.mode == "whitelist" { i18n::t(lang, "filter_wl_desc") } else { i18n::t(lang, "filter_bl_desc") };
-    let kw_display = if fc.keywords.is_empty() {
-        i18n::t(lang, "none").to_string()
-    } else {
-        format!("<code>{}</code>", crate::push::escape_html(&fc.keywords))
-    };
-
-    let text = i18n::fill(i18n::t(lang, "filter_panel"), &[status, mode_label, &kw_display]);
-
-    let toggle_label = if fc.enabled { i18n::t(lang, "filter_disable") } else { i18n::t(lang, "filter_enable") };
-    let mode_btn_label = if fc.mode == "whitelist" { i18n::t(lang, "filter_to_bl") } else { i18n::t(lang, "filter_to_wl") };
-
-    let buttons = vec![
-        vec![InlineKeyboardButton::callback(toggle_label, format!("c|srcftoggle|{}|{}|{}", sub_id, ch_page, chlist_page))],
-        vec![InlineKeyboardButton::callback(mode_btn_label, format!("c|srcfmode|{}|{}|{}", sub_id, ch_page, chlist_page))],
-        vec![InlineKeyboardButton::callback(i18n::t(lang, "filter_set_kw"), format!("c|srcfkw|{}|{}|{}", sub_id, ch_page, chlist_page))],
-        back_close_row(lang, "back", format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page)),
-    ];
-    let kb = InlineKeyboardMarkup::new(buttons);
-    deliver(bot, &target, &text, Some(kb)).await?;
-    Ok(())
 }
 
 async fn load_feed_ctx(

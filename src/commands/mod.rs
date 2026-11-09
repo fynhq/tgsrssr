@@ -147,13 +147,13 @@ pub async fn handle_command(
 }
 
 /// Resolve user language: DB preference first, then Telegram language_code, default En.
-/// Delegates to the shared `callbacks::resolve_lang` primitive so callback and
+/// Delegates to the shared `langpref::resolve_lang` primitive so callback and
 /// command paths stay in sync (previously they diverged: command replies
 /// honoured the client language_code while callback panels fell straight to
 /// English for users who had not yet run /start).
 pub async fn user_lang(state: &AppState, user_id: i64, msg: Option<&Message>) -> Lang {
     let code = msg.and_then(|m| m.from.as_ref()).and_then(|u| u.language_code.as_deref());
-    crate::callbacks::resolve_lang(state, user_id, code).await
+    crate::langpref::resolve_lang(state, user_id, code).await
 }
 
 // ===== /start & /about =====
@@ -213,9 +213,9 @@ async fn handle_set(
     let args = args.trim();
     if args.is_empty() {
         // Show channel list (paginated button panel, shared with the callback UI)
-        crate::callbacks::render_channel_list(
+        crate::ui::render_channel_list(
             bot,
-            crate::callbacks::PageTarget::Send(msg.chat.id),
+            crate::ui::PageTarget::Send(msg.chat.id),
             state,
             user_id,
             0,
@@ -225,9 +225,9 @@ async fn handle_set(
         // Direct channel page
         let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, args, user_id, lang).await);
         try_or_reply!(bot, msg.chat.id, lang, ensure_chat_registered(state, &chat_id).await);
-        crate::callbacks::render_channel_page(
+        crate::ui::render_channel_page(
             bot,
-            crate::callbacks::PageTarget::Send(msg.chat.id),
+            crate::ui::PageTarget::Send(msg.chat.id),
             &chat_id,
             state,
             0,
@@ -256,7 +256,7 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let subs = try_or_reply!(bot, msg.chat.id, lang, db::get_subscriptions(&state.db, &chat_id).await);
 
     let chat = try_or_reply!(bot, msg.chat.id, lang, db::get_chat(&state.db, &chat_id).await);
-    let title = crate::callbacks::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), &chat_id);
+    let title = crate::ui::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), &chat_id);
 
     if subs.is_empty() {
         let title_html = push::format_chat_title_html(&title, &chat_id);
@@ -641,7 +641,7 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
     }
 
     let chat = try_or_reply!(bot, msg.chat.id, lang, db::get_chat(&state.db, &chat_id).await);
-    let title = crate::callbacks::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), &chat_id);
+    let title = crate::ui::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), &chat_id);
 
     let title_html = push::escape_html(&title);
     let header = if added > 0 {
@@ -1189,9 +1189,9 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 /// update applies immediately without restart and is persisted across
 /// restarts.
 async fn handle_cookies(bot: &Bot, msg: &Message, state: &AppState, lang: Lang) -> ResponseResult<()> {
-    crate::callbacks::render_cookies_panel(
+    crate::ui::render_cookies_panel(
         bot,
-        crate::callbacks::PageTarget::Send(msg.chat.id),
+        crate::ui::PageTarget::Send(msg.chat.id),
         state,
         lang,
     ).await?;
@@ -1446,9 +1446,9 @@ pub async fn handle_pending_op(
                     retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::t(lang, "rename_ok").replacen("{}", text, 1)).await;
                     // Refresh the source's feed page panel in place (no new message sent); if the
                     // panel is no longer valid, deliver automatically falls back to sending a new one.
-                    crate::callbacks::render_feed_page(
+                    crate::ui::render_feed_page(
                         bot,
-                        crate::callbacks::PageTarget::EditMessage(
+                        crate::ui::PageTarget::EditMessage(
                             msg.chat.id,
                             teloxide::types::MessageId(panel_msg_id),
                         ),
@@ -1490,9 +1490,9 @@ pub async fn handle_pending_op(
                     // Refresh the /cookies panel in place: only the button
                     // status changes; the header stays untouched because the
                     // retired prompt message already carries the confirmation.
-                    crate::callbacks::render_cookies_panel(
+                    crate::ui::render_cookies_panel(
                         bot,
-                        crate::callbacks::PageTarget::EditMessage(
+                        crate::ui::PageTarget::EditMessage(
                             msg.chat.id,
                             teloxide::types::MessageId(panel_msg_id),
                         ),
@@ -1543,9 +1543,9 @@ pub async fn handle_pending_op(
                     };
                     retire_prompt(bot, msg.chat.id, prompt_msg_id, &status).await;
                     // Refresh the filter sub-page panel in place.
-                    crate::callbacks::render_feed_filter(
+                    crate::ui::render_feed_filter(
                         bot,
-                        crate::callbacks::PageTarget::EditMessage(
+                        crate::ui::PageTarget::EditMessage(
                             msg.chat.id,
                             teloxide::types::MessageId(panel_msg_id),
                         ),

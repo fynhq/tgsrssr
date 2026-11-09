@@ -152,9 +152,9 @@ pub(crate) async fn notify_admins_html(
 /// Resolve the owner's language preference from DB.
 pub(crate) async fn owner_lang(state: &AppState, owner_id: i64) -> Lang {
     // Delegate to the single source of truth for language resolution
-    // (callbacks::resolve_lang) — notifications have no Telegram client
+    // (langpref::resolve_lang) — notifications have no Telegram client
     // language hint, so pass None (falls back to En like before).
-    crate::callbacks::resolve_lang(state, owner_id, None).await
+    crate::langpref::resolve_lang(state, owner_id, None).await
 }
 
 /// Append a line "\nlabel：value" (skipped when the value is empty). The

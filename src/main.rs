@@ -10,6 +10,7 @@ mod htmlentities;
 mod htmltext;
 mod httpfollow;
 mod i18n;
+mod langpref;
 mod limits;
 mod logging;
 mod media;
@@ -21,6 +22,7 @@ mod scheduler;
 mod sendpolicy;
 mod ssrf;
 mod state;
+mod ui;
 
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
@@ -567,7 +569,7 @@ async fn register_pending_ops_sweep_job(
                     // Background sweep: no client language_code available, so
                     // resolve via the shared helper with None (DB preference
                     // first, English otherwise).
-                    let lang = callbacks::resolve_lang(&state, user_id, None).await;
+                    let lang = langpref::resolve_lang(&state, user_id, None).await;
                     crate::commands::retire_prompt(
                         &bot,
                         teloxide::types::ChatId(chat_id),
