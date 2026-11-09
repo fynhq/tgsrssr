@@ -1276,10 +1276,8 @@ async fn render_language_picker(
 ) -> ResponseResult<()> {
     let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     for option in Lang::ALL {
-        let label = match option {
-            Lang::Zh => i18n::t(lang, "language.zh"),
-            Lang::En => i18n::t(lang, "language.en"),
-        };
+        let label_key = option.label_key();
+        let label = i18n::t(lang, &label_key);
         let mark = if option == lang { "✓ " } else { "" };
         buttons.push(vec![InlineKeyboardButton::callback(
             format!("{mark}{label}"),

@@ -13,10 +13,12 @@
 //! first used.
 //!
 //! To add a language: add a variant, extend `db_value`, `Lang::ALL`,
-//! `source()` and the `strings()` map, then add `locales/<code>.conf`. The
-//! `t()` fallback already routes every non-English language to English. The
-//! locale tests iterate `Lang::ALL`, so the new file is checked automatically
-//! once these pieces are in place.
+//! `source()` and the `strings()` map, then add `locales/<code>.conf`.
+//! The file must define `language.<code>` plus every `cmd_menu.*` key;
+//! menu registration and the language picker iterate `Lang::ALL`, so no
+//! per-language match arms elsewhere are needed. The `t()` fallback routes
+//! every non-English language to English. The locale tests iterate
+//! `Lang::ALL`, so the new file is covered automatically.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -78,6 +80,13 @@ impl Lang {
     /// Settings key for a user.
     pub fn setting_key(user_id: i64) -> String {
         format!("lang:{user_id}")
+    }
+
+    /// Locale key for this language's display name (`language.<code>`).
+    /// Derived from `db_value` so the language picker does not need a
+    /// per-language match arm; every locale file must define this key.
+    pub fn label_key(self) -> String {
+        format!("language.{}", self.db_value())
     }
 
     fn source(self) -> &'static str {
@@ -223,6 +232,20 @@ mod tests {
     }
 
     #[test]
+    fn language_labels_exist_for_every_ui_language() {
+        for ui in Lang::ALL {
+            for option in Lang::ALL {
+                let key = option.label_key();
+                let label = t(ui, &key);
+                assert_ne!(label, "[?]", "missing {key} for {ui:?}");
+                assert!(!label.is_empty(), "empty {key} for {ui:?}");
+            }
+        }
+        assert_eq!(Lang::Zh.label_key(), "language.zh");
+        assert_eq!(Lang::En.label_key(), "language.en");
+    }
+
+    #[test]
     fn missing_keys_fall_back_to_marker() {
         for lang in Lang::ALL {
             assert_eq!(t(lang, "__missing_key__"), "[?]");
@@ -325,6 +348,12 @@ mod tests {
         let source = source_text();
         let re = regex::Regex::new(r#"i18n::t\s*\(\s*[^,]+,\s*"([a-z0-9_.]+)""#).unwrap();
         let mut keys: HashSet<String> = DYNAMIC_KEYS.iter().map(|key| (*key).to_string()).collect();
+        // Language-picker labels are looked up by `Lang::label_key()` rather
+        // than a literal `i18n::t` call; register every supported key so a
+        // new language's missing `language.<code>` fails the key-set test.
+        for lang in Lang::ALL {
+            keys.insert(lang.label_key());
+        }
         let mut literal_count = 0;
         for caps in re.captures_iter(&source) {
             keys.insert(caps[1].to_string());

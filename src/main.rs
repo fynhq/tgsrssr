@@ -31,6 +31,7 @@ use tracing::{error, info};
 
 use commands::Command;
 use config::Config;
+use i18n::Lang;
 use state::AppState;
 
 #[tokio::main]
@@ -172,14 +173,13 @@ async fn main() -> anyhow::Result<()> {
         .filter(|c| !is_admin_only_command(&c.command))
         .cloned()
         .collect();
-    // Per-language menus (Unreleased): Telegram keys the command menu on the
-    // language each client reports. The derive literals are English and are
-    // registered with no language_code, which is the fallback for every client
-    // whose language has no dedicated list; Chinese clients (zh-hans / zh-hant
-    // UIs) are matched by the two-letter ISO 639-1 code `zh` — the Bot API
-    // rejects subtag forms like `zh-hans` ("invalid language code"), so a
-    // single `zh` list serves both scripts. One shared text set
-    // (commands::menu_desc_zh).
+    // Per-language menus: Telegram keys the command menu on the language each
+    // client reports. The derive literals are English and are registered with
+    // no language_code, which is the fallback for every client whose language
+    // has no dedicated list. Every other `Lang` registers its two-letter code;
+    // the Bot API rejects subtag forms like `zh-hans` ("invalid language
+    // code"), so a single `zh` list serves both scripts. Descriptions come
+    // from locales via `commands::menu_desc`.
     //
     // Commands are private-chat only, so the user menu is registered under
     // AllPrivateChats and stale group/default menus are deleted below. The
@@ -211,18 +211,18 @@ async fn main() -> anyhow::Result<()> {
     }
     // Remove menus inherited by groups/channels from older versions (the
     // default scope is also cleared; private users are covered by the
-    // AllPrivateChats registrations above). Clear the language-specific `zh`
-    // fallback too: the previous version registered it under the default
-    // scope, and deleting only the default-language list would leave Chinese
-    // clients seeing the old menu in groups.
+    // AllPrivateChats registrations above). Clear each language-specific
+    // menu as well: an older version may have registered it under the
+    // default scope, and deleting only the language-less list would leave
+    // those clients seeing the old menu in groups.
     for (scope_desc, scope) in [
         ("groups", teloxide::types::BotCommandScope::AllGroupChats),
         ("default", teloxide::types::BotCommandScope::Default),
     ] {
-        for lang in MENU_LANGUAGES_ZH.iter().map(|l| Some(*l)).chain([None]) {
+        for lang in menu_language_codes().map(Some).chain([None]) {
             let mut req = bot.delete_my_commands().scope(scope.clone());
-            if let Some(l) = lang {
-                req = req.language_code(l.to_string());
+            if let Some(code) = lang {
+                req = req.language_code(code);
             }
             if let Err(e) = req.await {
                 error!(
@@ -596,13 +596,18 @@ fn is_admin_only_command(cmd: &str) -> bool {
     matches!(cmd.trim_start_matches('/'), "cookies" | "loget")
 }
 
-/// Client language codes for which a dedicated Chinese command menu is
-/// registered. The Bot API accepts only two-letter ISO 639-1 codes here and
-/// rejects subtag forms such as `zh-hans` ("invalid language code specified",
-/// verified against a live server) — Telegram normalizes Simplified and
-/// Traditional Chinese clients onto the single `zh` list, so one entry covers
-/// both scripts (same Chinese text set).
-const MENU_LANGUAGES_ZH: [&str; 1] = ["zh"];
+/// Telegram language codes that have a dedicated command-menu translation.
+/// English is the language-less fallback, so it is excluded. The Bot API
+/// accepts only two-letter ISO 639-1 codes here and rejects subtag forms such
+/// as `zh-hans` ("invalid language code specified", verified against a live
+/// server) — Telegram normalizes Simplified and Traditional Chinese clients
+/// onto the single `zh` list.
+fn menu_language_codes() -> impl Iterator<Item = &'static str> {
+    Lang::ALL
+        .into_iter()
+        .filter(|lang| *lang != Lang::En)
+        .map(Lang::db_value)
+}
 
 /// One menu variant: `(language_code, commands)`. `language_code = None`
 /// means "no dedicated language" — the fallback list every client uses when
@@ -611,21 +616,24 @@ type MenuVariant = (Option<String>, Vec<teloxide::types::BotCommand>);
 
 /// Build the per-language menu variants for one command list: the English
 /// base (registered with no language code, acting as the fallback) plus one
-/// Chinese-translated copy per `MENU_LANGUAGES_ZH` entry. The command order
-/// is preserved; only descriptions are replaced. An unknown command name
-/// keeps its English description rather than being dropped.
+/// translated copy per non-English `Lang`. The command order is preserved;
+/// only descriptions are replaced. An unknown command name keeps its English
+/// description rather than being dropped.
 fn menu_variants(cmds: &[teloxide::types::BotCommand]) -> Vec<MenuVariant> {
-    let mut out = Vec::with_capacity(1 + MENU_LANGUAGES_ZH.len());
+    let mut out = Vec::with_capacity(Lang::ALL.len());
     out.push((None, cmds.to_vec()));
-    for lang in MENU_LANGUAGES_ZH {
-        let zh = cmds
+    for lang in Lang::ALL {
+        if lang == Lang::En {
+            continue;
+        }
+        let localized = cmds
             .iter()
             .map(|c| {
-                let desc = commands::menu_desc_zh(&c.command).unwrap_or(c.description.as_str());
+                let desc = commands::menu_desc(lang, &c.command).unwrap_or(c.description.as_str());
                 teloxide::types::BotCommand::new(c.command.clone(), desc.to_string())
             })
             .collect();
-        out.push((Some(lang.to_string()), zh));
+        out.push((Some(lang.db_value().to_string()), localized));
     }
     out
 }
@@ -635,48 +643,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn menu_variants_covers_en_fallback_and_zh() {
+    fn menu_variants_cover_en_fallback_and_every_translation() {
         let base = vec![
             teloxide::types::BotCommand::new("/set", "Subscriptions"),
             teloxide::types::BotCommand::new("/find", "Find message source"),
         ];
         let variants = menu_variants(&base);
-        // English fallback + one Chinese list. The Bot API only accepts
-        // two-letter ISO 639-1 codes (zh-hans/zh-hant are rejected), so a
-        // single `zh` list serves both Simplified and Traditional clients.
-        assert_eq!(variants.len(), 2);
+        // English fallback + one translated list per non-English Lang.
+        assert_eq!(variants.len(), Lang::ALL.len());
 
         // English fallback carries the derive descriptions untouched.
         let (lang, en) = &variants[0];
         assert!(lang.is_none());
         assert_eq!(en[0].description, "Subscriptions");
 
-        // The Chinese list uses the `zh` code, keeps the derive "/" prefix
-        // (Telegram accepts either form when sending, menus show the bare
-        // name), and translates every command.
-        let (lang, zh) = &variants[1];
-        assert_eq!(lang.as_deref(), Some("zh"));
+        // Every non-English language registers its two-letter code and
+        // translates every command; the command order/prefix is preserved.
+        for option in Lang::ALL {
+            if option == Lang::En {
+                continue;
+            }
+            let (code, localized) = variants
+                .iter()
+                .find(|(code, _)| code.as_deref() == Some(option.db_value()))
+                .unwrap_or_else(|| panic!("missing menu for {option:?}"));
+            assert_eq!(code.as_deref(), Some(option.db_value()));
+            assert_eq!(localized.len(), base.len());
+            for (source, translated) in base.iter().zip(localized) {
+                assert_eq!(
+                    translated.description,
+                    commands::menu_desc(option, &source.command).expect("menu description"),
+                    "wrong {option:?} description for {}",
+                    source.command
+                );
+                assert_eq!(translated.command, source.command);
+            }
+        }
+
+        // Representative Chinese texts (the locale value, not a code table).
+        let (_, zh) = variants
+            .iter()
+            .find(|(code, _)| code.as_deref() == Some("zh"))
+            .expect("zh menu");
         assert_eq!(zh[0].description, "订阅管理");
         assert_eq!(zh[1].description, "查询消息源");
-        assert_eq!(zh[0].command, "/set");
-    }
-
-    #[test]
-    fn menu_desc_zh_covers_every_command_and_matches_derive() {
-        // Every command emitted by the derive must have a Chinese menu text:
-        // a missing entry would silently fall back to English in a Chinese
-        // client, which is exactly the regression this guards.
-        for c in Command::bot_commands() {
-            assert!(
-                commands::menu_desc_zh(&c.command).is_some(),
-                "missing Chinese menu description for {}",
-                c.command
-            );
-        }
-        // Unknown commands yield None (caller falls back to the English text)
-        // and both spellings resolve identically.
-        assert_eq!(commands::menu_desc_zh("/set"), commands::menu_desc_zh("set"));
-        assert_eq!(commands::menu_desc_zh("/nope"), None);
     }
 
     #[test]

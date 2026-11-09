@@ -14,10 +14,10 @@ use crate::try_or_reply;
 /// The `description` literals below are the **default (English)** command-menu
 /// texts: they feed `Command::bot_commands()`, which main.rs registers with an
 /// empty `language_code` (the fallback every client uses when it has no
-/// dedicated list). Chinese menu texts live in `menu_desc_zh()` and are
-/// registered under the two-letter code `zh` at startup (the Bot API rejects
-/// subtag forms like `zh-hans`, so one `zh` list covers Simplified and
-/// Traditional clients alike).
+/// dedicated list). Non-English menu texts live in `locales/*.conf` under
+/// `cmd_menu.*` and are registered under each language's two-letter code
+/// (the Bot API rejects subtag forms like `zh-hans`, so one `zh` list covers
+/// Simplified and Traditional clients alike).
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "RSS subscription bot commands")]
 pub enum Command {
@@ -41,23 +41,29 @@ pub enum Command {
     About,
 }
 
-/// Chinese command-menu descriptions, keyed by command name (leading `/`
-/// ignored — teloxide 0.17 derive emits both spellings across versions).
+/// Localized command-menu description for non-English languages, keyed by
+/// command name (leading `/` ignored — teloxide 0.17 derive emits both
+/// spellings across versions).
 ///
-/// Simplified and Traditional clients share this one list (see
-/// `MENU_LANGUAGES` in main.rs). Returns `None` for an unknown command so the
-/// caller can fall back to the default English text rather than dropping it.
-pub fn menu_desc_zh(cmd: &str) -> Option<&'static str> {
+/// Texts live in `locales/*.conf` under `cmd_menu.*`; English returns `None`
+/// so the caller keeps the derive description as the language-less fallback.
+/// Every non-English language registers its own two-letter code, so adding a
+/// language needs no match arm here. Returns `None` for an unknown command so
+/// the caller falls back to the default English text rather than dropping it.
+pub fn menu_desc(lang: Lang, cmd: &str) -> Option<&'static str> {
+    if lang == Lang::En {
+        return None;
+    }
     Some(match cmd.trim_start_matches('/') {
-        "start" => "帮助",
-        "set" => "订阅管理",
-        "list" => "订阅列表",
-        "sub" => "添加订阅",
-        "test" => "测试推送",
-        "find" => "查询消息源",
-        "cookies" => "平台验证",
-        "loget" => "获取日志",
-        "about" => "关于",
+        "start" => i18n::t(lang, "cmd_menu.start"),
+        "set" => i18n::t(lang, "cmd_menu.set"),
+        "list" => i18n::t(lang, "cmd_menu.list"),
+        "sub" => i18n::t(lang, "cmd_menu.sub"),
+        "test" => i18n::t(lang, "cmd_menu.test"),
+        "find" => i18n::t(lang, "cmd_menu.find"),
+        "cookies" => i18n::t(lang, "cmd_menu.cookies"),
+        "loget" => i18n::t(lang, "cmd_menu.loget"),
+        "about" => i18n::t(lang, "cmd_menu.about"),
         _ => return None,
     })
 }
@@ -1722,6 +1728,29 @@ mod tests {
             assert!(text.contains(&expected), "missing version link for {lang:?}");
             assert!(!text.contains("{}"), "placeholder left in {lang:?} text");
         }
+    }
+
+    #[test]
+    fn menu_desc_is_localized_for_every_non_english_language() {
+        for lang in Lang::ALL {
+            for c in Command::bot_commands() {
+                let desc = menu_desc(lang, &c.command);
+                if lang == Lang::En {
+                    assert_eq!(desc, None, "English must use the derive text: {}", c.command);
+                } else {
+                    assert!(
+                        desc.is_some(),
+                        "missing {lang:?} menu description for {}",
+                        c.command
+                    );
+                }
+            }
+        }
+        // Leading slash is optional; unknown commands fall back to English.
+        assert_eq!(menu_desc(Lang::Zh, "/set"), menu_desc(Lang::Zh, "set"));
+        assert_eq!(menu_desc(Lang::Zh, "/set"), Some("订阅管理"));
+        assert_eq!(menu_desc(Lang::Zh, "/nope"), None);
+        assert_eq!(menu_desc(Lang::En, "/set"), None);
     }
 
     #[test]
