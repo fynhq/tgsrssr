@@ -28,24 +28,6 @@ pub fn flood_retry_secs(err_str: &str) -> Option<u64> {
         .map(|caps| caps[1].parse().unwrap_or(5).min(60))
 }
 
-/// Flood-control backoff for media sends: if the error is a 429, sleep for
-/// the number of seconds Telegram demands and return true (caller should
-/// retry); returns false for non-flood errors or when retries are exhausted
-/// (caller should return the error). `tries` is capped at 2 to avoid an
-/// infinite loop in edge cases.
-pub async fn flood_backoff(err_str: &str, tries: &mut u32, chat_id: i64) -> bool {
-    if *tries >= 2 {
-        return false;
-    }
-    if let Some(secs) = flood_retry_secs(err_str) {
-        *tries += 1;
-        tracing::warn!(chat_id = chat_id, secs = secs, "media send flood control, backing off");
-        tokio::time::sleep(std::time::Duration::from_secs(secs + 1)).await;
-        return true;
-    }
-    false
-}
-
 /// Only retry on connection-class errors that are definitely undelivered;
 /// timeouts are not retried — on timeout the server may have already received
 /// and started processing the request, and resending that op would duplicate
@@ -206,6 +188,155 @@ pub fn classify_send_error(err_str: &str) -> SendFailureClass {
     SendFailureClass::Fatal
 }
 
+/// Capability set for one send-retry path. `SendRetryState` only offers the
+/// actions a path can actually perform: document sends may invalidate the
+/// file_id cache, drop a thumbnail, and retry transport errors; rich ops
+/// handle cache/thumbnail/flood but leave transport retries to the outer
+/// rich-ops loop; text sends add the HTML-to-plain fallback.
+#[derive(Debug, Clone, Copy)]
+pub struct SendRetryPolicy {
+    pub flood: bool,
+    pub transient: bool,
+    pub file_id: bool,
+    pub thumbnail: bool,
+    pub html_fallback: bool,
+}
+
+impl SendRetryPolicy {
+    pub const DOCUMENT: Self = Self {
+        flood: true,
+        transient: true,
+        file_id: true,
+        thumbnail: true,
+        html_fallback: false,
+    };
+    pub const RICH_OP: Self = Self {
+        flood: true,
+        transient: false,
+        file_id: true,
+        thumbnail: true,
+        html_fallback: false,
+    };
+    pub const TRANSIENT_ONLY: Self = Self {
+        flood: false,
+        transient: true,
+        file_id: false,
+        thumbnail: false,
+        html_fallback: false,
+    };
+    pub const FLOOD_ONLY: Self = Self {
+        flood: true,
+        transient: false,
+        file_id: false,
+        thumbnail: false,
+        html_fallback: false,
+    };
+    pub const TEXT: Self = Self {
+        flood: true,
+        transient: false,
+        file_id: false,
+        thumbnail: false,
+        html_fallback: true,
+    };
+    pub const POLL: Self = Self {
+        flood: true,
+        transient: true,
+        file_id: false,
+        thumbnail: false,
+        html_fallback: false,
+    };
+}
+
+/// The action a retry state wants the caller to take. The state owns the
+/// counters and capability checks; callers only perform the side effect
+/// (sleep, pace, invalidate a cache, or switch to plain text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendRetryAction {
+    RetryFlood { delay: Duration },
+    RetryTransient { delay: Duration },
+    DropFileIdCache,
+    DropThumbnail,
+    FallbackPlainText,
+    GiveUp,
+}
+
+/// Per-send retry state shared by every send path.
+///
+/// This centralizes the branch policy that used to be copied into each
+/// wrapper: flood is capped at two retries, transient errors follow
+/// `SEND_BACKOFF_SECS`, file_id/thumbnail recovery is available once, and
+/// the HTML-to-plain fallback gets a fresh flood budget (the old nested
+/// fallback loop kept its own counter).
+pub struct SendRetryState {
+    policy: SendRetryPolicy,
+    flood_tries: u32,
+    transient_tries: usize,
+    file_id_available: bool,
+    thumbnail_available: bool,
+    html_fallback_available: bool,
+}
+
+impl SendRetryState {
+    pub fn new(policy: SendRetryPolicy, file_id_cache: bool, thumbnail: bool) -> Self {
+        Self {
+            policy,
+            flood_tries: 0,
+            transient_tries: 0,
+            file_id_available: policy.file_id && file_id_cache,
+            thumbnail_available: policy.thumbnail && thumbnail,
+            html_fallback_available: policy.html_fallback,
+        }
+    }
+
+    /// Whether the next attempt should use the cached file_id.
+    pub fn use_file_id(&self) -> bool {
+        self.file_id_available
+    }
+
+    /// Whether the next attempt should attach the thumbnail.
+    pub fn use_thumbnail(&self) -> bool {
+        self.thumbnail_available
+    }
+
+    /// Classify one failure and return the next action. Counters and
+    /// one-shot capabilities are updated here so callers cannot drift.
+    pub fn next_action(&mut self, err_str: &str) -> SendRetryAction {
+        match classify_send_error(err_str) {
+            SendFailureClass::Flood if self.policy.flood && self.flood_tries < 2 => {
+                let secs = flood_retry_secs(err_str).unwrap_or(5);
+                self.flood_tries += 1;
+                SendRetryAction::RetryFlood {
+                    delay: Duration::from_secs(secs + 1),
+                }
+            }
+            SendFailureClass::FileId if self.file_id_available => {
+                self.file_id_available = false;
+                SendRetryAction::DropFileIdCache
+            }
+            SendFailureClass::Thumbnail if self.thumbnail_available => {
+                self.thumbnail_available = false;
+                SendRetryAction::DropThumbnail
+            }
+            SendFailureClass::HtmlParse if self.html_fallback_available => {
+                self.html_fallback_available = false;
+                // The plain-text fallback previously had its own flood
+                // counter; reset the budget so this path keeps the same
+                // number of retries after the switch.
+                self.flood_tries = 0;
+                SendRetryAction::FallbackPlainText
+            }
+            SendFailureClass::Retryable
+                if self.policy.transient && self.transient_tries < SEND_BACKOFF_SECS.len() =>
+            {
+                let delay = Duration::from_secs(SEND_BACKOFF_SECS[self.transient_tries]);
+                self.transient_tries += 1;
+                SendRetryAction::RetryTransient { delay }
+            }
+            _ => SendRetryAction::GiveUp,
+        }
+    }
+}
+
 /// Bounded exponential backoff sequence (seconds) for network errors
 /// (proxy flaps / upstream outages) and transient TG errors. Shared by
 /// media-op-level and text-chunk-level retries (#14 fix: merged the two
@@ -265,8 +396,11 @@ pub async fn pace(chat_id: i64) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         classify_send_error, is_ambiguous_send_error, is_send_retryable_error, SendFailureClass,
+        SendRetryAction, SendRetryPolicy, SendRetryState,
     };
 
     #[test]
@@ -297,6 +431,118 @@ mod tests {
         ] {
             assert_eq!(classify_send_error(err), expected, "{err}");
         }
+    }
+
+    #[test]
+    fn retry_state_caps_flood_and_transient_budgets() {
+        let mut flood = SendRetryState::new(SendRetryPolicy::FLOOD_ONLY, false, false);
+        for _ in 0..2 {
+            assert_eq!(
+                flood.next_action("Too Many Requests: retry after 5"),
+                SendRetryAction::RetryFlood {
+                    delay: Duration::from_secs(6)
+                }
+            );
+        }
+        assert_eq!(
+            flood.next_action("Too Many Requests: retry after 5"),
+            SendRetryAction::GiveUp
+        );
+
+        let mut transient = SendRetryState::new(SendRetryPolicy::TRANSIENT_ONLY, false, false);
+        for expected in [2, 5, 10] {
+            assert_eq!(
+                transient.next_action("tcp connect error: Connection refused"),
+                SendRetryAction::RetryTransient {
+                    delay: Duration::from_secs(expected)
+                }
+            );
+        }
+        assert_eq!(
+            transient.next_action("tcp connect error: Connection refused"),
+            SendRetryAction::GiveUp
+        );
+    }
+
+    #[test]
+    fn retry_state_uses_cache_and_thumbnail_once() {
+        let mut state = SendRetryState::new(SendRetryPolicy::DOCUMENT, true, true);
+        assert!(state.use_file_id());
+        assert_eq!(
+            state.next_action("Bad Request: wrong file identifier"),
+            SendRetryAction::DropFileIdCache
+        );
+        assert!(!state.use_file_id());
+        assert_eq!(
+            state.next_action("Bad Request: wrong file identifier"),
+            SendRetryAction::GiveUp
+        );
+
+        assert!(state.use_thumbnail());
+        assert_eq!(
+            state.next_action("Bad Request: PHOTO_INVALID_DIMENSIONS"),
+            SendRetryAction::DropThumbnail
+        );
+        assert!(!state.use_thumbnail());
+        assert_eq!(
+            state.next_action("Bad Request: PHOTO_INVALID_DIMENSIONS"),
+            SendRetryAction::GiveUp
+        );
+    }
+
+    #[test]
+    fn retry_state_html_fallback_resets_the_flood_budget() {
+        let mut state = SendRetryState::new(SendRetryPolicy::TEXT, false, false);
+        for _ in 0..2 {
+            assert!(matches!(
+                state.next_action("Too Many Requests: retry after 1"),
+                SendRetryAction::RetryFlood { .. }
+            ));
+        }
+        assert_eq!(
+            state.next_action("Bad Request: can't parse entities"),
+            SendRetryAction::FallbackPlainText
+        );
+        // The plain-text fallback has its own two-retry flood budget.
+        for _ in 0..2 {
+            assert!(matches!(
+                state.next_action("Too Many Requests: retry after 1"),
+                SendRetryAction::RetryFlood { .. }
+            ));
+        }
+        assert_eq!(
+            state.next_action("Too Many Requests: retry after 1"),
+            SendRetryAction::GiveUp
+        );
+        assert_eq!(
+            state.next_action("Bad Request: can't parse entities"),
+            SendRetryAction::GiveUp
+        );
+    }
+
+    #[test]
+    fn retry_state_only_offers_actions_enabled_by_its_policy() {
+        // Rich ops handle cache/thumbnail/flood; transport retries belong to
+        // the outer rich-ops loop.
+        let mut rich = SendRetryState::new(SendRetryPolicy::RICH_OP, true, true);
+        assert_eq!(
+            rich.next_action("tcp connect error: Connection refused"),
+            SendRetryAction::GiveUp
+        );
+        assert_eq!(
+            rich.next_action("Bad Request: PHOTO_INVALID_DIMENSIONS"),
+            SendRetryAction::DropThumbnail
+        );
+
+        let mut flood_only = SendRetryState::new(SendRetryPolicy::FLOOD_ONLY, true, true);
+        assert_eq!(
+            flood_only.next_action("Bad Request: wrong file identifier"),
+            SendRetryAction::GiveUp
+        );
+        assert_eq!(
+            flood_only.next_action("Bad Request: can't parse entities"),
+            SendRetryAction::GiveUp
+        );
     }
 
     #[test]

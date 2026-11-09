@@ -14,8 +14,7 @@ use crate::htmltext::{
 use crate::media::{MediaItem, MediaKind};
 use crate::richmsg::{self, RichMedia, RichMediaKind, RichMediaSource};
 use crate::sendpolicy::{
-    classify_send_error, error_chain_string, flood_backoff, flood_retry_secs, pace,
-    SendFailureClass, SEND_BACKOFF_SECS,
+    error_chain_string, pace, SendRetryAction, SendRetryPolicy, SendRetryState,
 };
 
 // Re-export pure HTML helpers for external callers (commands, callbacks,
@@ -58,9 +57,8 @@ pub fn channel_header_text(
 // Hot-path regexes are compiled statically once (hit on every message/chunk).
 // RE_TAG and the anchor/entity regexes live in crate::htmltext along with the
 // HTML helpers (imported via the `use` at the top).
-// Rate-limiting/backoff policy (pacer, flood_backoff, classify_send_error,
-// SEND_BACKOFF_SECS) moved to crate::sendpolicy (imported via the `use` at
-// the top).
+// Rate-limiting/backoff policy (pacer, SendRetryState, SendRetryPolicy)
+// moved to crate::sendpolicy (imported via the `use` at the top).
 // The Weibo poll data marker has been migrated to EntryMeta.poll (group-C
 // sidecar); RE_VOTE_DIV has been removed.
 
@@ -212,8 +210,8 @@ fn truncate_poll(question: &str, options: &[String], is_multi: bool) -> Option<(
 /// After a successful send the poll message is pinned automatically
 /// (following the channel notification options, allowed to replace an older
 /// pin).
-/// Paced before sending; on 429 it backs off and retries via flood_backoff
-/// (#4 fix).
+/// Paced before sending; flood and transient retries are driven by the
+/// shared SendRetryState policy (#4 fix).
 pub async fn send_poll(
     bot: &Bot,
     chat_id: i64,
@@ -229,8 +227,7 @@ pub async fn send_poll(
         .map(|o| InputPollOption { text: o.clone(), formatting: None })
         .collect();
     pace(chat_id).await;
-    let mut flood_tries: u32 = 0;
-    let mut transient_tries: usize = 0;
+    let mut retry = SendRetryState::new(SendRetryPolicy::POLL, false, false);
     let msg = loop {
         let mut req = bot
             .send_poll(ChatId(chat_id), question, poll_options.clone())
@@ -243,25 +240,22 @@ pub async fn send_poll(
             Ok(m) => break m,
             Err(e) => {
                 let es = error_chain_string(&e);
-                let class = classify_send_error(&es);
-                if class == SendFailureClass::Flood
-                    && flood_backoff(&es, &mut flood_tries, chat_id).await
-                {
-                    continue;
+                match retry.next_action(&es) {
+                    SendRetryAction::RetryFlood { delay } => {
+                        tracing::warn!(chat_id = chat_id, wait_secs = delay.as_secs(), error = %es, "poll send flood control, backing off");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    // v1.10.2: retry on network/TG transient errors
+                    // (consistent with the other send sites)
+                    SendRetryAction::RetryTransient { delay } => {
+                        tracing::warn!(chat_id = chat_id, backoff = delay.as_secs(), error = %es, "poll send transient error, backing off");
+                        tokio::time::sleep(delay).await;
+                        pace(chat_id).await;
+                        continue;
+                    }
+                    _ => return Err(e.into()),
                 }
-                // v1.10.2: retry on network/TG transient errors (consistent
-                // with the other send sites)
-                if class == SendFailureClass::Retryable
-                    && transient_tries < SEND_BACKOFF_SECS.len()
-                {
-                    let backoff = SEND_BACKOFF_SECS[transient_tries];
-                    tracing::warn!(chat_id = chat_id, backoff = backoff, error = %es, "poll send transient error, backing off");
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    pace(chat_id).await;
-                    transient_tries += 1;
-                    continue;
-                }
-                return Err(e.into());
             }
         }
     };
@@ -2056,45 +2050,37 @@ where
     F: FnMut(bool, bool) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    let mut use_cache = true;
-    let mut use_thumb = has_thumb;
-    let mut flood_tries = 0u32;
-    let mut transient_tries = 0usize;
+    let mut retry = SendRetryState::new(SendRetryPolicy::DOCUMENT, true, has_thumb);
     loop {
-        match attempt(use_cache, use_thumb).await {
+        match attempt(retry.use_file_id(), retry.use_thumbnail()).await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 let es = error_chain_string(e.as_ref());
-                let class = classify_send_error(&es);
-                if use_cache && class == SendFailureClass::FileId {
-                    for key in keys {
-                        db::invalidate_cached_file_id(db, key).await.ok();
+                match retry.next_action(&es) {
+                    SendRetryAction::DropFileIdCache => {
+                        for key in keys {
+                            db::invalidate_cached_file_id(db, key).await.ok();
+                        }
+                        pace(chat_id).await;
+                        continue;
                     }
-                    pace(chat_id).await;
-                    use_cache = false;
-                    continue;
+                    SendRetryAction::DropThumbnail => {
+                        tracing::warn!(chat_id = chat_id, error = %es, "thumbnail rejected, retrying without it");
+                        continue;
+                    }
+                    SendRetryAction::RetryFlood { delay } => {
+                        tracing::warn!(chat_id = chat_id, wait_secs = delay.as_secs(), error = %es, "send flood control, backing off");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    SendRetryAction::RetryTransient { delay } => {
+                        tracing::warn!(chat_id = chat_id, backoff = delay.as_secs(), error = %es, "send transient error, backing off");
+                        tokio::time::sleep(delay).await;
+                        pace(chat_id).await;
+                        continue;
+                    }
+                    _ => return Err(e),
                 }
-                if use_thumb && class == SendFailureClass::Thumbnail {
-                    tracing::warn!(chat_id = chat_id, error = %es, "thumbnail rejected, retrying without it");
-                    use_thumb = false;
-                    continue;
-                }
-                if class == SendFailureClass::Flood
-                    && flood_backoff(&es, &mut flood_tries, chat_id).await
-                {
-                    continue;
-                }
-                if class == SendFailureClass::Retryable
-                    && transient_tries < SEND_BACKOFF_SECS.len()
-                {
-                    let backoff = SEND_BACKOFF_SECS[transient_tries];
-                    tracing::warn!(chat_id = chat_id, backoff = backoff, error = %es, "send transient error, backing off");
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    pace(chat_id).await;
-                    transient_tries += 1;
-                    continue;
-                }
-                return Err(e);
             }
         }
     }
@@ -2245,20 +2231,21 @@ async fn send_rich_ops_with_retry(
     if let Err((_, first, _)) = &res {
         first_delivered = first.clone();
     }
-    for backoff in SEND_BACKOFF_SECS {
+    let mut retry = SendRetryState::new(SendRetryPolicy::TRANSIENT_ONLY, false, false);
+    loop {
         let retry_from = match &res {
-            Err((sent, _, e))
-                if *sent < ops.len()
-                    && classify_send_error(&error_chain_string(e.as_ref()))
-                        == SendFailureClass::Retryable =>
-            {
-                Some(*sent)
+            Err((sent, _, e)) if *sent < ops.len() => {
+                let es = error_chain_string(e.as_ref());
+                match retry.next_action(&es) {
+                    SendRetryAction::RetryTransient { delay } => Some((*sent, delay)),
+                    _ => None,
+                }
             }
             _ => None,
         };
-        let Some(sent) = retry_from else { break };
-        tracing::warn!(chat_id = chat_id, ctx = ctx, resume = sent, backoff = backoff, "rich send network error, backing off before retry");
-        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        let Some((sent, delay)) = retry_from else { break };
+        tracing::warn!(chat_id = chat_id, ctx = ctx, resume = sent, backoff = delay.as_secs(), "rich send network error, backing off before retry");
+        tokio::time::sleep(delay).await;
         let resume_anchor = first_delivered.as_ref().map(|m| m.id);
         res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, sent, reply_first_to, resume_anchor).await;
         if first_delivered.is_none() {
@@ -2404,32 +2391,29 @@ where
     F: FnMut(bool, bool) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    let mut use_cache = true;
-    let mut use_thumb = has_thumb;
-    let mut flood_tries = 0u32;
+    let mut retry = SendRetryState::new(SendRetryPolicy::RICH_OP, true, has_thumb);
     loop {
-        match attempt(use_cache, use_thumb).await {
+        match attempt(retry.use_file_id(), retry.use_thumbnail()).await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 let es = error_chain_string(e.as_ref());
-                let class = classify_send_error(&es);
-                if use_thumb && class == SendFailureClass::Thumbnail {
-                    tracing::warn!(chat_id = chat_id, error = %es, "thumbnail rejected, retrying without it");
-                    use_thumb = false;
-                    continue;
+                match retry.next_action(&es) {
+                    SendRetryAction::DropThumbnail => {
+                        tracing::warn!(chat_id = chat_id, error = %es, "thumbnail rejected, retrying without it");
+                        continue;
+                    }
+                    SendRetryAction::DropFileIdCache => {
+                        invalidate_op_cache(db, op).await;
+                        pace(chat_id).await;
+                        continue;
+                    }
+                    SendRetryAction::RetryFlood { delay } => {
+                        tracing::warn!(chat_id = chat_id, wait_secs = delay.as_secs(), error = %es, "op send flood control, backing off");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    _ => return Err(e),
                 }
-                if use_cache && class == SendFailureClass::FileId {
-                    invalidate_op_cache(db, op).await;
-                    pace(chat_id).await;
-                    use_cache = false;
-                    continue;
-                }
-                if class == SendFailureClass::Flood
-                    && flood_backoff(&es, &mut flood_tries, chat_id).await
-                {
-                    continue;
-                }
-                return Err(e);
             }
         }
     }
@@ -2592,88 +2576,56 @@ async fn send_single_html(
     link_preview: bool,
     reply_to: Option<teloxide::types::MessageId>,
 ) -> anyhow::Result<Message> {
-    // Flood backoff capped at 2 retries (consistent with the media path's
-    // flood_backoff).
-    const MAX_RETRIES: u32 = 2;
     // Unified blockquote folding rules (fold when >200 chars).
     let html_text = normalize_blockquote_fold(html_text);
     let lpo = if link_preview { None } else { Some(no_preview()) };
+    let mut retry = SendRetryState::new(SendRetryPolicy::TEXT, false, false);
+    let mut plain_text: Option<String> = None;
 
-    for attempt in 0..=MAX_RETRIES {
-        // Queue centrally per channel (including flood retries) so parallel
-        // sources don't hit rate limits
+    loop {
+        // Queue centrally per channel (including flood retries and the
+        // plain-text fallback) so parallel sources don't hit rate limits.
         pace(chat_id).await;
-        let mut req = bot
-            .send_message(ChatId(chat_id), html_text.as_str())
-            .parse_mode(ParseMode::Html);
+        let text = plain_text.as_deref().unwrap_or(html_text.as_str());
+        let mut req = bot.send_message(ChatId(chat_id), text);
+        if plain_text.is_none() {
+            req = req.parse_mode(ParseMode::Html);
+        }
         if let Some(o) = &lpo {
             req = req.link_preview_options(o.clone());
         }
         if let Some(rid) = reply_to {
             req = req.reply_parameters(teloxide::types::ReplyParameters::new(rid));
         }
-        let result = req.await;
 
-        match result {
+        match req.await {
             Ok(m) => return Ok(m),
             Err(e) => {
                 let err_str = error_chain_string(&e);
-                let class = classify_send_error(&err_str);
-                // Flood control: wait the requested time and retry.
-                if class == SendFailureClass::Flood {
-                    if attempt < MAX_RETRIES {
-                        let secs = flood_retry_secs(&err_str).unwrap_or(5);
-                        tracing::warn!(chat_id = chat_id, secs = secs, attempt = attempt, "flood control, backing off");
-                        tokio::time::sleep(std::time::Duration::from_secs(secs + 1)).await;
+                match retry.next_action(&err_str) {
+                    SendRetryAction::RetryFlood { delay } => {
+                        tracing::warn!(chat_id = chat_id, wait_secs = delay.as_secs(), "flood control, backing off");
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
-                    return Err(e.into());
-                }
-                // If Telegram can't parse HTML entities, fallback to plain text
-                if class == SendFailureClass::HtmlParse {
-                    // Stripping all formatting is a user-visible degradation;
-                    // leave a trace so we can track down which HTML triggered
-                    // it.
-                    tracing::warn!(
-                        chat_id = chat_id,
-                        error = %err_str,
-                        html_head = %html_text.chars().take(100).collect::<String>(),
-                        "HTML parse failed, falling back to plain text"
-                    );
-                    let plain = strip_html_tags(&html_text);
-                    // The fallback send gets its own flood backoff: a 429
-                    // here is not covered by the outer retry layer (429 is
-                    // Flood, not Retryable), and losing the chunk over a
-                    // transient flood window would push the entry to outbox
-                    // even though the HTML problem itself is permanent.
-                    let mut fallback_flood_tries = 0u32;
-                    loop {
-                        let mut req2 = bot.send_message(ChatId(chat_id), &plain);
-                        if let Some(o) = &lpo {
-                            req2 = req2.link_preview_options(o.clone());
-                        }
-                        if let Some(rid) = reply_to {
-                            req2 = req2.reply_parameters(teloxide::types::ReplyParameters::new(rid));
-                        }
-                        match req2.await {
-                            Ok(m) => return Ok(m),
-                            Err(e2) => {
-                                let err2 = error_chain_string(&e2);
-                                if classify_send_error(&err2) == SendFailureClass::Flood
-                                    && flood_backoff(&err2, &mut fallback_flood_tries, chat_id).await
-                                {
-                                    continue;
-                                }
-                                return Err(e2.into());
-                            }
-                        }
+                    SendRetryAction::FallbackPlainText => {
+                        // Stripping all formatting is a user-visible
+                        // degradation; leave a trace so we can track down
+                        // which HTML triggered it.
+                        tracing::warn!(
+                            chat_id = chat_id,
+                            error = %err_str,
+                            html_head = %html_text.chars().take(100).collect::<String>(),
+                            "HTML parse failed, falling back to plain text"
+                        );
+                        plain_text = Some(strip_html_tags(&html_text));
+                        continue;
                     }
+                    _ => return Err(e.into()),
                 }
-                return Err(e.into());
             }
         }
     }
-    unreachable!()
 }
 
 /// Send one already-split HTML chunk with bounded network/transient-TG
@@ -2687,22 +2639,24 @@ async fn send_chunk_with_retry(
     link_preview: bool,
     reply_to: Option<teloxide::types::MessageId>,
 ) -> anyhow::Result<Message> {
-    let mut send_res = send_single_html(bot, chat_id, text, link_preview, reply_to).await;
-    for backoff in SEND_BACKOFF_SECS {
-        if !matches!(
-            &send_res,
-            Err(e)
-                if classify_send_error(&error_chain_string(e.as_ref()))
-                    == SendFailureClass::Retryable
-        ) {
-            break;
+    let mut retry = SendRetryState::new(SendRetryPolicy::TRANSIENT_ONLY, false, false);
+    loop {
+        match send_single_html(bot, chat_id, text, link_preview, reply_to).await {
+            Ok(m) => return Ok(m),
+            Err(e) => {
+                let es = error_chain_string(e.as_ref());
+                match retry.next_action(&es) {
+                    SendRetryAction::RetryTransient { delay } => {
+                        tracing::warn!(chat_id = chat_id, backoff = delay.as_secs(), "text chunk send failed, retrying");
+                        tokio::time::sleep(delay).await;
+                        pace(chat_id).await;
+                        continue;
+                    }
+                    _ => return Err(e),
+                }
+            }
         }
-        tracing::warn!(chat_id = chat_id, backoff = backoff, "text chunk send failed, retrying");
-        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-        pace(chat_id).await;
-        send_res = send_single_html(bot, chat_id, text, link_preview, reply_to).await;
     }
-    send_res
 }
 
 /// Build a t.me link for a message in a channel/supergroup (best effort).

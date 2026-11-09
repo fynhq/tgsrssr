@@ -12,6 +12,9 @@ use tracing::{error, warn};
 use crate::db;
 use crate::i18n::{self, Lang};
 use crate::push;
+use crate::sendpolicy::{
+    error_chain_string, pace, SendRetryAction, SendRetryPolicy, SendRetryState,
+};
 use crate::state::AppState;
 
 /// Send one message with the shared per-chat pacer and flood-control
@@ -25,9 +28,9 @@ async fn send_message_with_pace_flood(
     html: bool,
     no_preview: &teloxide::types::LinkPreviewOptions,
 ) -> Option<String> {
-    let mut tries = 0u32;
+    let mut retry = SendRetryState::new(SendRetryPolicy::FLOOD_ONLY, false, false);
     loop {
-        crate::sendpolicy::pace(chat_id).await;
+        pace(chat_id).await;
         let mut req = bot
             .send_message(ChatId(chat_id), text)
             .link_preview_options(no_preview.clone());
@@ -37,14 +40,15 @@ async fn send_message_with_pace_flood(
         match req.await {
             Ok(_) => return None,
             Err(e) => {
-                let err_str = crate::sendpolicy::error_chain_string(&e);
-                if crate::sendpolicy::classify_send_error(&err_str)
-                    == crate::sendpolicy::SendFailureClass::Flood
-                    && crate::sendpolicy::flood_backoff(&err_str, &mut tries, chat_id).await
-                {
-                    continue;
+                let err_str = error_chain_string(&e);
+                match retry.next_action(&err_str) {
+                    SendRetryAction::RetryFlood { delay } => {
+                        warn!(chat_id = chat_id, wait_secs = delay.as_secs(), "notification flood control, backing off");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    _ => return Some(err_str),
                 }
-                return Some(err_str);
             }
         }
     }
