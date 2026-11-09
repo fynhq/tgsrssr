@@ -340,9 +340,10 @@ pub(crate) async fn render_channel_list(
     Ok(())
 }
 
-/// Render the language picker. Every supported language is one button; the
-/// current one is marked with a check. Selecting a language writes the user
-/// preference and returns to the channel list in that language.
+/// Render the language picker. Every supported language is one button, always
+/// labelled with that language's own name; the current one is marked with a
+/// check. Selecting a language writes the user preference and returns to the
+/// channel list in that language.
 pub(crate) async fn render_language_picker(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -350,8 +351,7 @@ pub(crate) async fn render_language_picker(
 ) -> ResponseResult<()> {
     let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     for option in Lang::ALL {
-        let label_key = option.label_key();
-        let label = i18n::t(lang, &label_key);
+        let label = option.label();
         let mark = if option == lang { "✓ " } else { "" };
         buttons.push(vec![InlineKeyboardButton::callback(
             format!("{mark}{label}"),

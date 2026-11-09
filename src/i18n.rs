@@ -14,11 +14,12 @@
 //!
 //! To add a language: add a variant, extend `db_value`, `Lang::ALL`,
 //! `source()` and the `strings()` map, then add `locales/<code>.conf`.
-//! The file must define `language.<code>` plus every `cmd_menu.*` key;
-//! menu registration and the language picker iterate `Lang::ALL`, so no
-//! per-language match arms elsewhere are needed. The `t()` fallback routes
-//! every non-English language to English. The locale tests iterate
-//! `Lang::ALL`, so the new file is covered automatically.
+//! The file must define its own `language.<code>` key (the language's
+//! self-name) plus every `cmd_menu.*` key; menu registration and the language
+//! picker iterate `Lang::ALL`, so no per-language match arms elsewhere are
+//! needed. The `t()` fallback routes every non-English language to English.
+//! The locale tests iterate `Lang::ALL`, so the new file is covered
+//! automatically.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -84,9 +85,16 @@ impl Lang {
 
     /// Locale key for this language's display name (`language.<code>`).
     /// Derived from `db_value` so the language picker does not need a
-    /// per-language match arm; every locale file must define this key.
+    /// per-language match arm; only the language's own locale file defines
+    /// this key.
     pub fn label_key(self) -> String {
         format!("language.{}", self.db_value())
+    }
+
+    /// The language's own display name, read from its own locale file so a
+    /// picker option is never translated by the current UI language.
+    pub fn label(self) -> &'static str {
+        t(self, &self.label_key())
     }
 
     fn source(self) -> &'static str {
@@ -232,17 +240,29 @@ mod tests {
     }
 
     #[test]
-    fn language_labels_exist_for_every_ui_language() {
-        for ui in Lang::ALL {
-            for option in Lang::ALL {
-                let key = option.label_key();
-                let label = t(ui, &key);
-                assert_ne!(label, "[?]", "missing {key} for {ui:?}");
-                assert!(!label.is_empty(), "empty {key} for {ui:?}");
+    fn language_labels_are_owned_by_their_locale() {
+        for owner in Lang::ALL {
+            let key = owner.label_key();
+            for lang in Lang::ALL {
+                let defined = lang.strings().contains_key(key.as_str());
+                assert_eq!(
+                    defined,
+                    lang == owner,
+                    "{key} must be defined only in the {owner:?} locale"
+                );
             }
+            assert_ne!(owner.label(), "[?]", "missing label for {owner:?}");
+            assert!(!owner.label().is_empty(), "empty {} label", owner.label_key());
         }
         assert_eq!(Lang::Zh.label_key(), "language.zh");
         assert_eq!(Lang::En.label_key(), "language.en");
+    }
+
+    #[test]
+    fn language_picker_labels_are_self_names() {
+        // Escapes keep source files outside the CJK allowlist free of CJK.
+        assert_eq!(Lang::Zh.label(), "\u{4e2d}\u{6587}");
+        assert_eq!(Lang::En.label(), "English");
     }
 
     #[test]
@@ -283,17 +303,24 @@ mod tests {
     fn locale_files_have_matching_non_empty_keys() {
         let baseline = Lang::En.strings();
         assert!(baseline.len() > 200, "only {} en keys", baseline.len());
-        let baseline_keys: HashSet<_> = baseline.keys().copied().collect();
+        let label_keys: HashSet<String> = Lang::ALL.iter().map(|lang| lang.label_key()).collect();
+        let baseline_keys: HashSet<_> = baseline
+            .keys()
+            .copied()
+            .filter(|key| !label_keys.contains(*key))
+            .collect();
         for lang in Lang::ALL {
             let strings = lang.strings();
-            assert_eq!(
-                strings.len(),
-                baseline.len(),
-                "{lang:?} key count differs from en"
-            );
-            let keys: HashSet<_> = strings.keys().copied().collect();
+            let keys: HashSet<_> = strings
+                .keys()
+                .copied()
+                .filter(|key| !label_keys.contains(*key))
+                .collect();
             assert_eq!(keys, baseline_keys, "{lang:?} key set differs from en");
             for (key, value) in strings {
+                if label_keys.contains(*key) {
+                    continue;
+                }
                 assert!(!value.is_empty(), "empty {lang:?} translation for {key}");
             }
         }
@@ -348,9 +375,10 @@ mod tests {
         let source = source_text();
         let re = regex::Regex::new(r#"i18n::t\s*\(\s*[^,]+,\s*"([a-z0-9_.]+)""#).unwrap();
         let mut keys: HashSet<String> = DYNAMIC_KEYS.iter().map(|key| (*key).to_string()).collect();
-        // Language-picker labels are looked up by `Lang::label_key()` rather
-        // than a literal `i18n::t` call; register every supported key so a
-        // new language's missing `language.<code>` fails the key-set test.
+        // Language-picker labels are looked up through `Lang::label()` /
+        // `label_key()` rather than a literal `i18n::t` call; register every
+        // supported key so a new language's missing `language.<code>` fails
+        // the key-set test.
         for lang in Lang::ALL {
             keys.insert(lang.label_key());
         }
@@ -376,9 +404,14 @@ mod tests {
             literal_count > 300,
             "only {literal_count} literal i18n::t calls scanned"
         );
+        let label_keys: HashSet<String> = Lang::ALL.iter().map(|lang| lang.label_key()).collect();
         for lang in Lang::ALL {
             let strings = lang.strings();
+            let own_label = lang.label_key();
             for key in &referenced {
+                if label_keys.contains(key) && *key != own_label {
+                    continue;
+                }
                 assert!(
                     strings.contains_key(key.as_str()),
                     "missing {lang:?} key {key}"
@@ -408,12 +441,16 @@ mod tests {
     #[test]
     fn placeholders_match_between_languages() {
         let baseline = Lang::En.strings();
+        let label_keys: HashSet<String> = Lang::ALL.iter().map(|lang| lang.label_key()).collect();
         for lang in Lang::ALL {
             if lang == Lang::En {
                 continue;
             }
             for (key, value) in lang.strings() {
                 let key = *key;
+                if label_keys.contains(key) {
+                    continue;
+                }
                 let base = baseline
                     .get(key)
                     .unwrap_or_else(|| panic!("missing en key {key}"));
