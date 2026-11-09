@@ -475,17 +475,14 @@ async fn wait_for_bot_api(bot: &Bot) -> anyhow::Result<String> {
     anyhow::bail!("Bot API not reachable after 30 attempts");
 }
 
+/// Fixed periodic cleanup interval.
+const CLEANUP_INTERVAL_MINUTES: u64 = 60;
+
 /// Register the periodic cleanup job.
 async fn register_cleanup_job(sched: &JobScheduler, state: AppState) -> anyhow::Result<()> {
-    let interval = if state.config.cleanup_interval_minutes == 0 {
-        60
-    } else {
-        state.config.cleanup_interval_minutes
-    };
-    // Tick every minute and gate with the configured interval. A cron
-    // `0 */N` step is anchored to the hour, so values that do not divide 60
-    // (e.g. 45) would run at 45/15-minute intervals instead of 45. The gate
-    // makes every value mean exactly what the configuration says.
+    let interval = CLEANUP_INTERVAL_MINUTES;
+    // Tick every minute and gate with the fixed interval. The gate keeps the
+    // first run anchored to process start rather than the wall clock.
     let (expr, gate_secs) = (
         "0 * * * * *".to_string(),
         Some(interval.saturating_mul(60)),

@@ -11,6 +11,15 @@ use walkdir::WalkDir;
 use crate::config::Config;
 use crate::db::{self, Db};
 
+/// Fixed retention for outbound media date directories.
+const OUTBOUND_TTL_HOURS: u64 = 80;
+/// Fixed retention for orphaned sent-entry markers.
+const SENT_ENTRIES_RETENTION_DAYS: i64 = 180;
+/// Fixed retention for the file_id upload dedup cache.
+const FILE_ID_CACHE_RETENTION_DAYS: i64 = 30;
+/// Fixed row cap for the sent-messages registry.
+const SENT_MESSAGES_MAX_ROWS: i64 = 5000;
+
 /// Run all cleanup tasks once. `ctx` is a log prefix distinguishing the
 /// periodic run ("cleanup") from the startup run ("startup cleanup").
 /// L6 fix: run_all_cleanup and run_startup_cleanup duplicated the same
@@ -37,7 +46,7 @@ async fn run_cleanup_tasks(config: &Config, db_pool: &Db, ctx: &str) {
     if let Err(e) = cleanup_logs(config).await {
         warn!(error = %e, ctx = ctx, "log cleanup failed");
     }
-    if let Err(e) = cleanup_database(db_pool, config).await {
+    if let Err(e) = cleanup_database(db_pool).await {
         warn!(error = %e, ctx = ctx, "database cleanup failed");
     }
     if let Err(e) = backup_database(db_pool, config).await {
@@ -113,7 +122,7 @@ pub async fn cleanup_outbound(
     }
     // UTC cutoff, paired with the UTC date_dir written by media.rs: the
     // comparison only stays correct if both sides use the same clock.
-    let cutoff = outbound_cutoff(chrono::Utc::now().date_naive(), config.outbound_ttl_hours);
+    let cutoff = outbound_cutoff(chrono::Utc::now().date_naive(), OUTBOUND_TTL_HOURS);
     let mut removed = 0u64;
 
     let mut entries = fs::read_dir(&outbound).await?;
@@ -341,7 +350,7 @@ pub async fn cleanup_logs(config: &Config) -> anyhow::Result<u64> {
 }
 
 /// Clean up database tables.
-pub async fn cleanup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()> {
+pub async fn cleanup_database(db_pool: &Db) -> anyhow::Result<()> {
     // Each step is independent: a transient DB error in one sweep must not
     // cancel the remaining maintenance for this round.
     async fn step<F, Fut>(name: &'static str, f: F) -> u64
@@ -361,13 +370,13 @@ pub async fn cleanup_database(db_pool: &Db, config: &Config) -> anyhow::Result<(
     // Only orphaned markers expire; markers for existing subscriptions are
     // kept regardless of age (see db::cleanup_sent_entries).
     let r1 = step("sent_entries", || {
-        db::cleanup_sent_entries(db_pool, config.sent_entries_retention_days)
+        db::cleanup_sent_entries(db_pool, SENT_ENTRIES_RETENTION_DAYS)
     })
     .await;
-    // The file_id cache is cleaned by retention period (default 30 days);
+    // The file_id cache is cleaned by retention period (30 days);
     // sent_messages is trimmed by row-count cap, so no time-based cleanup needed.
     let r2 = step("file_id_cache", || {
-        db::cleanup_file_id_cache(db_pool, config.file_id_cache_retention_days)
+        db::cleanup_file_id_cache(db_pool, FILE_ID_CACHE_RETENTION_DAYS)
     })
     .await;
     // media_dl_fail: keys are only removed at two points — "download
@@ -397,7 +406,7 @@ pub async fn cleanup_database(db_pool: &Db, config: &Config) -> anyhow::Result<(
     // sent_messages is capped by row count; trim here instead of on every
     // delivered message (the old per-insert COUNT was a full scan).
     let r6 = step("sent_messages", || {
-        db::trim_sent_messages(db_pool, config.sent_messages_max_rows)
+        db::trim_sent_messages(db_pool, SENT_MESSAGES_MAX_ROWS)
     })
     .await;
     // Note: teloxide_dialogues table has no timestamp column.

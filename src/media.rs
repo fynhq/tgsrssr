@@ -1705,7 +1705,7 @@ pub async fn prepare_entry_media(
             item.duration_secs = dur;
         } else if item.kind == MediaKind::Image
             && !item.is_gif
-            && (image_goes_to_doc(item.size, item.width, item.height, state.config.long_image_aspect_ratio)
+            && (image_goes_to_doc(item.size, item.width, item.height, crate::config::LONG_IMAGE_ASPECT_RATIO)
                 || !photo_format_compatible(&item.path))
         {
             // Long/oversized images and formats that must go through

@@ -284,8 +284,8 @@ impl AppState {
         let media_trusted_insecure = build_client(None, true, false, false)?;
 
         Ok(Self {
-            fetch_semaphore: Arc::new(Semaphore::new(config.fetch_concurrency)),
-            download_semaphore: Arc::new(Semaphore::new(config.download_concurrency)),
+            fetch_semaphore: Arc::new(Semaphore::new(crate::config::FETCH_CONCURRENCY)),
+            download_semaphore: Arc::new(Semaphore::new(crate::config::DOWNLOAD_CONCURRENCY)),
             media_budget: Arc::new(crate::media::MediaBudget::new()),
             host_download_semaphores: Arc::new(Mutex::new(HashMap::new())),
             fetch_cycle_active: Arc::new(AtomicBool::new(false)),

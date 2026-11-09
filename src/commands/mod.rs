@@ -1101,7 +1101,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         media_count = prepared.items.len(),
         allow_rich = opts.allow_rich,
         caption_above_media = caption_above_media,
-        aspect_threshold = state.config.long_image_aspect_ratio,
+        aspect_threshold = crate::config::LONG_IMAGE_ASPECT_RATIO,
         "/test: send start"
     );
     let result = push::send_entry_with_media(
@@ -1114,7 +1114,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
             author: author.as_deref(),
             opts,
             caption_above_media,
-            aspect_threshold: state.config.long_image_aspect_ratio,
+            aspect_threshold: crate::config::LONG_IMAGE_ASPECT_RATIO,
             media: &prepared.items,
             meta,
         },

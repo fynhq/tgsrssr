@@ -302,7 +302,7 @@ pub const MAX_BODY_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Upper bound on entries retained from one RSS/Atom body. A hostile or
 /// excessively large feed otherwise keeps a huge Vec alive through the whole
-/// media/send loop (up to `RSS_PROCESS_CONCURRENCY` feeds at once). Newest
+/// media/send loop (up to `FETCH_CONCURRENCY` feeds at once). Newest
 /// entries are kept after the normal newest-first sort.
 pub const MAX_ENTRIES_PER_FEED: usize = 500;
 

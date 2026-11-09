@@ -25,20 +25,23 @@ const MAX_SEND_FAILURES: i64 = 3;
 /// bound.
 const OUTBOX_PER_FEED_LIMIT: i64 = 20;
 
+/// Fixed scheduler polling tick. Actual fetch intervals still come from each
+/// source/channel's `interval_minutes`.
+const SCHEDULER_INTERVAL_MINUTES: u64 = 5;
+
 /// Register the RSS fetch job on the scheduler.
 pub async fn register_fetch_job(
     sched: &JobScheduler,
     state: AppState,
     bot: Bot,
 ) -> anyhow::Result<()> {
-    let interval = state.config.scheduler_interval_minutes;
+    let interval = SCHEDULER_INTERVAL_MINUTES;
     // The cron minute field only accepts steps of 1-59: large intervals (such
     // as the 3/6/12-hour options in the panel) cannot be written directly as
-    // */180 — that is an invalid expression. Converge uniformly to a trigger
-    // frequency of one tick per 1-5 minutes; whether each source is due is
-    // decided precisely by the get_due_subscriptions SQL using its own interval.
-    let tick = interval.clamp(1, 5);
-    let expr = format!("0 */{} * * * *", tick);
+    // */180 — that is an invalid expression. A fixed 5-minute tick is used;
+    // whether each source is due is decided precisely by the
+    // get_due_subscriptions SQL using its own interval.
+    let expr = format!("0 */{} * * * *", interval);
 
     sched
         .add(Job::new_async(expr.as_str(), move |_uuid, _l| {
@@ -52,7 +55,7 @@ pub async fn register_fetch_job(
         })?)
         .await?;
 
-    info!(interval_min = interval, tick_min = tick, "fetch job registered");
+    info!(interval_min = interval, tick_min = interval, "fetch job registered");
     Ok(())
 }
 
@@ -191,17 +194,6 @@ struct PlatRoundStats {
     active_counts: std::collections::HashMap<&'static str, usize>,
 }
 
-/// Maximum number of RSS sources processed concurrently by one fetch cycle.
-///
-/// The fetch semaphore inside `fetcher::fetch_feed` only covers the request
-/// stage; after fetching, a task keeps its whole parsed `FeedResult` alive
-/// while it downloads media and sends messages. Without a second cap, that
-/// retained state (and the concurrent uploads) scales with the number of due
-/// subscriptions instead of the fetch concurrency. Platform sources stay
-/// strictly serial and are intentionally not gated here, so they can start
-/// immediately after the RSS tasks are spawned.
-const RSS_PROCESS_CONCURRENCY: usize = 8;
-
 /// One full fetch cycle: find due subscriptions, fetch, push new entries.
 /// Media/pipeline warnings notify the channel owner immediately
 /// (notify_owner_html) instead of being batched until the end of the cycle.
@@ -284,14 +276,15 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         .partition(|(sub, _)| platform_of_url(&sub.feed_url).is_some());
 
     // Plain RSS sources: the fetch request itself is bounded by
-    // `state.fetch_semaphore` inside fetcher::fetch_feed (FETCH_CONCURRENCY,
-    // which also covers /sub and /test). `process_sem` bounds the whole
-    // per-source processing (fetch + media downloads + sends): a task keeps
-    // its parsed FeedResult alive until its last entry is pushed, so without
-    // this cap the retained memory would scale with the number of due
-    // subscriptions instead of a fixed limit. Platform sources stay serial
-    // and are deliberately not gated so they keep their priority.
-    let process_sem = std::sync::Arc::new(Semaphore::new(RSS_PROCESS_CONCURRENCY));
+    // `state.fetch_semaphore` inside fetcher::fetch_feed
+    // (config::FETCH_CONCURRENCY, which also covers /sub and /test).
+    // `process_sem` bounds the whole per-source processing (fetch + media
+    // downloads + sends): a task keeps its parsed FeedResult alive until its
+    // last entry is pushed, so without this cap the retained memory would
+    // scale with the number of due subscriptions instead of a fixed limit.
+    // Platform sources stay serial and are deliberately not gated so they keep
+    // their priority.
+    let process_sem = std::sync::Arc::new(Semaphore::new(crate::config::FETCH_CONCURRENCY));
     // Each handle is paired with a copy of the feed_url: once sub is moved
     // into the spawn closure, the source identifier can no longer be obtained
     // at the join site and failure logs would lose their locator info
@@ -1140,7 +1133,7 @@ async fn process_feed(
                             author: author.as_deref(),
                             opts,
                             caption_above_media: cfg.caption_above_media,
-                            aspect_threshold: state.config.long_image_aspect_ratio,
+                            aspect_threshold: crate::config::LONG_IMAGE_ASPECT_RATIO,
                             media: &prepared.items,
                             meta,
                         },
@@ -2153,7 +2146,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     author,
                     opts,
                     caption_above_media: row.caption_above_media,
-                    aspect_threshold: state.config.long_image_aspect_ratio,
+                    aspect_threshold: crate::config::LONG_IMAGE_ASPECT_RATIO,
                     media: &media_items,
                     meta: meta_ref,
                 },

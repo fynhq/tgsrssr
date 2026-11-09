@@ -9,6 +9,13 @@ pub enum TrustedPrivateScope {
     Allowed,
 }
 
+/// Fixed concurrency for RSS fetches and per-source processing.
+pub const FETCH_CONCURRENCY: usize = 8;
+/// Fixed concurrency for media downloads.
+pub const DOWNLOAD_CONCURRENCY: usize = 4;
+/// Fixed aspect-ratio threshold above which images are sent as documents.
+pub const LONG_IMAGE_ASPECT_RATIO: f64 = 8.0;
+
 /// Application configuration loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -28,9 +35,7 @@ pub struct Config {
 
     // Media
     pub media_dir: PathBuf,
-    pub outbound_ttl_hours: u64,
     pub media_max_size_gb: u64,
-    pub long_image_aspect_ratio: f64,
     /// Maximum size of one downloaded media item (MB). Applies to all media
     /// types, not just videos; official/local Bot API transport caps still
     /// apply on top of it.
@@ -74,25 +79,9 @@ pub struct Config {
     pub img_relay_domains: Vec<String>,
 
     // Cleanup
-    /// Retention for orphaned sent-entry markers only (no matching
-    /// subscription row). Markers for existing subscriptions are never purged
-    /// by age (see db::cleanup_sent_entries).
-    pub sent_entries_retention_days: i64,
-    pub cleanup_interval_minutes: u64,
     pub log_retention_days: i64,
     /// Daily DB backups kept this many days.
     pub backup_retention_days: i64,
-    /// Retention days for the file_id upload dedup cache (expired entries are
-    /// removed by the cleanup task).
-    pub file_id_cache_retention_days: i64,
-    /// Row-count cap for the sent-messages registry (oldest rows are deleted
-    /// when exceeded).
-    pub sent_messages_max_rows: i64,
-
-    // Scheduler
-    pub scheduler_interval_minutes: u64,
-    pub fetch_concurrency: usize,
-    pub download_concurrency: usize,
 
     // Error handling
     pub max_fetch_errors: i64,
@@ -132,12 +121,6 @@ impl Config {
         let img_relay_base_url = env_or("IMG_RELAY_BASE_URL", "");
         let img_relay_domains = split_host_list("IMG_RELAY_DOMAINS", true);
 
-        let cleanup_interval_minutes = {
-            let v = env_parse_or("CLEANUP_INTERVAL_MINUTES", 60u64);
-            let v = if v == 0 { 60 } else { v };
-            clamp_warn("CLEANUP_INTERVAL_MINUTES", v, 1, 1440)
-        };
-
         Ok(Self {
             token,
             bot_api_url,
@@ -148,20 +131,11 @@ impl Config {
             media_dir,
             log_dir,
             bot_api_media_dir,
-            outbound_ttl_hours: clamp_warn(
-                "MEDIA_OUTBOUND_TTL_HOURS",
-                env_parse_or("MEDIA_OUTBOUND_TTL_HOURS", 80u64),
-                1,
-                87_600,
-            ),
             media_max_size_gb: clamp_warn(
                 "MEDIA_MAX_SIZE_GB",
                 env_parse_or("MEDIA_MAX_SIZE_GB", 10u64),
                 1,
                 1000,
-            ),
-            long_image_aspect_ratio: validate_aspect_ratio(
-                env_parse_or("LONG_IMAGE_ASPECT_RATIO", 8.0),
             ),
             max_media_download_mb: clamp_warn(
                 "MAX_MEDIA_DOWNLOAD_MB",
@@ -197,13 +171,6 @@ impl Config {
             // Retention-day floor of 1: a misconfigured negative/0 value would
             // make the datetime('-N days') modifier invalid (cleanup silently
             // stops working and the table grows unboundedly).
-            sent_entries_retention_days: clamp_warn(
-                "SENT_ENTRIES_RETENTION_DAYS",
-                env_parse_or("SENT_ENTRIES_RETENTION_DAYS", 180i64),
-                1,
-                3650,
-            ),
-            cleanup_interval_minutes,
             log_retention_days: clamp_warn(
                 "LOG_RETENTION_DAYS",
                 env_parse_or("LOG_RETENTION_DAYS", 30i64),
@@ -215,38 +182,6 @@ impl Config {
                 env_parse_or("BACKUP_RETENTION_DAYS", 7i64),
                 1,
                 3650,
-            ),
-            file_id_cache_retention_days: clamp_warn(
-                "FILE_ID_CACHE_RETENTION_DAYS",
-                env_parse_or("FILE_ID_CACHE_RETENTION_DAYS", 30i64),
-                1,
-                3650,
-            ),
-            sent_messages_max_rows: clamp_warn(
-                "SENT_MESSAGES_MAX_ROWS",
-                env_parse_or("SENT_MESSAGES_MAX_ROWS", 5000i64),
-                1,
-                1_000_000,
-            ),
-            scheduler_interval_minutes: clamp_warn(
-                "SCHEDULER_INTERVAL_MINUTES",
-                env_parse_or("SCHEDULER_INTERVAL_MINUTES", 5u64),
-                1,
-                5,
-            ),
-            // Concurrency floor of 1: a misconfigured 0 would make
-            // Semaphore(0)'s acquire never succeed, silently hanging fetches.
-            fetch_concurrency: clamp_warn(
-                "FETCH_CONCURRENCY",
-                env_parse_or("FETCH_CONCURRENCY", 8usize),
-                1,
-                32,
-            ),
-            download_concurrency: clamp_warn(
-                "DOWNLOAD_CONCURRENCY",
-                env_parse_or("DOWNLOAD_CONCURRENCY", 4usize),
-                1,
-                16,
             ),
             // Floor of 1: MAX_FETCH_ERRORS=0 makes the `count >= max` check in
             // the scheduler true on the very first failure, auto-disabling a
@@ -365,7 +300,7 @@ fn env_parse_or<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {
             Ok(x) => x,
             Err(_) => {
                 // Silently falling back to the default on an invalid value is a
-                // debugging trap (e.g. FETCH_CONCURRENCY=abc), so leave a trace.
+                // debugging trap (e.g. MAX_FETCH_ERRORS=abc), so leave a trace.
                 // Logging isn't initialized yet, so use eprintln.
                 eprintln!("WARNING: {} has invalid value '{}', using default", key, v);
                 default
@@ -431,20 +366,6 @@ fn validate_single_admin(ids: Vec<i64>) -> anyhow::Result<i64> {
     }
 }
 
-/// A non-finite or non-positive aspect ratio would make every image (or none)
-/// take the document path silently. Keep the documented 8.0 default and warn.
-fn validate_aspect_ratio(value: f64) -> f64 {
-    if value.is_finite() && value > 0.0 {
-        value
-    } else {
-        eprintln!(
-            "WARNING: LONG_IMAGE_ASPECT_RATIO has invalid value '{}', using default 8.0",
-            value
-        );
-        8.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{host_in_list, host_matches_exact, is_allowed_by_ids, validate_single_admin};
@@ -491,16 +412,6 @@ mod tests {
         assert!(is_allowed_by_ids(42, &[7, 8], 7));
         assert!(!is_allowed_by_ids(42, &[7, 8], 9));
         assert!(!is_allowed_by_ids(42, &[], 9));
-    }
-
-    #[test]
-    fn invalid_aspect_ratio_falls_back() {
-        use super::validate_aspect_ratio;
-        assert_eq!(validate_aspect_ratio(8.0), 8.0);
-        assert_eq!(validate_aspect_ratio(0.0), 8.0);
-        assert_eq!(validate_aspect_ratio(-1.0), 8.0);
-        assert_eq!(validate_aspect_ratio(f64::NAN), 8.0);
-        assert_eq!(validate_aspect_ratio(f64::INFINITY), 8.0);
     }
 
     #[test]

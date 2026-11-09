@@ -100,16 +100,8 @@ services:
       ## oversized media is skipped, oversized videos fall back to text with a notice
       # MAX_MEDIA_DOWNLOAD_MB: "100"
 
-      ## 默认 80；按日期目录粒度清理，实际约 5–7 天；outbox 待重试媒体受保护
-      ## Default 80; date-directory granularity keeps roughly 5–7 days; outbox retry media is protected
-      # MEDIA_OUTBOUND_TTL_HOURS: "80"
-
       ## 默认 10 / Default 10
       # MEDIA_MAX_SIZE_GB: "10"
-
-      ## 默认 8.0；高宽比超阈值的图片转文档发送；非法值（0/负数/NaN/∞）告警并回退 8.0
-      ## Default 8.0; images exceeding this aspect ratio are sent as documents; invalid values (0/negative/NaN/∞) warn and fall back to 8.0
-      # LONG_IMAGE_ASPECT_RATIO: "8.0"
 
       ## ===== 图片中转（默认关闭：BASE_URL 为空或不匹配 DOMAINS 即不生效）=====
       ## ===== Image relay (off unless BASE_URL is non-empty AND a domain matches) =====
@@ -136,17 +128,7 @@ services:
       ## Non-admin platform-source subscriptions (0 = unlimited)
       # MAX_PLATFORM_SUBSCRIPTIONS_PER_USER: "20"
 
-      ## ===== 调度与并发 / Scheduling & concurrency =====
-
-      ## 默认 5；轮询 tick，范围 1–5（实际抓取间隔由源/频道间隔决定）
-      ## Default 5; polling tick, range 1–5 (actual fetch intervals come from source/channel settings)
-      # SCHEDULER_INTERVAL_MINUTES: "5"
-
-      ## 默认 8 / Default 8
-      # FETCH_CONCURRENCY: "8"
-
-      ## 默认 4 / Default 4
-      # DOWNLOAD_CONCURRENCY: "4"
+      ## ===== 调度与失败处理 / Scheduling & failure handling =====
 
       ## 默认 20；连续失败停源阈值
       ## Default 20; consecutive-failure threshold to pause a source
@@ -154,27 +136,12 @@ services:
 
       ## ===== 清理与保留 / Cleanup & retention =====
 
-      ## 仅清理已无订阅的孤儿已读记录；仍存在的订阅永久保留。默认 180
-      ## Only orphaned sent-entry markers (no subscription row) expire; existing subscriptions are kept. Default 180
-      # SENT_ENTRIES_RETENTION_DAYS: "180"
-
-      ## 默认 60 / Default 60
-      # CLEANUP_INTERVAL_MINUTES: "60"
-
       ## 默认 30 / Default 30
       # LOG_RETENTION_DAYS: "30"
 
       ## 默认 7；每日 WAL checkpoint 快照保留天数
       ## Default 7; daily WAL checkpoint snapshot retention
       # BACKUP_RETENTION_DAYS: "7"
-
-      ## 默认 30；file_id 上传去重缓存
-      ## Default 30; file_id upload dedup cache
-      # FILE_ID_CACHE_RETENTION_DAYS: "30"
-
-      ## 默认 5000；/find 反查登记表行数上限
-      ## Default 5000; /find reverse-lookup registry row limit
-      # SENT_MESSAGES_MAX_ROWS: "5000"
 
       ## ===== 日志 / Logging =====
 

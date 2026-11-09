@@ -111,7 +111,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 - 连续抓取失败达阈值（默认 20 次）自动停源并通知；每小时自愈检查，冷却 3 小时后恢复。
 - Outbox 持久化重试：1 分钟→2 小时指数退避，72 小时放弃；支持分段/op 级续发。
 - 平台级健康监控：连续 2 轮全部源失败通知管理员，恢复后再次通知；媒体下载 5xx 重试（间隔 5 秒）、4xx 不重试，失败随条目最多重试 3 轮后降级发送。
-- 定时任务：抓取（默认 5 分钟，按源间隔）、outbox 重试（5 分钟）、自愈（每小时）、清理（默认 60 分钟）。
+- 定时任务：抓取（默认 5 分钟，按源间隔）、outbox 重试（5 分钟）、自愈（每小时）、清理（每小时）。
 - 通知对象：频道属主（源停用、媒体失败/视频超限、入队/72h 放弃）、管理员（cookie 失效、平台异常与恢复）；Bot 被移出频道时软停用该频道并保留数据，重新添加后恢复（属主不变）。
 
 ## 配置参考（compose.yaml environment）
@@ -134,7 +134,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 | `LOG_DIR` | 日志目录 | logs |
 | `RUST_LOG` | 日志级别（tracing EnvFilter） | info |
 
-代理只由 `RSS_PROXY`/`BOT_PROXY` 控制：程序不读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`；`BOT_PROXY` 仅覆盖 Bot API。完整可调项（并发、清理、配额、缓存保留期等）见 [compose.example.yaml](compose.example.yaml)。
+代理只由 `RSS_PROXY`/`BOT_PROXY` 控制：程序不读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`；`BOT_PROXY` 仅覆盖 Bot API。完整可调项（代理、媒体、配额、日志等）见 [compose.example.yaml](compose.example.yaml)。
 
 ## 本地 Bot API（可选）
 
@@ -285,7 +285,7 @@ Local RSSHub: SSRF protection rejects private/loopback addresses by default; add
 - A source is auto-disabled after consecutive failures (default 20) with a notice; the hourly self-heal job resumes it after a 3-hour cooldown.
 - Persistent outbox retry: 1 min → 2 h exponential backoff, abandoned after 72 h; segment/op-level resumption.
 - Platform health monitoring: two consecutive all-source failure rounds notify the admin, and recovery notifies again; media downloads retry on 5xx (5 s interval) but not 4xx, and failed entries are retried up to 3 fetch rounds before being sent degraded.
-- Scheduled jobs: fetch (default 5 min, per-source interval), outbox retry (5 min), self-heal (hourly), cleanup (default 60 min).
+- Scheduled jobs: fetch (default 5 min, per-source interval), outbox retry (5 min), self-heal (hourly), cleanup (hourly).
 - Notifications: channel owner (source disabled, media failure/oversized video, queued/72h abandoned) and admin (cookie expiry, platform errors/recovery); removing the bot from a channel soft-disables it and keeps its data, so re-adding restores the original owner and subscriptions.
 
 ## Configuration Reference (compose.yaml environment)
@@ -308,7 +308,7 @@ Local RSSHub: SSRF protection rejects private/loopback addresses by default; add
 | `LOG_DIR` | Log directory | logs |
 | `RUST_LOG` | Log level (tracing EnvFilter) | info |
 
-Proxies are controlled only by `RSS_PROXY`/`BOT_PROXY`: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` are ignored; `BOT_PROXY` covers the Bot API only. See [compose.example.yaml](compose.example.yaml) for the full set of tunables (concurrency, cleanup, quotas, cache retention, etc.).
+Proxies are controlled only by `RSS_PROXY`/`BOT_PROXY`: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` are ignored; `BOT_PROXY` covers the Bot API only. See [compose.example.yaml](compose.example.yaml) for the full set of tunables (proxy, media, quotas, logging, etc.).
 
 ## Local Bot API (optional)
 
