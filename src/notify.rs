@@ -37,8 +37,11 @@ async fn send_message_with_pace_flood(
         match req.await {
             Ok(_) => return None,
             Err(e) => {
-                let err_str = e.to_string();
-                if crate::sendpolicy::flood_backoff(&err_str, &mut tries, chat_id).await {
+                let err_str = crate::sendpolicy::error_chain_string(&e);
+                if crate::sendpolicy::classify_send_error(&err_str)
+                    == crate::sendpolicy::SendFailureClass::Flood
+                    && crate::sendpolicy::flood_backoff(&err_str, &mut tries, chat_id).await
+                {
                     continue;
                 }
                 return Some(err_str);

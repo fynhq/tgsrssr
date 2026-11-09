@@ -14,8 +14,8 @@ use crate::htmltext::{
 use crate::media::{MediaItem, MediaKind};
 use crate::richmsg::{self, RichMedia, RichMediaKind, RichMediaSource};
 use crate::sendpolicy::{
-    error_chain_string, flood_backoff, flood_retry_secs, is_send_retryable_error, pace,
-    SEND_BACKOFF_SECS,
+    classify_send_error, error_chain_string, flood_backoff, flood_retry_secs, pace,
+    SendFailureClass, SEND_BACKOFF_SECS,
 };
 
 // Re-export pure HTML helpers for external callers (commands, callbacks,
@@ -58,7 +58,7 @@ pub fn channel_header_text(
 // Hot-path regexes are compiled statically once (hit on every message/chunk).
 // RE_TAG and the anchor/entity regexes live in crate::htmltext along with the
 // HTML helpers (imported via the `use` at the top).
-// Rate-limiting/backoff policy (pacer, flood_backoff, is_send_retryable_error,
+// Rate-limiting/backoff policy (pacer, flood_backoff, classify_send_error,
 // SEND_BACKOFF_SECS) moved to crate::sendpolicy (imported via the `use` at
 // the top).
 // The Weibo poll data marker has been migrated to EntryMeta.poll (group-C
@@ -243,12 +243,17 @@ pub async fn send_poll(
             Ok(m) => break m,
             Err(e) => {
                 let es = error_chain_string(&e);
-                if flood_backoff(&es, &mut flood_tries, chat_id).await {
+                let class = classify_send_error(&es);
+                if class == SendFailureClass::Flood
+                    && flood_backoff(&es, &mut flood_tries, chat_id).await
+                {
                     continue;
                 }
                 // v1.10.2: retry on network/TG transient errors (consistent
                 // with the other send sites)
-                if is_send_retryable_error(&es) && transient_tries < SEND_BACKOFF_SECS.len() {
+                if class == SendFailureClass::Retryable
+                    && transient_tries < SEND_BACKOFF_SECS.len()
+                {
                     let backoff = SEND_BACKOFF_SECS[transient_tries];
                     tracing::warn!(chat_id = chat_id, backoff = backoff, error = %es, "poll send transient error, backing off");
                     tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
@@ -339,7 +344,7 @@ pub async fn send_text_only(
                 rich_msg = Some(m);
             }
             Err(e) => {
-                let err_str = format!("{:#}", e);
+                let err_str = error_chain_string(e.as_ref());
                 crate::richmsg::note_send_error(&err_str);
                 tracing::warn!(
                     chat_id = chat_id,
@@ -1222,21 +1227,6 @@ async fn invalidate_op_cache(db: &Db, op: &RichOp<'_>) {
     }
 }
 
-/// Determine whether an error is "file_id invalid/unusable" — in that case
-/// the cache should be invalidated and the file re-uploaded, rather than
-/// degrading to plain text.
-fn is_file_id_error(es: &str) -> bool {
-    let s = es.to_lowercase();
-    s.contains("file_id") || s.contains("file identifier") || s.contains("wrong file")
-}
-
-/// Telegram rejects thumbnails outside 320x320 / 200KB. A thumbnail-related
-/// 400 must drop the thumbnail and retry, not fail the whole document.
-fn is_thumbnail_error(es: &str) -> bool {
-    let s = es.to_lowercase();
-    s.contains("thumbnail") || s.contains("photo_invalid_dimensions") || s.contains("wrong file dimensions")
-}
-
 /// Entry context for one push: collapses the many parameters of
 /// send_entry_with_media into a single struct that callers construct once.
 /// The fields are destructured into same-named local variables inside the
@@ -1484,7 +1474,7 @@ pub async fn send_entry_with_media(
                 );
             }
             Err(e) => {
-                let err_str = format!("{:#}", e);
+                let err_str = error_chain_string(e.as_ref());
                 crate::richmsg::note_send_error(&err_str);
                 tracing::warn!(
                     chat_id = chat_id,
@@ -2074,8 +2064,9 @@ where
         match attempt(use_cache, use_thumb).await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                let es = e.to_string();
-                if use_cache && is_file_id_error(&es) {
+                let es = error_chain_string(e.as_ref());
+                let class = classify_send_error(&es);
+                if use_cache && class == SendFailureClass::FileId {
                     for key in keys {
                         db::invalidate_cached_file_id(db, key).await.ok();
                     }
@@ -2083,15 +2074,19 @@ where
                     use_cache = false;
                     continue;
                 }
-                if use_thumb && is_thumbnail_error(&es) {
+                if use_thumb && class == SendFailureClass::Thumbnail {
                     tracing::warn!(chat_id = chat_id, error = %es, "thumbnail rejected, retrying without it");
                     use_thumb = false;
                     continue;
                 }
-                if flood_backoff(&es, &mut flood_tries, chat_id).await {
+                if class == SendFailureClass::Flood
+                    && flood_backoff(&es, &mut flood_tries, chat_id).await
+                {
                     continue;
                 }
-                if is_send_retryable_error(&es) && transient_tries < SEND_BACKOFF_SECS.len() {
+                if class == SendFailureClass::Retryable
+                    && transient_tries < SEND_BACKOFF_SECS.len()
+                {
                     let backoff = SEND_BACKOFF_SECS[transient_tries];
                     tracing::warn!(chat_id = chat_id, backoff = backoff, error = %es, "send transient error, backing off");
                     tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
@@ -2252,7 +2247,13 @@ async fn send_rich_ops_with_retry(
     }
     for backoff in SEND_BACKOFF_SECS {
         let retry_from = match &res {
-            Err((sent, _, e)) if *sent < ops.len() && is_send_retryable_error(&e.to_string()) => Some(*sent),
+            Err((sent, _, e))
+                if *sent < ops.len()
+                    && classify_send_error(&error_chain_string(e.as_ref()))
+                        == SendFailureClass::Retryable =>
+            {
+                Some(*sent)
+            }
             _ => None,
         };
         let Some(sent) = retry_from else { break };
@@ -2410,19 +2411,22 @@ where
         match attempt(use_cache, use_thumb).await {
             Ok(v) => return Ok(v),
             Err(e) => {
-                let es = format!("{:#}", e);
-                if use_thumb && is_thumbnail_error(&es) {
+                let es = error_chain_string(e.as_ref());
+                let class = classify_send_error(&es);
+                if use_thumb && class == SendFailureClass::Thumbnail {
                     tracing::warn!(chat_id = chat_id, error = %es, "thumbnail rejected, retrying without it");
                     use_thumb = false;
                     continue;
                 }
-                if use_cache && is_file_id_error(&es) {
+                if use_cache && class == SendFailureClass::FileId {
                     invalidate_op_cache(db, op).await;
                     pace(chat_id).await;
                     use_cache = false;
                     continue;
                 }
-                if flood_backoff(&es, &mut flood_tries, chat_id).await {
+                if class == SendFailureClass::Flood
+                    && flood_backoff(&es, &mut flood_tries, chat_id).await
+                {
                     continue;
                 }
                 return Err(e);
@@ -2613,10 +2617,12 @@ async fn send_single_html(
         match result {
             Ok(m) => return Ok(m),
             Err(e) => {
-                let err_str = e.to_string();
+                let err_str = error_chain_string(&e);
+                let class = classify_send_error(&err_str);
                 // Flood control: wait the requested time and retry.
-                if let Some(secs) = flood_retry_secs(&err_str) {
+                if class == SendFailureClass::Flood {
                     if attempt < MAX_RETRIES {
+                        let secs = flood_retry_secs(&err_str).unwrap_or(5);
                         tracing::warn!(chat_id = chat_id, secs = secs, attempt = attempt, "flood control, backing off");
                         tokio::time::sleep(std::time::Duration::from_secs(secs + 1)).await;
                         continue;
@@ -2624,7 +2630,7 @@ async fn send_single_html(
                     return Err(e.into());
                 }
                 // If Telegram can't parse HTML entities, fallback to plain text
-                if err_str.contains("parse entities") || err_str.contains("Can't parse") {
+                if class == SendFailureClass::HtmlParse {
                     // Stripping all formatting is a user-visible degradation;
                     // leave a trace so we can track down which HTML triggered
                     // it.
@@ -2637,7 +2643,7 @@ async fn send_single_html(
                     let plain = strip_html_tags(&html_text);
                     // The fallback send gets its own flood backoff: a 429
                     // here is not covered by the outer retry layer (429 is
-                    // not is_send_retryable_error), and losing the chunk over a
+                    // Flood, not Retryable), and losing the chunk over a
                     // transient flood window would push the entry to outbox
                     // even though the HTML problem itself is permanent.
                     let mut fallback_flood_tries = 0u32;
@@ -2652,8 +2658,10 @@ async fn send_single_html(
                         match req2.await {
                             Ok(m) => return Ok(m),
                             Err(e2) => {
-                                let err2 = e2.to_string();
-                                if flood_backoff(&err2, &mut fallback_flood_tries, chat_id).await {
+                                let err2 = error_chain_string(&e2);
+                                if classify_send_error(&err2) == SendFailureClass::Flood
+                                    && flood_backoff(&err2, &mut fallback_flood_tries, chat_id).await
+                                {
                                     continue;
                                 }
                                 return Err(e2.into());
@@ -2681,7 +2689,12 @@ async fn send_chunk_with_retry(
 ) -> anyhow::Result<Message> {
     let mut send_res = send_single_html(bot, chat_id, text, link_preview, reply_to).await;
     for backoff in SEND_BACKOFF_SECS {
-        if !matches!(&send_res, Err(e) if is_send_retryable_error(&format!("{:#}", e))) {
+        if !matches!(
+            &send_res,
+            Err(e)
+                if classify_send_error(&error_chain_string(e.as_ref()))
+                    == SendFailureClass::Retryable
+        ) {
             break;
         }
         tracing::warn!(chat_id = chat_id, backoff = backoff, "text chunk send failed, retrying");
@@ -3075,14 +3088,6 @@ mod tests {
         let vrefs: Vec<&MediaItem> = sliced.iter().filter(|m| m.kind == MediaKind::Video).collect();
         let ops = build_rich_ops(&prefs, &[], &vrefs);
         assert_eq!(op_labels(&ops), vec!["photo:p1"]);
-    }
-
-    #[test]
-    fn thumbnail_errors_are_detected() {
-        assert!(is_thumbnail_error("Bad Request: PHOTO_INVALID_DIMENSIONS"));
-        assert!(is_thumbnail_error("Bad Request: wrong file dimensions"));
-        assert!(is_thumbnail_error("Bad Request: THUMBNAIL_DIMENSIONS_INVALID"));
-        assert!(!is_thumbnail_error("Bad Request: message is too long"));
     }
 
     #[test]

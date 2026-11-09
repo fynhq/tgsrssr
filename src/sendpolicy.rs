@@ -153,6 +153,59 @@ pub fn is_ambiguous_send_error(err_str: &str) -> bool {
         || err_str.contains("Internal Server Error")
 }
 
+/// Single classification of a send failure, used by every send path.
+///
+/// `Flood` is checked first because a 429 can safely be retried after the
+/// server-provided delay. The Telegram parameter-class rejections
+/// (`FileId` / `Thumbnail` / `HtmlParse`) are checked before the transport
+/// predicates so callers can apply their specific recovery (invalidate the
+/// cached file_id, drop the thumbnail, fall back to plain text) instead of
+/// treating them as generic failures. `Retryable` is the connect/DNS subset
+/// that is definitely undelivered; `Ambiguous` may already have been
+/// delivered and must not be retried inline; everything else is `Fatal`.
+///
+/// Callers must pass `error_chain_string(&err)` (or anyhow's `{:#}`) rather
+/// than `Display::to_string()`: teloxide wrapper errors hide the reqwest
+/// source detail, and the connect/ambiguous predicates only match that detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendFailureClass {
+    Flood,
+    FileId,
+    Thumbnail,
+    HtmlParse,
+    Retryable,
+    Ambiguous,
+    Fatal,
+}
+
+/// Classify a send failure once, so the retry wrappers in push.rs only decide
+/// which action to take for each class.
+pub fn classify_send_error(err_str: &str) -> SendFailureClass {
+    if flood_retry_secs(err_str).is_some() {
+        return SendFailureClass::Flood;
+    }
+    let lower = err_str.to_lowercase();
+    if lower.contains("file_id") || lower.contains("file identifier") {
+        return SendFailureClass::FileId;
+    }
+    if lower.contains("thumbnail")
+        || lower.contains("photo_invalid_dimensions")
+        || lower.contains("wrong file dimensions")
+    {
+        return SendFailureClass::Thumbnail;
+    }
+    if lower.contains("parse entities") || lower.contains("can't parse") {
+        return SendFailureClass::HtmlParse;
+    }
+    if is_send_retryable_error(err_str) {
+        return SendFailureClass::Retryable;
+    }
+    if is_ambiguous_send_error(err_str) {
+        return SendFailureClass::Ambiguous;
+    }
+    SendFailureClass::Fatal
+}
+
 /// Bounded exponential backoff sequence (seconds) for network errors
 /// (proxy flaps / upstream outages) and transient TG errors. Shared by
 /// media-op-level and text-chunk-level retries (#14 fix: merged the two
@@ -212,7 +265,39 @@ pub async fn pace(chat_id: i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ambiguous_send_error, is_send_retryable_error};
+    use super::{
+        classify_send_error, is_ambiguous_send_error, is_send_retryable_error, SendFailureClass,
+    };
+
+    #[test]
+    fn failure_classes_cover_each_recovery_branch() {
+        use SendFailureClass::*;
+        for (err, expected) in [
+            ("Too Many Requests: retry after 30", Flood),
+            ("Bad Request: wrong file identifier/HTTP URL specified", FileId),
+            ("Bad Request: file_id is invalid", FileId),
+            ("Bad Request: PHOTO_INVALID_DIMENSIONS", Thumbnail),
+            ("Bad Request: THUMBNAIL_DIMENSIONS_INVALID", Thumbnail),
+            ("Bad Request: wrong file dimensions", Thumbnail),
+            (
+                "Bad Request: can't parse entities: Unexpected end tag",
+                HtmlParse,
+            ),
+            ("tcp connect error: Connection refused (os error 111)", Retryable),
+            ("dns resolve failed: https://example.com", Retryable),
+            (
+                "rich message request failed: error sending request: tcp connect error: Connection refused (os error 111)",
+                Retryable,
+            ),
+            ("operation timed out", Ambiguous),
+            ("connection reset by peer", Ambiguous),
+            ("HTTP 500 Internal Server Error", Ambiguous),
+            ("Bad Request: message is too long (HTTP 400)", Fatal),
+            ("Unauthorized (HTTP 401)", Fatal),
+        ] {
+            assert_eq!(classify_send_error(err), expected, "{err}");
+        }
+    }
 
     #[test]
     fn only_connect_phase_failures_are_retried_inline() {
@@ -249,6 +334,9 @@ mod tests {
             "dns resolve failed: https://example.com",
             "tcp connect error: Connection refused (os error 111)",
             "client error (Connect)",
+            "Bad Request: wrong file identifier/HTTP URL specified",
+            "Bad Request: PHOTO_INVALID_DIMENSIONS",
+            "Bad Request: can't parse entities: Unexpected end tag",
         ] {
             assert!(!is_ambiguous_send_error(err), "{err}");
         }
