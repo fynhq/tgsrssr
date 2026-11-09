@@ -103,8 +103,6 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        check_removed_env()?;
-
         let token = std::env::var("TELOXIDE_TOKEN")
             .map_err(|_| anyhow::anyhow!("TELOXIDE_TOKEN is required"))?;
 
@@ -133,7 +131,6 @@ impl Config {
 
         let img_relay_base_url = env_or("IMG_RELAY_BASE_URL", "");
         let img_relay_domains = split_host_list("IMG_RELAY_DOMAINS", true);
-        warn_removed_img_relay_enabled(&img_relay_base_url, &img_relay_domains);
 
         let cleanup_interval_minutes = {
             let v = env_parse_or("CLEANUP_INTERVAL_MINUTES", 60u64);
@@ -289,58 +286,6 @@ impl Config {
 
 fn is_allowed_by_ids(admin_user_id: i64, allowed: &[i64], user_id: i64) -> bool {
     admin_user_id == user_id || allowed.contains(&user_id)
-}
-
-fn check_removed_env() -> anyhow::Result<()> {
-    if let Ok(v) = std::env::var("OPEN_TO_ALL") {
-        if open_to_all_is_fatal(&v) {
-            anyhow::bail!(
-                "OPEN_TO_ALL has been removed; add allowed users to ALLOWED_USER_IDS (the admin is always allowed)"
-            );
-        }
-        if !v.trim().is_empty() {
-            eprintln!("WARNING: OPEN_TO_ALL is deprecated and ignored");
-        }
-    }
-    if let Ok(v) = std::env::var("MAX_VIDEO_PUSH_MB") {
-        if max_video_push_is_fatal(&v) {
-            anyhow::bail!(
-                "MAX_VIDEO_PUSH_MB has been renamed to MAX_MEDIA_DOWNLOAD_MB (it caps all media downloads)"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Old `OPEN_TO_ALL` values that previously enabled open registration. They
-/// now fail startup instead of silently locking everyone but the admin out.
-fn open_to_all_is_fatal(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "true" | "1" | "yes" | "on"
-    )
-}
-
-/// Any non-empty old media-cap variable fails startup: silently ignoring it
-/// would apply the default cap, not the configured one.
-fn max_video_push_is_fatal(v: &str) -> bool {
-    !v.trim().is_empty()
-}
-
-fn warn_removed_img_relay_enabled(base_url: &str, domains: &[String]) {
-    let Ok(v) = std::env::var("IMG_RELAY_ENABLED") else {
-        return;
-    };
-    let v = v.trim().to_ascii_lowercase();
-    eprintln!("WARNING: IMG_RELAY_ENABLED is deprecated and ignored; relay is controlled by IMG_RELAY_BASE_URL + IMG_RELAY_DOMAINS");
-    if matches!(v.as_str(), "false" | "0" | "no" | "off")
-        && !base_url.is_empty()
-        && !domains.is_empty()
-    {
-        eprintln!(
-            "WARNING: IMG_RELAY_ENABLED=false no longer disables the relay; clear IMG_RELAY_BASE_URL or IMG_RELAY_DOMAINS to disable it"
-        );
-    }
 }
 
 fn parse_trusted_private_scope() -> TrustedPrivateScope {
@@ -556,20 +501,6 @@ mod tests {
         assert_eq!(validate_aspect_ratio(-1.0), 8.0);
         assert_eq!(validate_aspect_ratio(f64::NAN), 8.0);
         assert_eq!(validate_aspect_ratio(f64::INFINITY), 8.0);
-    }
-
-    #[test]
-    fn removed_env_verdicts() {
-        use super::{max_video_push_is_fatal, open_to_all_is_fatal};
-        for v in ["true", "1", "yes", "on", " TRUE "] {
-            assert!(open_to_all_is_fatal(v), "{v}");
-        }
-        for v in ["false", "0", "no", "off", "", "  "] {
-            assert!(!open_to_all_is_fatal(v), "{v}");
-        }
-        assert!(max_video_push_is_fatal("100"));
-        assert!(!max_video_push_is_fatal(""));
-        assert!(!max_video_push_is_fatal("  "));
     }
 
     #[test]
