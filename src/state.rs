@@ -234,6 +234,12 @@ impl AppState {
             let mut b = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .read_timeout(std::time::Duration::from_secs(30))
+                // Keep idle keep-alive connections bounded: reqwest otherwise
+                // retains an unlimited number of idle sockets per host and
+                // keeps them for 90s, each holding TLS/HTTP buffers. Two idle
+                // sockets per host still cover fetch + redirect reuse.
+                .pool_max_idle_per_host(2)
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
                 .user_agent(BROWSER_UA);
             if insecure {
                 b = b.danger_accept_invalid_certs(true);

@@ -114,6 +114,10 @@ fn is_explicitly_undelivered(err_str: &str) -> bool {
         || err_str.contains("tcp connect error")
         || err_str.contains("client error (Connect)")
         || err_str.contains("connection refused")
+        // Streamed rich-media upload: the local file could not be read to
+        // completion, so the multipart body was truncated before Telegram
+        // could deliver a complete message.
+        || err_str.contains("rich media upload body read failed")
 }
 
 /// Classify a rich-message send failure by whether the message may already
@@ -599,6 +603,7 @@ mod tests {
             "Bad Request: wrong file identifier/HTTP URL specified",
             "Bad Request: PHOTO_INVALID_DIMENSIONS",
             "Bad Request: can't parse entities: Unexpected end tag",
+            "rich media upload body read failed: request or response body error",
         ] {
             assert!(!is_ambiguous_send_error(err), "{err}");
         }

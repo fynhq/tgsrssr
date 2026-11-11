@@ -40,12 +40,13 @@ const CAPTION_LIMIT: usize = 1024;
 /// Bot API rich message hard limits (10.x): rich text and media attachments.
 const RICH_TEXT_MAX: usize = 32768;
 const RICH_MEDIA_MAX: usize = 50;
-/// Safety cap for rich attachments held in memory until the response
-/// arrives. Rich-message photos/videos use `file://` on the local Bot API and
-/// do not count; documents always use multipart bytes (to keep their logical
-/// file name) and therefore always count. Very large sets fall back to the
-/// album path instead of risking the bot process.
-const RICH_MEMORY_MEDIA_MAX: u64 = 128 * 1024 * 1024;
+/// Safety cap for rich attachments uploaded through multipart. Photos/videos
+/// use `file://` on the local Bot API and do not count; documents (and all
+/// media on the official API) stream from disk and therefore do not consume
+/// equivalent heap memory either. The cap is kept as a deliberate payload
+/// threshold: very large sets fall back to the standard album path, matching
+/// the established rich-message behavior.
+const RICH_MULTIPART_MEDIA_MAX: u64 = 128 * 1024 * 1024;
 /// The existing album chunk size; > this triggers the rich-media enhancement.
 const ALBUM_LIMIT: usize = 10;
 
@@ -443,7 +444,8 @@ pub struct RenderOpts {
 }
 
 /// Prepare one local file for rich-media upload. Local Bot API gets a
-/// `file://` path in its own namespace; otherwise bytes go through multipart.
+/// `file://` path in its own namespace; otherwise the file is uploaded as a
+/// streamed multipart part (opened at send time, never read into a Vec).
 async fn rich_source_for_path(
     path: &std::path::Path,
     transport: &crate::media::MediaTransport,
@@ -451,9 +453,12 @@ async fn rich_source_for_path(
     if let Some(bp) = transport.bot_path(path) {
         return Ok(RichMediaSource::FilePath(bp));
     }
-    let data = tokio::fs::read(path).await?;
-    Ok(RichMediaSource::Bytes {
-        data,
+    // Validate readability up front: callers use an error to omit a broken
+    // thumbnail or fall back to the standard send path before building the
+    // whole request.
+    tokio::fs::metadata(path).await?;
+    Ok(RichMediaSource::File {
+        path: path.to_path_buf(),
         filename: crate::media::logical_file_name(path),
     })
 }
@@ -476,16 +481,16 @@ async fn rich_source_for_item(
 /// Document attachments must keep the logical file name in Telegram. A local
 /// Bot API `file://` upload takes the name from the on-disk path, which still
 /// carries the `.tgsr` storage suffix, so documents always go through
-/// multipart bytes with the stripped name. The file_id cache avoids the read
-/// after the first upload.
+/// multipart with the stripped name. The file itself is streamed at send
+/// time; the file_id cache avoids the upload entirely after the first send.
 async fn rich_source_for_doc(db: &Db, item: &MediaItem) -> anyhow::Result<RichMediaSource> {
     let key = format!("{}:doc", item.content_hash);
     if let Ok(Some(fid)) = db::get_cached_file_id(db, &key).await {
         return Ok(RichMediaSource::FileId(fid));
     }
-    let data = tokio::fs::read(&item.path).await?;
-    Ok(RichMediaSource::Bytes {
-        data,
+    tokio::fs::metadata(&item.path).await?;
+    Ok(RichMediaSource::File {
+        path: item.path.clone(),
         filename: crate::media::logical_file_name(&item.path),
     })
 }
@@ -610,17 +615,17 @@ async fn try_send_rich_media(
     }
     // Documents always upload as bytes (their file name must not carry the
     // `.tgsr` suffix), so their size counts even with a local Bot API.
-    let memory_bytes: u64 = album_media
+    let multipart_bytes: u64 = album_media
         .iter()
         .filter(|m| transport.bot_path(&m.path).is_none())
         .map(|m| m.size)
         .sum::<u64>()
         + docs.iter().map(|m| m.size).sum::<u64>();
-    if memory_bytes > RICH_MEMORY_MEDIA_MAX {
+    if multipart_bytes > RICH_MULTIPART_MEDIA_MAX {
         anyhow::bail!(
-            "rich media in-memory upload too large: {} bytes (cap {})",
-            memory_bytes,
-            RICH_MEMORY_MEDIA_MAX
+            "rich media multipart payload too large: {} bytes (cap {})",
+            multipart_bytes,
+            RICH_MULTIPART_MEDIA_MAX
         );
     }
 

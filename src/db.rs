@@ -233,10 +233,21 @@ pub async fn connect(db_path: &Path) -> anyhow::Result<Db> {
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(5))
-        .pragma("journal_size_limit", "52428800");
+        .pragma("journal_size_limit", "52428800")
+        // Memory bounds. SQLite's default page cache is 2 MB per connection
+        // (up to 8 MB for this 4-connection pool); 512 KiB is enough for this
+        // workload (a few thousand small rows) and the OS page cache still
+        // serves hot pages. Temp b-trees stay on disk instead of in RAM, and
+        // mmap is disabled so the DB file does not inflate process RSS.
+        .pragma("cache_size", "-512")
+        .pragma("temp_store", "1")
+        .pragma("mmap_size", "0");
 
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
+        // Reap idle connections so their page caches are returned between
+        // command/fetch bursts; reconnect is cheap for a local SQLite file.
+        .idle_timeout(Some(Duration::from_secs(60)))
         .connect_with(options)
         .await?;
 
@@ -759,10 +770,18 @@ pub fn entry_marker_hash(entry_id: &str) -> u64 {
 /// Compact form of [`sent_entry_ids`] for the fetch-cycle filter. Rows are
 /// streamed one at a time, so loading a long-lived subscription's history does
 /// not build a full rows vector plus a full `String` set at once.
+///
+/// `wanted` optionally restricts the returned set to marker hashes the caller
+/// actually needs (the current feed window). The table is still scanned row by
+/// row, but memory is bounded by the feed window rather than by the
+/// subscription's lifetime history: `sent_entries` rows are never pruned while
+/// the subscription exists, so a decades-old source can accumulate hundreds of
+/// thousands of markers.
 pub async fn sent_entry_id_hashes(
     db: &Db,
     chat_id: &str,
     feed_url: &str,
+    wanted: Option<&std::collections::HashSet<u64>>,
 ) -> anyhow::Result<std::collections::HashSet<u64>> {
     use futures_util::TryStreamExt;
     let mut rows = sqlx::query_scalar::<_, String>(
@@ -773,7 +792,10 @@ pub async fn sent_entry_id_hashes(
     .fetch(db);
     let mut set = std::collections::HashSet::new();
     while let Some(id) = rows.try_next().await? {
-        set.insert(entry_marker_hash(&id));
+        let hash = entry_marker_hash(&id);
+        if wanted.is_none_or(|w| w.contains(&hash)) {
+            set.insert(hash);
+        }
     }
     Ok(set)
 }
@@ -2652,13 +2674,24 @@ mod tests {
             .unwrap();
 
         let ids = sent_entry_ids(&pool, "1", feed).await.unwrap();
-        let hashes = sent_entry_id_hashes(&pool, "1", feed).await.unwrap();
+        let hashes = sent_entry_id_hashes(&pool, "1", feed, None).await.unwrap();
         assert_eq!(ids.len(), 2);
         assert_eq!(hashes.len(), 2);
         assert!(hashes.contains(&entry_marker_hash("e1")));
         assert!(hashes.contains(&entry_marker_hash("e2")));
         assert!(!hashes.contains(&entry_marker_hash("other-chat")));
         assert!(!hashes.contains(&entry_marker_hash("other-feed")));
+
+        // A wanted filter bounds the result to the current feed window while
+        // preserving the same membership answers for those ids.
+        let wanted = std::collections::HashSet::from([
+            entry_marker_hash("e2"),
+            entry_marker_hash("not-sent"),
+        ]);
+        let filtered = sent_entry_id_hashes(&pool, "1", feed, Some(&wanted))
+            .await
+            .unwrap();
+        assert_eq!(filtered, std::collections::HashSet::from([entry_marker_hash("e2")]));
     }
 
     async fn insert_chat(pool: &Db, chat_id: &str, owner: &str, enabled: i64) {

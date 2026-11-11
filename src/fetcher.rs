@@ -332,6 +332,11 @@ pub async fn read_body_capped(resp: reqwest::Response, ctx: &str) -> anyhow::Res
             anyhow::bail!("response too large (>{} bytes) for {}", MAX_BODY_BYTES, ctx);
         }
     }
+    // Chunked responses without Content-Length grow by doubling, so capacity
+    // can be up to ~2x the body. Trim it before the parser runs: the raw body
+    // and the parsed feed are alive together, and the excess capacity would
+    // otherwise multiply across concurrent fetches.
+    body_buf.shrink_to_fit();
     Ok(body_buf)
 }
 
@@ -530,12 +535,15 @@ pub fn entry_id(entry: &Entry) -> String {
     let ts = entry.published.or(entry.updated)
         .map(|d| d.timestamp().to_string())
         .unwrap_or_default();
-    let body = entry
+    // Borrow the body: cloning it here would double a potentially large entry
+    // body just to compute the fallback id (called several times per entry in
+    // the fetch filter loop).
+    let body: &str = entry
         .content
         .as_ref()
-        .and_then(|c| c.body.clone())
-        .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()))
-        .unwrap_or_default();
+        .and_then(|c| c.body.as_deref())
+        .or_else(|| entry.summary.as_ref().map(|s| s.content.as_str()))
+        .unwrap_or("");
     let hash: String = {
         use sha2::{Digest, Sha256};
         Sha256::digest(body.as_bytes())
@@ -698,6 +706,8 @@ pub(crate) fn entry_body_html_from_source(
 /// fallbacks and title/label extraction all funnel through here, so that
 /// source text never reaches the message.
 pub fn strip_tags(s: &str) -> String {
+    // Keep the non-rendered-block removal borrowed when it does not match;
+    // only the final tag strip needs an owned result.
     let s = RE_NON_RENDERED_BLOCK.replace_all(s, "");
     RE_TAG.replace_all(&s, "").to_string()
 }
@@ -769,12 +779,25 @@ pub(crate) fn is_video_href(href: &str) -> bool {
 ///
 /// Mirrors rsstt's approach (strip media, keep hashtag/topic links).
 pub fn html_to_telegram_html(html: &str) -> String {
-    let mut s = html.to_string();
+    use std::borrow::Cow;
+
+    // Most transformation steps below are conditional. Keeping the working
+    // string as a Cow avoids copying a multi-megabyte body once per step when
+    // the regex found nothing; only an actual match allocates.
+    macro_rules! replace_cow {
+        ($cur:ident, $re:expr, $rep:expr) => {
+            if let Cow::Owned(v) = $re.replace_all(&$cur, $rep) {
+                $cur = Cow::Owned(v);
+            }
+        };
+    }
+
+    let mut s: Cow<'_, str> = Cow::Borrowed(html);
     // Normalize line endings up front: split_html/blockquote folding split on
     // "\n\n", so a JSON Feed (or any source that keeps CRLF) would otherwise
     // never match paragraph boundaries and would retain stray '\r' bytes.
     if s.contains('\r') {
-        s = s.replace("\r\n", "\n").replace('\r', "\n");
+        s = Cow::Owned(s.replace("\r\n", "\n").replace('\r', "\n"));
     }
 
     // 0) Strip sentinel characters already present in the input (U+FFFC object
@@ -783,43 +806,47 @@ pub fn html_to_telegram_html(html: &str) -> String {
     //    placeholders / blockquote boundaries); if the feed body itself
     //    contains them they would be wrongly restored as markers, causing
     //    layout injection.
-    s.retain(|c| c != '\u{FFFC}' && c != '\u{FFFE}');
+    if s.contains('\u{FFFC}') || s.contains('\u{FFFE}') {
+        let mut owned = s.into_owned();
+        owned.retain(|c| c != '\u{FFFC}' && c != '\u{FFFE}');
+        s = Cow::Owned(owned);
+    }
 
     // 1) Drop media entirely. For <img>, preserve the alt text ONLY when it
     //    looks like a weibo emoji icon (e.g. <img alt="[酷]">) so it survives
     //    as plain text instead of vanishing. Regular images are sent as media
     //    attachments, so their alt text (e.g. Unsplash filenames like
     //    "peter-burdon-5aJi4Dw2_Gs-unsplash") is noise and must not leak.
-    s = RE_VIDEO_BLOCK.replace_all(&s, "").to_string();
-    s = RE_IMG_ALT
-        .replace_all(&s, |caps: &regex::Captures| {
-            let alt = &caps[1];
-            if alt.starts_with('[') && alt.ends_with(']') {
-                alt.to_string()
-            } else {
-                String::new()
-            }
-        })
-        .to_string();
-    s = RE_IMG.replace_all(&s, "").to_string();
-    s = RE_SOURCE.replace_all(&s, "").to_string();
+    replace_cow!(s, RE_VIDEO_BLOCK, "");
+    replace_cow!(s, RE_IMG_ALT, |caps: &regex::Captures| {
+        let alt = &caps[1];
+        if alt.starts_with('[') && alt.ends_with(']') {
+            alt.to_string()
+        } else {
+            String::new()
+        }
+    });
+    replace_cow!(s, RE_IMG, "");
+    replace_cow!(s, RE_SOURCE, "");
     // Safety: remove any leftover video fallback text that may have leaked
     // (e.g. the "video cannot be displayed, please go to Weibo Video to
     // watch" text from RSSHub <video> blocks).
-    s = RE_VIDEO_FALLBACK_TEXT.replace_all(&s, "").to_string();
+    replace_cow!(s, RE_VIDEO_FALLBACK_TEXT, "");
 
     // 2) Line breaks and block boundaries. Other block closers (</li>, </tr>,
     //    headings, ...) also become newlines; otherwise their text runs
     //    together after tag stripping.
-    s = RE_BR.replace_all(&s, "\n").to_string();
-    s = RE_BLOCK_CLOSE.replace_all(&s, "\n").to_string();
-    s = s.replace("</br>", "\n");
+    replace_cow!(s, RE_BR, "\n");
+    replace_cow!(s, RE_BLOCK_CLOSE, "\n");
+    if s.contains("</br>") {
+        s = Cow::Owned(s.replace("</br>", "\n"));
+    }
 
     // 2.5) Preserve <blockquote> boundaries (RSSHub wraps retweeted content in
     //      <blockquote>). Replace with sentinel tokens that survive strip_tags
     //      and escape_tg, then restore as Telegram <blockquote expandable>.
-    s = RE_BLOCKQUOTE_OPEN.replace_all(&s, "\u{FFFE}BQO\u{FFFE}").to_string();
-    s = RE_BLOCKQUOTE_CLOSE.replace_all(&s, "\u{FFFE}BQC\u{FFFE}").to_string();
+    replace_cow!(s, RE_BLOCKQUOTE_OPEN, "\u{FFFE}BQO\u{FFFE}");
+    replace_cow!(s, RE_BLOCKQUOTE_CLOSE, "\u{FFFE}BQC\u{FFFE}");
 
     // 3) Extract anchors to placeholders, remembering (href, text).
     //    Anchors whose href is a non-video media resource (image files) are
@@ -852,7 +879,8 @@ pub fn html_to_telegram_html(html: &str) -> String {
     // after anchor extraction: a kept video anchor's label lives in `links`,
     // and removing it earlier would leave an empty anchor that is then
     // dropped.
-    let buf = RE_WEIBO_VIDEO_CARD_TEXT.replace_all(&buf, "").to_string();
+    let mut buf: Cow<'_, str> = Cow::Owned(buf);
+    replace_cow!(buf, RE_WEIBO_VIDEO_CARD_TEXT, "");
 
     // 4) Flatten remaining markup, decode entities, escape for Telegram.
     //    `decode_entities` is the visible-text decoder: it maps HTML5
@@ -871,6 +899,11 @@ pub fn html_to_telegram_html(html: &str) -> String {
     // 5) Restore anchors as Telegram hyperlinks (skip empty-text links).
     for (i, (href, text)) in links.iter().enumerate() {
         let token = format!("\u{FFFC}{}\u{FFFC}", i);
+        // Media anchors are dropped before this point, so their tokens never
+        // exist; skip the full-string replace in that case.
+        if !out.contains(&token) {
+            continue;
+        }
         let replacement = if text.is_empty() {
             String::new()
         } else if href.is_empty() || !crate::htmltext::is_safe_href(href) {
@@ -884,16 +917,21 @@ pub fn html_to_telegram_html(html: &str) -> String {
     }
 
     // 6) Restore blockquote sentinels as Telegram expandable blockquote.
-    out = out.replace("\u{FFFE}BQO\u{FFFE}", "<blockquote expandable>");
-    out = out.replace("\u{FFFE}BQC\u{FFFE}", "</blockquote>");
+    if out.contains("\u{FFFE}BQO\u{FFFE}") {
+        out = out.replace("\u{FFFE}BQO\u{FFFE}", "<blockquote expandable>");
+    }
+    if out.contains("\u{FFFE}BQC\u{FFFE}") {
+        out = out.replace("\u{FFFE}BQC\u{FFFE}", "</blockquote>");
+    }
 
     // Collapse HTML formatting whitespace: strip line-leading indentation and
     // fold runs of spaces/tabs (RSSHub etc. indent tags heavily; after tag
     // stripping these become visible blank runs).
-    out = RE_LINE_INDENT.replace_all(&out, "").to_string();
-    out = RE_MULTI_SPACE.replace_all(&out, " ").to_string();
+    let mut out: Cow<'_, str> = Cow::Owned(out);
+    replace_cow!(out, RE_LINE_INDENT, "");
+    replace_cow!(out, RE_MULTI_SPACE, " ");
 
-    out = collapse_blank_lines(&out);
+    let out = collapse_blank_lines(&out);
     out.trim().to_string()
 }
 

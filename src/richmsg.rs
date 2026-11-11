@@ -156,9 +156,10 @@ pub enum RichMediaSource {
     /// Local Bot API server reads this path from its own filesystem namespace
     /// (shared mount). The value is already translated to the server prefix.
     FilePath(String),
-    /// Official API (or an untranslatable path): upload the bytes through
-    /// multipart/form-data.
-    Bytes { data: Vec<u8>, filename: String },
+    /// Official API (or an untranslatable path): stream the local file through
+    /// multipart/form-data. The file is read chunk by chunk at send time, so a
+    /// large document does not occupy the equivalent heap memory.
+    File { path: std::path::PathBuf, filename: String },
 }
 
 /// Media type accepted by `InputRichMessageMedia`.
@@ -188,13 +189,26 @@ pub struct RichMedia {
     pub disable_content_type_detection: bool,
 }
 
-fn value_and_part(source: RichMediaSource, part_name: &str) -> (String, Option<Part>) {
+async fn value_and_part(
+    source: RichMediaSource,
+    part_name: &str,
+) -> anyhow::Result<(String, Option<Part>)> {
     match source {
-        RichMediaSource::FileId(id) => (id, None),
-        RichMediaSource::FilePath(path) => (format!("file://{path}"), None),
-        RichMediaSource::Bytes { data, filename } => {
-            let part = Part::bytes(data).file_name(filename);
-            (format!("attach://{part_name}"), Some(part))
+        RichMediaSource::FileId(id) => Ok((id, None)),
+        RichMediaSource::FilePath(path) => Ok((format!("file://{path}"), None)),
+        RichMediaSource::File { path, filename } => {
+            let file = tokio::fs::File::open(&path).await.with_context(|| {
+                format!("open rich media file failed: {}", path.display())
+            })?;
+            let len = file
+                .metadata()
+                .await
+                .with_context(|| format!("stat rich media file failed: {}", path.display()))?
+                .len();
+            // Known length keeps the multipart Content-Length deterministic;
+            // the file body itself is streamed by reqwest.
+            let part = Part::stream_with_length(file, len).file_name(filename);
+            Ok((format!("attach://{part_name}"), Some(part)))
         }
     }
 }
@@ -285,7 +299,7 @@ pub async fn send_rich_message(
             disable_content_type_detection,
         } = item;
 
-        let (media_value, media_part) = value_and_part(source, &id);
+        let (media_value, media_part) = value_and_part(source, &id).await?;
         if let Some(part) = media_part {
             parts.push((id.clone(), part));
         }
@@ -295,7 +309,7 @@ pub async fn send_rich_message(
         let thumbnail_value = match (kind, thumbnail) {
             (RichMediaKind::Video | RichMediaKind::Document, Some(thumb)) => {
                 let thumb_name = format!("thumb_{id}");
-                let (thumb_value, thumb_part) = value_and_part(thumb, &thumb_name);
+                let (thumb_value, thumb_part) = value_and_part(thumb, &thumb_name).await?;
                 if let Some(part) = thumb_part {
                     parts.push((thumb_name, part));
                 }
@@ -330,16 +344,17 @@ pub async fn send_rich_message(
     }
     let rich = Value::Object(rich);
 
-    let mut payload = Map::new();
-    payload.insert("chat_id".to_string(), json!(chat_id));
-    payload.insert("rich_message".to_string(), rich.clone());
-    if let Some(id) = reply_to {
-        payload.insert("reply_parameters".to_string(), json!({ "message_id": id.0 }));
-    }
-    let payload = Value::Object(payload);
-
     let url = method_url(bot, "sendRichMessage");
     if parts.is_empty() {
+        // JSON branch: consume `rich` directly instead of cloning the whole
+        // HTML/media tree into a second payload value.
+        let mut payload = Map::new();
+        payload.insert("chat_id".to_string(), json!(chat_id));
+        payload.insert("rich_message".to_string(), rich);
+        if let Some(id) = reply_to {
+            payload.insert("reply_parameters".to_string(), json!({ "message_id": id.0 }));
+        }
+        let payload = Value::Object(payload);
         let response = bot
             .client()
             .post(url)
@@ -370,16 +385,26 @@ pub async fn send_rich_message(
         form = form.part(name, part);
     }
 
-    let response = bot
-        .client()
-        .post(url)
-        .multipart(form)
-        .send()
-        .await
-        // Same chain-preserving wrap as the JSON path above; late-upload
-        // transport failures are exactly the ambiguous case A1 must catch.
-        .map_err(|e| e.without_url())
-        .context("rich message upload failed")?;
+    let response = match bot.client().post(url).multipart(form).send().await {
+        Ok(response) => response,
+        Err(e) => {
+            let e = e.without_url();
+            if e.is_body() {
+                // A request-body stream failure means a local file could not
+                // be read to completion. The multipart payload was truncated,
+                // so Telegram cannot have delivered the message; mark it as
+                // explicitly undelivered instead of the generic ambiguous
+                // "request or response body error".
+                return Err(anyhow::anyhow!(
+                    "rich media upload body read failed: {:#}",
+                    e
+                ));
+            }
+            // Same chain-preserving wrap as the JSON path above; late-upload
+            // transport failures are exactly the ambiguous case A1 must catch.
+            return Err(anyhow::Error::new(e).context("rich message upload failed"));
+        }
+    };
     parse_response::<Message>(response).await
 }
 
@@ -387,29 +412,138 @@ pub async fn send_rich_message(
 mod tests {
     use super::*;
 
-    #[test]
-    fn file_id_and_file_path_do_not_require_parts() {
-        let (value, part) = value_and_part(RichMediaSource::FileId("abc".into()), "m0");
+    #[tokio::test]
+    async fn file_id_and_file_path_do_not_require_parts() {
+        let (value, part) = value_and_part(RichMediaSource::FileId("abc".into()), "m0")
+            .await
+            .unwrap();
         assert_eq!(value, "abc");
         assert!(part.is_none());
 
         let (value, part) =
-            value_and_part(RichMediaSource::FilePath("/tmp/a.jpg".into()), "m0");
+            value_and_part(RichMediaSource::FilePath("/tmp/a.jpg".into()), "m0")
+                .await
+                .unwrap();
         assert_eq!(value, "file:///tmp/a.jpg");
         assert!(part.is_none());
     }
 
-    #[test]
-    fn bytes_use_attach_reference() {
+    #[tokio::test]
+    async fn local_file_uses_attach_reference() {
+        let path = std::env::temp_dir().join(format!(
+            "tgsrssr-richmsg-{}.jpg",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::write(&path, [1u8, 2, 3]).await.unwrap();
         let (value, part) = value_and_part(
-            RichMediaSource::Bytes {
-                data: vec![1, 2, 3],
+            RichMediaSource::File {
+                path: path.clone(),
                 filename: "a.jpg".into(),
             },
             "m0",
-        );
+        )
+        .await
+        .unwrap();
         assert_eq!(value, "attach://m0");
         assert!(part.is_some());
+        tokio::fs::remove_file(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_streams_local_file_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let path = std::env::temp_dir().join(format!(
+            "tgsrssr-richmsg-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        let payload: Vec<u8> = (0..=255u8).cycle().take(8 * 1024).collect();
+        tokio::fs::write(&path, &payload).await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = payload.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut data = Vec::new();
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+                if let Some(head_end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..head_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= head_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&data);
+            assert!(
+                request.starts_with("POST /bot123:abc/sendRichMessage HTTP/1.1"),
+                "unexpected request line: {request}"
+            );
+            assert!(request.contains("filename=\"a.jpg\""));
+            assert!(request.contains("attach://m0"));
+            assert!(
+                data.windows(expected.len()).any(|w| w == expected.as_slice()),
+                "uploaded multipart body is missing the file bytes"
+            );
+
+            let body = r#"{"ok":true,"result":{"message_id":7,"date":1770000000,"chat":{"id":42,"type":"channel","title":"t"}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = reqwest_bot::Client::builder().no_proxy().build().unwrap();
+        let bot = Bot::with_client("123:abc", client)
+            .set_api_url(format!("http://{addr}").parse().unwrap());
+        let message = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_rich_message(
+                &bot,
+                42,
+                "hello".into(),
+                vec![RichMedia {
+                    id: "m0".into(),
+                    kind: RichMediaKind::Photo,
+                    source: RichMediaSource::File {
+                        path: path.clone(),
+                        filename: "a.jpg".into(),
+                    },
+                    thumbnail: None,
+                    width: 0,
+                    height: 0,
+                    duration: None,
+                    disable_content_type_detection: false,
+                }],
+                None,
+            ),
+        )
+        .await
+        .expect("client timed out")
+        .unwrap();
+        assert_eq!(message.id.0, 7);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server timed out")
+            .unwrap();
+        tokio::fs::remove_file(&path).await.unwrap();
     }
 
     #[test]

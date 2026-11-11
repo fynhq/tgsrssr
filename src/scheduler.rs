@@ -748,10 +748,25 @@ async fn process_feed(
             // the pre-fetch snapshot is only for enrichment and may be stale
             // (an overlapping outbox retry can finish while the fetch runs).
             // Sent ids are held as 64-bit marker hashes: a long-lived source's
-            // history stays compact and is streamed row by row.
+            // history stays compact and is streamed row by row. The query is
+            // also restricted to this feed window's markers, so memory is
+            // bounded by the fetched entry count instead of by the
+            // subscription's entire (never-pruned) sent history.
             // A read error must fail closed and leave the headers untouched,
             // so the whole feed is retried next round instead of being pushed.
-            let known_sent = match db::sent_entry_id_hashes(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+            let wanted_hashes: std::collections::HashSet<u64> = fr
+                .entries
+                .iter()
+                .map(|e| db::entry_marker_hash(&fetcher::entry_id(e)))
+                .collect();
+            let known_sent = match db::sent_entry_id_hashes(
+                &state.db,
+                &cfg.chat_id,
+                &cfg.feed_url,
+                Some(&wanted_hashes),
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(

@@ -111,6 +111,10 @@ async fn main() -> anyhow::Result<()> {
         probe_bot = probe_bot.set_api_url(reqwest::Url::parse(api_url)?);
     }
     let bot_username = wait_for_bot_api(&probe_bot).await?;
+    // The probe client is only used for startup readiness/getMe. Drop the
+    // Bot (which owns the client) now so its connection pool and TLS state do
+    // not live for the whole process.
+    drop(probe_bot);
 
     // Shared state
     let state = AppState::new(cfg.clone(), db_pool.clone(), bot_username)?;
@@ -317,7 +321,12 @@ fn build_bot_client(
     proxy: Option<&str>,
     timeout: std::time::Duration,
 ) -> anyhow::Result<reqwest_bot::Client> {
-    let builder = reqwest_bot::Client::builder().timeout(timeout);
+    let builder = reqwest_bot::Client::builder()
+        .timeout(timeout)
+        // Uploads are few and long-lived; a small idle pool avoids retaining
+        // many finished connections and their buffers between sends.
+        .pool_max_idle_per_host(2)
+        .pool_idle_timeout(std::time::Duration::from_secs(30));
     let builder = match proxy {
         Some(p) => {
             let proxy = reqwest_bot::Proxy::all(p).map_err(|e| {
