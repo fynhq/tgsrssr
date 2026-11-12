@@ -928,7 +928,13 @@ async fn process_feed(
                     }
                     continue;
                 }
-                let download_warnings = prepared.warnings;
+                // Owner-facing warning texts. Per-file oversized skips are
+                // muted when NOTIFY_OVERSIZED_MEDIA=false; the raw warning
+                // list still drives MediaOnly retry / mark-sent control flow
+                // below, so the gate never changes delivery behavior.
+                let notify_warnings = prepared.notify_warnings(state.config.notify_oversized_media);
+                let has_download_warnings = !prepared.warnings.is_empty();
+                let notify_oversized = state.config.notify_oversized_media;
 
                 // Oversized videos: stash for now, record after a successful
                 // send (the TG message link is needed).
@@ -946,11 +952,13 @@ async fn process_feed(
                     // Oversized videos: notify the owner immediately (media-only
                     // mode, entry not pushed).
                     let entry_link = fetcher::entry_link(entry).unwrap_or_default();
-                    for ov in &oversized {
-                        notify_oversized_video(bot, lang, owner_id, &chat_title, &entry_link, None, false, ov).await;
+                    if notify_oversized {
+                        for ov in &oversized {
+                            notify_oversized_video(bot, lang, owner_id, &chat_title, &entry_link, None, false, ov).await;
+                        }
                     }
                     // Download failures: notify immediately.
-                    if !download_warnings.is_empty() {
+                    if has_download_warnings {
                         const MEDIA_DL_MAX_RETRIES: i64 = 10;
                         let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, &eid);
                         // Read the current counter, distinguishing a genuine
@@ -1006,22 +1014,24 @@ async fn process_feed(
                             // re-fetches the body and retries the media
                             // instead of returning 304.
                             deferred = true;
-                            notify_download_failed(
-                                bot,
-                                lang,
-                                owner_id,
-                                &feed_title,
-                                &download_warnings,
-                                &i18n::t(lang, "notif_dl_note")
-                                    .replacen("{}", &fail_count.to_string(), 1)
-                                    .replacen("{}", &MEDIA_DL_MAX_RETRIES.to_string(), 1),
-                                None,
-                                &entry_link,
-                            )
-                            .await;
+                            if !notify_warnings.is_empty() {
+                                notify_download_failed(
+                                    bot,
+                                    lang,
+                                    owner_id,
+                                    &feed_title,
+                                    &notify_warnings,
+                                    &i18n::t(lang, "notif_dl_note")
+                                        .replacen("{}", &fail_count.to_string(), 1)
+                                        .replacen("{}", &MEDIA_DL_MAX_RETRIES.to_string(), 1),
+                                    None,
+                                    &entry_link,
+                                )
+                                .await;
+                            }
                         }
                     }
-                    if download_warnings.is_empty() {
+                    if !has_download_warnings {
                         db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
                     }
                     continue;
@@ -1190,13 +1200,13 @@ async fn process_feed(
                         // Download failures: notify the owner immediately
                         // (including the delivered-message link and the source
                         // entry link).
-                        if !download_warnings.is_empty() {
+                        if !notify_warnings.is_empty() {
                             notify_download_failed(
                                 bot,
                                 lang,
                                 owner_id,
                                 &feed_title,
-                                &download_warnings,
+                                &notify_warnings,
                                 &dl_retry_note,
                                 send_outcome.delivered_tg_link.as_deref(),
                                 &entry_link,
@@ -1216,19 +1226,22 @@ async fn process_feed(
                             }
                             notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
                         }
-                        // Oversized videos: notify immediately.
-                        for ov in &oversized {
+                        // Oversized videos: notify immediately (unless muted
+                        // by NOTIFY_OVERSIZED_MEDIA).
+                        if notify_oversized {
+                            for ov in &oversized {
                                 notify_oversized_video(
-                                bot,
-                                lang,
-                                owner_id,
-                                &chat_title,
-                                &entry_link,
-                                send_outcome.delivered_tg_link.as_deref(),
-                                send_outcome.text_only,
-                                ov,
-                            )
-                            .await;
+                                    bot,
+                                    lang,
+                                    owner_id,
+                                    &chat_title,
+                                    &entry_link,
+                                    send_outcome.delivered_tg_link.as_deref(),
+                                    send_outcome.text_only,
+                                    ov,
+                                )
+                                .await;
+                            }
                         }
                         // Register the sent message: TG message id → RSS entry,
                         // for /find reverse lookup. Registration failure does
@@ -1399,31 +1412,33 @@ async fn process_feed(
                                 // not persisted: send them at enqueue time,
                                 // otherwise these alerts would be lost forever
                                 // once the outbox retry succeeds.
-                                if !download_warnings.is_empty() {
+                                if !notify_warnings.is_empty() {
                                     notify_download_failed(
                                         bot,
                                         lang,
                                         owner_id,
                                         &feed_title,
-                                        &download_warnings,
+                                        &notify_warnings,
                                         &dl_retry_note,
                                         None,
                                         &entry_link,
                                     )
                                     .await;
                                 }
-                                for ov in &oversized {
-                                    notify_oversized_video(
-                                        bot,
-                                        lang,
-                                        owner_id,
-                                        &chat_title,
-                                        &entry_link,
-                                        None,
-                                        false,
-                                        ov,
-                                    )
-                                    .await;
+                                if notify_oversized {
+                                    for ov in &oversized {
+                                        notify_oversized_video(
+                                            bot,
+                                            lang,
+                                            owner_id,
+                                            &chat_title,
+                                            &entry_link,
+                                            None,
+                                            false,
+                                            ov,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                             Ok(false) => {

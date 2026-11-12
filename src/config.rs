@@ -40,6 +40,10 @@ pub struct Config {
     /// types, not just videos; official/local Bot API transport caps still
     /// apply on top of it.
     pub max_media_download_mb: u64,
+    /// Notify the channel owner when media is skipped for exceeding the
+    /// per-file download limit (dedicated video notice plus oversized image/
+    /// file entries in the media warning notice). Defaults to true.
+    pub notify_oversized_media: bool,
 
     // Subscription limits
     /// 0 = unlimited. Applies to every user.
@@ -143,6 +147,7 @@ impl Config {
                 1,
                 2048,
             ),
+            notify_oversized_media: env_bool_or("NOTIFY_OVERSIZED_MEDIA", true),
             max_subscriptions_per_chat: clamp_warn(
                 "MAX_SUBSCRIPTIONS_PER_CHAT",
                 env_parse_or("MAX_SUBSCRIPTIONS_PER_CHAT", 99i64),
@@ -293,6 +298,32 @@ pub(crate) fn host_matches_exact(host: &str, list: &[String]) -> bool {
     })
 }
 
+/// Boolean env flag. Accepts 1/0, true/false, yes/no and on/off
+/// (case-insensitive); an invalid value warns and keeps the default.
+fn env_bool_or(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(v) => match parse_bool(&v) {
+            Some(b) => b,
+            None => {
+                eprintln!(
+                    "WARNING: {} has invalid value '{}', using default {}",
+                    key, v, default
+                );
+                default
+            }
+        },
+    }
+}
+
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 fn env_parse_or<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {
     match std::env::var(key) {
         Err(_) => default,
@@ -368,7 +399,21 @@ fn validate_single_admin(ids: Vec<i64>) -> anyhow::Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_in_list, host_matches_exact, is_allowed_by_ids, validate_single_admin};
+    use super::{
+        host_in_list, host_matches_exact, is_allowed_by_ids, parse_bool, validate_single_admin,
+    };
+
+    #[test]
+    fn bool_values_parse_with_common_spellings() {
+        for raw in ["1", "true", "TRUE", " yes ", "on"] {
+            assert_eq!(parse_bool(raw), Some(true), "raw = {:?}", raw);
+        }
+        for raw in ["0", "false", "False", "no", "off"] {
+            assert_eq!(parse_bool(raw), Some(false), "raw = {:?}", raw);
+        }
+        assert_eq!(parse_bool("maybe"), None);
+        assert_eq!(parse_bool(""), None);
+    }
 
     #[test]
     fn insecure_host_matching_is_exact_but_no_proxy_inherits_subdomains() {

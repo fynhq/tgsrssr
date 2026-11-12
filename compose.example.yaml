@@ -100,6 +100,15 @@ services:
       ## oversized media is skipped, oversized videos fall back to text with a notice
       # MAX_MEDIA_DOWNLOAD_MB: "100"
 
+      ## 默认 true；媒体超过单文件上限未推送时是否通知频道属主
+      ## （超限视频降级纯文本的专属通知 + 下载告警中的超限跳过条目）。
+      ## false 时只写日志，不发送超限告警；其他下载失败通知不受影响。
+      ## Default true; notify the channel owner when media exceeds the per-file
+      ## limit and is not pushed (oversized-video notice plus oversized skip
+      ## entries in the media warning notice). false logs only; other download
+      ## failure notices are unaffected.
+      # NOTIFY_OVERSIZED_MEDIA: "true"
+
       ## 默认 10 / Default 10
       # MEDIA_MAX_SIZE_GB: "10"
 

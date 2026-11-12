@@ -1079,11 +1079,30 @@ pub struct OversizedVideo {
     pub size: Option<u64>,
 }
 
+/// One human-readable media-pipeline warning. `oversized_skip` marks
+/// deterministic per-file size-limit skips: those notices can be muted by
+/// NOTIFY_OVERSIZED_MEDIA, while real download failures always notify.
+#[derive(Debug, Clone)]
+pub struct MediaWarning {
+    pub text: String,
+    pub oversized_skip: bool,
+}
+
+impl MediaWarning {
+    fn plain(text: String) -> Self {
+        Self { text, oversized_skip: false }
+    }
+
+    fn oversized(text: String) -> Self {
+        Self { text, oversized_skip: true }
+    }
+}
+
 /// Result of preparing media for one entry.
 #[derive(Debug, Default)]
 pub struct PreparedMedia {
     pub items: Vec<MediaItem>,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<MediaWarning>,
     /// Videos skipped for exceeding MAX_MEDIA_DOWNLOAD_MB (dedicated owner
     /// notice; the entry itself is pushed as text).
     pub oversized_videos: Vec<OversizedVideo>,
@@ -1115,6 +1134,17 @@ impl PreparedMedia {
             setup_failed: false,
             download_failed: false,
         }
+    }
+
+    /// Warning texts for owner notifications. Per-file oversized skips are
+    /// omitted when `include_oversized` is false; the raw `warnings` list
+    /// (used for retry/control flow) is never mutated.
+    pub fn notify_warnings(&self, include_oversized: bool) -> Vec<String> {
+        self.warnings
+            .iter()
+            .filter(|w| include_oversized || !w.oversized_skip)
+            .map(|w| w.text.clone())
+            .collect()
     }
 }
 
@@ -1479,7 +1509,7 @@ pub async fn prepare_entry_media(
         let entry_remaining = MAX_MEDIA_BYTES_PER_ENTRY.saturating_sub(entry_bytes);
         if entry_remaining < MIN_MEDIA_FREE_BYTES {
             warn!(entry_id = %fetcher::entry_id(entry), "per-entry media byte cap reached, skipping remaining candidates");
-            out.warnings.push(crate::i18n::t(lang, "media_entry_cap_skip").to_string());
+            out.warnings.push(MediaWarning::plain(crate::i18n::t(lang, "media_entry_cap_skip").to_string()));
             break;
         }
         let download_cap = base_cap.min(entry_remaining);
@@ -1579,14 +1609,16 @@ pub async fn prepare_entry_media(
                     out.oversized_videos.push(OversizedVideo { size });
                     video_needs_cover = true;
                 } else {
-                    out.warnings.push(crate::i18n::t(lang, "media_oversized_skip").replacen("{}", kind_label(lang, &kind), 1));
+                    out.warnings.push(MediaWarning::oversized(
+                        crate::i18n::t(lang, "media_oversized_skip").replacen("{}", kind_label(lang, &kind), 1),
+                    ));
                     debug!(url = %url, "media skipped (size limit)");
                 }
             }
             Ok(DownloadOutcome::Empty) => {
                 let msg = crate::i18n::t(lang, "media_dl_empty").replacen("{}", kind_label(lang, &kind), 1);
                 debug!(url = %url, "media skipped (empty response)");
-                out.warnings.push(msg);
+                out.warnings.push(MediaWarning::plain(msg));
                 // A 200 with an empty body is often a transient CDN hiccup
                 // (the relay path already retries it directly). Treat it like
                 // other download failures so the entry is deferred instead of
@@ -1599,7 +1631,7 @@ pub async fn prepare_entry_media(
             Ok(DownloadOutcome::InvalidContent) => {
                 let msg = crate::i18n::t(lang, "media_invalid_content")
                     .replacen("{}", kind_label(lang, &kind), 1);
-                out.warnings.push(msg);
+                out.warnings.push(MediaWarning::plain(msg));
                 // A soft-404/challenge page can be transient; retry the entry
                 // like other download failures instead of silently dropping
                 // media on the first response.
@@ -1610,7 +1642,7 @@ pub async fn prepare_entry_media(
             }
             Ok(DownloadOutcome::QuotaSkipped) => {
                 warn!(entry_id = %fetcher::entry_id(entry), "media byte budget exhausted, skipping media");
-                out.warnings.push(crate::i18n::t(lang, "media_quota_skip").to_string());
+                out.warnings.push(MediaWarning::plain(crate::i18n::t(lang, "media_quota_skip").to_string()));
                 break;
             }
             Err(e) => {
@@ -1620,7 +1652,7 @@ pub async fn prepare_entry_media(
                 } else {
                     warn!(entry_id = %fetcher::entry_id(entry), url = %url, error = format!("{:#}", e), "media download failed");
                 }
-                out.warnings.push(msg);
+                out.warnings.push(MediaWarning::plain(msg));
                 out.download_failed = true;
                 if kind == MediaKind::Video {
                     video_needs_cover = true;
@@ -2729,6 +2761,23 @@ mod tests {
         drop(after_release);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversized_warning_filter_only_drops_size_limit_skips() {
+        let mut prepared = PreparedMedia::empty();
+        prepared.warnings.push(MediaWarning::oversized("size skip".to_string()));
+        prepared.warnings.push(MediaWarning::plain("download failed".to_string()));
+
+        let all = prepared.notify_warnings(true);
+        assert_eq!(all, vec!["size skip".to_string(), "download failed".to_string()]);
+        let filtered = prepared.notify_warnings(false);
+        assert_eq!(filtered, vec!["download failed".to_string()]);
+        assert_eq!(
+            prepared.warnings.len(),
+            2,
+            "filtering must not mutate the raw warning list used for control flow"
+        );
     }
 
     #[test]

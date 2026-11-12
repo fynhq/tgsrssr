@@ -1053,7 +1053,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         );
     }
     for (index, warning) in prepared.warnings.iter().enumerate() {
-        tracing::info!(target: "tgsrssr::test", index = index, warning = %warning, "/test: media warning");
+        tracing::info!(target: "tgsrssr::test", index = index, warning = %warning.text, "/test: media warning");
     }
     for (index, oversized) in prepared.oversized_videos.iter().enumerate() {
         tracing::info!(target: "tgsrssr::test", index = index, size = ?oversized.size, "/test: oversized video");
@@ -1163,7 +1163,16 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
                 text.push_str(i18n::t(lang, "test_media_failed"));
             }
             if !prepared.warnings.is_empty() {
-                text.push_str(&i18n::t(lang, "test_warnings").replacen("{}", &prepared.warnings.join("\n"), 1));
+                // /test is a direct response to the operator, not a scheduled
+                // push notice: show every warning regardless of the
+                // NOTIFY_OVERSIZED_MEDIA gate.
+                let warnings = prepared
+                    .warnings
+                    .iter()
+                    .map(|w| w.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                text.push_str(&i18n::t(lang, "test_warnings").replacen("{}", &warnings, 1));
             }
             test_report(bot, msg.chat.id, progress_id, text).await;
         }

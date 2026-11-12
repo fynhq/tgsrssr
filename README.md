@@ -104,7 +104,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 - **内容模式**：`title_link` / `title_summary`（140 字摘要，只下载首个图片/视频）/ `title_content` / `title_only` / `content_only` / `media_only`；**来源显示**：`source` / `author` / `none`。
 - 长文按可见长度分段（正文 4096 / 媒体说明 1024 UTF-16 码元），后续分段引用第一条；HTML 解析失败降级纯文本。
 - 图片与视频可混排同一相册（每册最多 10 项、单条最多 30 项），GIF 单独发送；超限大图、长图及 sendPhoto 不支持的格式（AVIF/SVG/HEIC/TIFF 等）转文档保留原图（WebP/BMP 尺寸允许时按图片发送），转文档媒体成组发送。
-- 流式下载防 OOM，内容哈希 + file_id 去重；视频自动附缩略图与时长；可选图片中转反代；视频超限降级纯文本并通知。
+- 流式下载防 OOM，内容哈希 + file_id 去重；视频自动附缩略图与时长；可选图片中转反代；视频超限降级纯文本并通知（`NOTIFY_OVERSIZED_MEDIA=false` 可关闭超限告警）。
 
 ## 可靠性与调度
 
@@ -128,6 +128,7 @@ TELOXIDE_TOKEN=xxx ADMIN_USER_IDS=123 ./tgsrssr
 | `RSS_TRUSTED_PRIVATE_HOSTS` | 受信私网源 allowlist，精确 `host:port`；仅管理员/受信用户可用，非通用白名单 | 空 |
 | `RSS_TRUSTED_PRIVATE_SCOPE` | `admin` = 仅管理员；`allowed` = 管理员 + 白名单 | admin |
 | `MAX_MEDIA_DOWNLOAD_MB` | 单文件媒体下载上限（MB，所有媒体类型统一）；官方 API 下实际生效 49MB | 100 |
+| `NOTIFY_OVERSIZED_MEDIA` | 媒体超过单文件上限未推送时是否通知频道属主（超限视频及超限图片/文件）；`false` 仅记日志 | true |
 | `MAX_SUBSCRIPTIONS_PER_CHAT` | 每频道订阅数上限（0 = 不限） | 99 |
 | `DB_PATH` | SQLite 路径 | data/rss_bot.db |
 | `MEDIA_DIR` | 媒体目录 | media |
@@ -278,7 +279,7 @@ Local RSSHub: SSRF protection rejects private/loopback addresses by default; add
 - **Content modes**: `title_link` / `title_summary` (140-char summary, downloads only the first image/video) / `title_content` / `title_only` / `content_only` / `media_only`; **source display**: `source` / `author` / `none`.
 - Long text is split by visible length (body 4096 / media caption 1024 UTF-16 code units); later parts reply to the first; HTML parse failures fall back to plain text.
 - Photos and videos can share one album (max 10 per album, 30 per entry); GIFs are sent separately. Oversized/long images and formats not supported by sendPhoto (AVIF, SVG, HEIC, TIFF, etc.) are sent as documents to preserve the original (WebP/BMP are sent as photos when dimensions allow); document media is grouped.
-- Streaming downloads avoid OOM; content hash + file_id dedup; videos include thumbnails and duration; optional image relay proxy; oversized videos fall back to text with a notice.
+- Streaming downloads avoid OOM; content hash + file_id dedup; videos include thumbnails and duration; optional image relay proxy; oversized videos fall back to text with a notice (`NOTIFY_OVERSIZED_MEDIA=false` mutes oversized-media notices).
 
 ## Reliability & Scheduling
 
@@ -302,6 +303,7 @@ Local RSSHub: SSRF protection rejects private/loopback addresses by default; add
 | `RSS_TRUSTED_PRIVATE_HOSTS` | Trusted private-source allowlist, exact `host:port`; admin/trusted users only, not a general allowlist | empty |
 | `RSS_TRUSTED_PRIVATE_SCOPE` | `admin` = admin only; `allowed` = admin + whitelist | admin |
 | `MAX_MEDIA_DOWNLOAD_MB` | Per-file media download limit (MB, all media types); effective cap is 49MB on the official API | 100 |
+| `NOTIFY_OVERSIZED_MEDIA` | Notify the channel owner when media exceeds the per-file limit and is not pushed (oversized videos and images/files); `false` logs only | true |
 | `MAX_SUBSCRIPTIONS_PER_CHAT` | Subscriptions per channel (0 = unlimited) | 99 |
 | `DB_PATH` | SQLite path | data/rss_bot.db |
 | `MEDIA_DIR` | Media directory | media |
