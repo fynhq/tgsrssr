@@ -585,7 +585,7 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
                 Err(_) => {
                     results.push(
                         i18n::t(lang, "sub_fetch_failed")
-                            .replacen("{}", "platform fetch semaphore closed", 1),
+                            .replacen("{}", i18n::t(lang, "platform_busy"), 1),
                     );
                     continue;
                 }
@@ -820,7 +820,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         match state.platform_command_semaphore.acquire().await {
             Ok(p) => Some(p),
             Err(_) => {
-                test_report(bot, msg.chat.id, progress_id, "platform fetch semaphore closed".to_string()).await;
+                test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "platform_busy").to_string()).await;
                 return Ok(());
             }
         }
@@ -1308,7 +1308,11 @@ pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str,
         }
     };
 
-    let (chat_id, message_id) = target.unwrap();
+    // Every None branch above returns early with a user-facing message; this
+    // defensive let-else keeps the invariant explicit without an unwrap.
+    let Some((chat_id, message_id)) = target else {
+        return Ok(());
+    };
 
     match db::find_sent_message(&state.db, &chat_id, message_id).await {
         Ok(Some(row)) => {

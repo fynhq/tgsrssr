@@ -802,8 +802,9 @@ pub async fn sent_entry_id_hashes(
 
 /// Batch form of the per-entry outbox check for one subscription. The fetch
 /// cycle skips entries the outbox already owns (the outbox has sole retry
-/// authority). Fail-open semantics: callers treat a query error as empty,
-/// because the outbox re-checks is_entry_sent before sending.
+/// authority). Callers must fail closed: a query error means the outbox state
+/// is unknown, so the feed is deferred to the next round instead of treating
+/// the set as empty.
 pub async fn outbox_entry_ids(
     db: &Db,
     chat_id: &str,
@@ -1309,11 +1310,10 @@ pub async fn update_fetch_headers(
 // ===== Chat configs =====
 
 pub async fn ensure_chat_config(db: &Db, chat_id: &str) -> anyhow::Result<()> {
-    // New channels default to a 30-minute fetch interval (migration 002 has
-    // already changed existing rows to 30, but the DDL DEFAULT is still 10,
-    // so pass the value explicitly here to stay consistent).
-    // The value must match DEFAULT_INTERVAL_MINUTES (asserted by
-    // test_default_constants).
+    // New channels default to a 30-minute fetch interval. The immutable
+    // baseline DDL (001_init.sql) still declares DEFAULT 10, so every insert
+    // path must pass 30 explicitly; the value must match
+    // DEFAULT_INTERVAL_MINUTES (asserted by test_default_constants).
     sqlx::query(
         "INSERT OR IGNORE INTO chat_configs (chat_id, interval_minutes) VALUES (?, 30)",
     )

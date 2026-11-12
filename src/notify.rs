@@ -167,12 +167,18 @@ pub(crate) async fn owner_lang(state: &AppState, owner_id: i64) -> Lang {
 }
 
 /// Append a line "\nlabel：value" (skipped when the value is empty). The
-/// unified way of assembling notification copy.
+/// unified way of assembling notification copy. The separator and spacing
+/// live in the locale file (`label_line`) so English uses ": " while Chinese
+/// uses the full-width "：".
 pub(crate) fn push_line(msg: &mut String, lang: Lang, label_key: &str, value: &str) {
     if !value.is_empty() {
         // Values are mostly URLs (containing & query parameters); escape them
         // uniformly so they are not parsed as HTML entities.
-        msg.push_str(&format!("\n{}：{}", i18n::t(lang, label_key), push::escape_html(value)));
+        let escaped = push::escape_html(value);
+        msg.push_str(&i18n::fill(
+            i18n::t(lang, "label_line"),
+            &[i18n::t(lang, label_key), &escaped],
+        ));
     }
 }
 
@@ -266,4 +272,30 @@ pub(crate) async fn notify_download_failed(
     }
     push_line(&mut msg, lang, "label_source", entry_link);
     notify_user_html(bot, owner, &msg).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_line_uses_the_locale_separator() {
+        let mut en = String::new();
+        push_line(&mut en, Lang::En, "label_message", "https://t.me/example");
+        assert_eq!(en, "\nMessage: https://t.me/example");
+
+        let mut zh = String::new();
+        push_line(&mut zh, Lang::Zh, "label_message", "https://t.me/example");
+        assert_eq!(zh, "\n消息：https://t.me/example");
+    }
+
+    #[test]
+    fn push_line_skips_empty_values_and_escapes_html() {
+        let mut msg = String::new();
+        push_line(&mut msg, Lang::En, "label_source", "");
+        assert!(msg.is_empty());
+
+        push_line(&mut msg, Lang::En, "label_source", "https://example.com/?a=1&b=2");
+        assert_eq!(msg, "\nSource: https://example.com/?a=1&amp;b=2");
+    }
 }
