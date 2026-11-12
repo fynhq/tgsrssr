@@ -173,12 +173,14 @@ mod tests {
 
         let zh = text_partial_msg(
             Lang::Zh,
-            "频道",
+            "\u{9891}\u{9053}",
             None,
             Some("https://example.com/post"),
         );
-        assert!(zh.contains("正文分段发送失败"));
-        assert!(zh.contains("\n条目：https://example.com/post"));
+        // Unicode escapes keep literal CJK out of the public source tree while
+        // still asserting the exact Chinese locale output.
+        assert!(zh.contains("\u{6b63}\u{6587}\u{5206}\u{6bb5}\u{53d1}\u{9001}\u{5931}\u{8d25}"));
+        assert!(zh.contains("\n\u{6761}\u{76ee}\u{ff1a}https://example.com/post"));
         assert!(!zh.contains("Message:"));
     }
 

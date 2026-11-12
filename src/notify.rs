@@ -286,7 +286,12 @@ mod tests {
 
         let mut zh = String::new();
         push_line(&mut zh, Lang::Zh, "label_message", "https://t.me/example");
-        assert_eq!(zh, "\n消息：https://t.me/example");
+        // Unicode escapes keep literal CJK out of the public source tree while
+        // still asserting the exact Chinese locale output.
+        assert_eq!(
+            zh,
+            "\n\u{6d88}\u{606f}\u{ff1a}https://t.me/example"
+        );
     }
 
     #[test]
