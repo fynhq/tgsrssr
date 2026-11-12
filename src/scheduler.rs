@@ -1,3 +1,4 @@
+mod pending;
 mod policy;
 mod send_effects;
 
@@ -612,16 +613,15 @@ async fn process_feed(
         } else {
             None
         };
-    let result = fetcher::fetch_feed(
-        state,
-        &sub.feed_url,
-        sub.http_etag.as_deref(),
-        sub.http_last_modified.as_deref(),
-        known_sent_snapshot.as_ref(),
+    let fetch_opts = fetcher::FetchOptions {
+        etag: sub.http_etag.as_deref(),
+        last_modified: sub.http_last_modified.as_deref(),
+        known_sent: known_sent_snapshot.as_ref(),
         lang,
         allow_trusted_private,
-    )
-    .await;
+        enrichment: fetcher::Enrichment::Full,
+    };
+    let result = fetcher::fetch_feed(state, &sub.feed_url, &fetch_opts).await;
     let result = match result {
         // Render the anyhow error chain with `{:#}` (alternates Display):
         // fetcher::fetch_feed wraps reqwest errors via `.with_context(...)`
@@ -638,16 +638,7 @@ async fn process_feed(
                 "fetch transient error, retrying once after 2s"
             );
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            fetcher::fetch_feed(
-                state,
-                &sub.feed_url,
-                sub.http_etag.as_deref(),
-                sub.http_last_modified.as_deref(),
-                known_sent_snapshot.as_ref(),
-                lang,
-                allow_trusted_private,
-            )
-            .await
+            fetcher::fetch_feed(state, &sub.feed_url, &fetch_opts).await
         }
         other => other,
     };
@@ -805,59 +796,38 @@ async fn process_feed(
             // deadline only after the filter loop.
             let deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(FEED_DEADLINE_SECS);
-            let mut deferred = false;
             // One storage-failure notice per feed per round: a global volume
             // outage would otherwise send one notice per media entry.
             let mut storage_notice_sent = false;
-            let mut pending: Vec<&feed_rs::model::Entry> = Vec::new();
-            // The same source can repeat an entry id within one response; the
-            // sent-entry sets cannot know about the copy sent earlier in this
-            // loop, so dedupe explicitly.
-            let mut seen_eids: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (idx, entry) in fr.entries.iter().enumerate() {
-                if idx % 256 == 0 && tokio::time::Instant::now() >= deadline {
-                    warn!(
-                        feed = %cfg.feed_url,
-                        "feed filtering deadline reached, remaining entries deferred to next cycle"
-                    );
-                    deferred = true;
-                    break;
-                }
-                let eid = fetcher::entry_id(entry);
-                if !seen_eids.insert(eid.clone()) {
-                    continue;
-                }
-                if known_sent.contains(&db::entry_marker_hash(&eid)) {
-                    continue;
-                }
-                if outbox_ids.contains(&eid) {
-                    continue;
-                }
-                // Content filter: entries whose title matches a rule are marked
-                // as sent directly (never pushed), avoiding repeated checks
-                // every round eating into the fetch window.
-                if !filter_cfg
-                    .allows_title_with_keywords(&fetcher::entry_title(entry, lang), &filter_keywords)
-                {
-                    db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
-                    continue;
-                }
-                pending.push(entry);
+            // Dedup/filter/deadline/sort live in a pure helper; the caller
+            // still owns the sent/outbox queries and the mark-sent writes.
+            let selection = pending::select_pending(
+                &fr.entries,
+                &known_sent,
+                &outbox_ids,
+                &filter_cfg,
+                &filter_keywords,
+                lang,
+                deadline,
+            );
+            if selection.deferred {
+                warn!(
+                    feed = %cfg.feed_url,
+                    "feed filtering deadline reached, remaining entries deferred to next cycle"
+                );
             }
-            // Sort only when every entry has a timestamp (stable sort, equal
-            // timestamps keep the feed's original order); sources missing
-            // timestamps keep the feed's original order — no risky reordering.
-            if pending.len() > 1
-                && pending.iter().all(|e| e.published.or(e.updated).is_some())
-            {
-                pending.sort_by_key(|e| e.published.or(e.updated));
+            let mut deferred = selection.deferred;
+            for eid in &selection.filtered_ids {
+                // Content-filtered entries are marked sent directly (never
+                // pushed), avoiding repeated checks every round.
+                db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, eid).await?;
             }
+            let pending = selection.entries;
             // The filter sets are not needed during the (much slower) send
             // loop; release them now instead of holding a long-lived
             // subscription's history for the whole entry-processing phase.
             drop(known_sent);
             drop(outbox_ids);
-            drop(seen_eids);
 
             // True when an entry loop was cut short (filtering or pushing).
             // The response's negotiation headers are only saved when everything

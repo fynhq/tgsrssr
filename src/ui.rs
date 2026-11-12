@@ -315,7 +315,7 @@ pub(crate) async fn render_channel_list(
         // The 4th segment passes through the channel-list page number so the channel page's
         // "back to channel list" button can restore the original page.
         row.push(InlineKeyboardButton::callback(
-            format!("{}（{}）", crate::fetcher::truncate_text(&title, 32), cnt_label),
+            format!("{}（{}）", crate::htmltext::truncate_text(&title, 32), cnt_label),
             format!("c|ch|{}|0|{}", chat.chat_id, page),
         ));
         if row.len() >= 2 {
@@ -421,7 +421,7 @@ pub(crate) async fn render_channel_page(
         let name = sub.feed_title.as_deref().unwrap_or(&sub.feed_url);
         let flag = if sub.active == 0 { " ⏸" } else { "" };
         buttons.push(vec![InlineKeyboardButton::callback(
-            format!("{}. {}{}", start + offset + 1, crate::fetcher::truncate_text(name, 36), flag),
+            format!("{}. {}{}", start + offset + 1, crate::htmltext::truncate_text(name, 36), flag),
             format!("c|src|{}|{}|{}", sub.id, page, chlist_page),
         )]);
     }
@@ -526,12 +526,12 @@ async fn render_feed_page_impl(
     // Panels are sent/edited as one message; an unbounded feed title or long
     // URL would make both edit and send fail with "message is too long",
     // leaving the source page permanently unreachable.
-    let name_html = crate::push::escape_html(&crate::fetcher::truncate_text(name, 200));
+    let name_html = crate::push::escape_html(&crate::htmltext::truncate_text(name, 200));
     let mut text = i18n::fill(i18n::t(lang, "feed_header"), &[&url_attr, &name_html, status]);
     // Show original title when manually renamed
     if sub.title_overridden == 1 {
         if let Some(orig) = &sub.original_title {
-            let orig = crate::fetcher::truncate_text(orig, 200);
+            let orig = crate::htmltext::truncate_text(orig, 200);
             text.push_str(&i18n::t(lang, "feed_orig_name").replacen("{}", &crate::push::escape_html(&orig), 1));
         }
     }

@@ -1,3 +1,5 @@
+mod fetch;
+
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use teloxide::utils::command::BotCommands;
@@ -339,32 +341,6 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     Ok(())
 }
 
-/// Reject subscribing a public Telegram channel to its own web preview. The
-/// preview contains the bot's own posts, and every push creates a new msgid
-/// that the next fetch sees as a new entry, forming an endless self-feed.
-async fn is_self_telegram_source(
-    state: &AppState,
-    chat_id: &str,
-    feed_url: &str,
-) -> anyhow::Result<bool> {
-    let Some(p) = crate::platforms::platform_for_url(feed_url) else {
-        return Ok(false);
-    };
-    if p.id != "telegram" {
-        return Ok(false);
-    }
-    let Some(channel) = crate::platforms::telegram::parse_channel_name(feed_url) else {
-        return Ok(false);
-    };
-    let Some(chat) = db::get_chat(&state.db, chat_id).await? else {
-        return Ok(false);
-    };
-    Ok(chat
-        .username
-        .as_deref()
-        .is_some_and(|u| u.eq_ignore_ascii_case(&channel)))
-}
-
 // ===== /sub =====
 
 async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang: Lang) -> ResponseResult<()> {
@@ -541,70 +517,22 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
         // Already disabled -> go through the fetch + activate flow below; the reply text is marked "re-enabled"
         let was_inactive = existing.is_some();
 
-        // Platform sources (Weibo/X) require an admin-configured global cookie to work;
-        // intercept when not configured and report "the admin has not opened this platform"
-        // (fetching would inevitably fail and the error would be unintuitive).
-        if let Some(p) = crate::platforms::platform_for_url(url_str) {
-            if p.needs_cookie && state.get_cookie(p.id).await.is_none() {
-                results.push(
-                    i18n::t(lang, "sub_platform_closed")
-                        .replacen("{}", p.label, 1)
-                );
-                continue;
-            }
-        }
-        match is_self_telegram_source(state, &chat_id, url_str).await {
-            Ok(true) => {
-                results.push(i18n::t(lang, "sub_self_channel").to_string());
-                continue;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                results.push(
-                    i18n::t(lang, "sub_check_failed")
-                        .replacen("{}", &push::escape_html(&format!("{:#}", e)), 1),
-                );
-                continue;
-            }
-        }
-
-        // Fetch feed first (rsstt-style validation): a feed we cannot fetch now is
-        // NOT added. Otherwise the title falls back to the URL and, worse, the
-        // "mark existing entries as read" step is skipped — the first successful
-        // cycle would then dump the whole feed history into the channel.
-        //
-        // Platform sources additionally take the command-path semaphore
-        // (capacity 2, commands only): the scheduler's serial platform loop is
-        // unaffected, so the total concurrent platform fetches stay ≤3. The
-        // permit is released as soon as the fetch returns (not held through
-        // the DB inserts).
-        let is_platform = crate::platforms::platform_for_url(url_str).is_some();
-        let platform_permit = if is_platform {
-            match state.platform_command_semaphore.acquire().await {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    results.push(
-                        i18n::t(lang, "sub_fetch_failed")
-                            .replacen("{}", i18n::t(lang, "platform_busy"), 1),
-                    );
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        let fetch_result = fetcher::fetch_feed(state, url_str, None, None, None, lang, allow_trusted_private).await;
-        drop(platform_permit);
-        let fr = match fetch_result {
+        // Validate (cookie / self-feed), take the command-path platform
+        // semaphore, and fetch. /sub marks the whole visible window as sent,
+        // so it uses Enrichment::None and avoids per-entry detail/vote calls.
+        let fr = match fetch::fetch_command_feed(
+            state,
+            &chat_id,
+            url_str,
+            lang,
+            allow_trusted_private,
+            fetcher::Enrichment::None,
+        )
+        .await
+        {
             Ok(fr) => fr,
             Err(e) => {
-                // The raw error already carries the source URL (e.g. "HTTP 403 ... for <url>"),
-                // so the reply text doesn't repeat the URL; the error content is wrapped in a
-                // blockquote on the next line.
-                results.push(
-                    i18n::t(lang, "sub_fetch_failed")
-                        .replacen("{}", &push::escape_html(&format!("{:#}", e)), 1)
-                );
+                results.push(fetch::sub_error_text(lang, e));
                 continue;
             }
         };
@@ -749,32 +677,13 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     // falling back to default config instead of that source's override — so the
     // test result would not reflect what the real push actually does.
     let feed_url = fetcher::normalize_feed_url(&raw_feed_url);
-    // Platform sources (Weibo/X) require an admin-configured global cookie to work; intercept when not configured.
-    if let Some(p) = crate::platforms::platform_for_url(&feed_url) {
-        if p.needs_cookie && state.get_cookie(p.id).await.is_none() {
-            bot.send_message(
-                msg.chat.id,
-                i18n::t(lang, "sub_platform_closed").replacen("{}", p.label, 1),
-            ).await?;
-            return Ok(());
-        }
-    }
-    match is_self_telegram_source(state, &chat_id, &feed_url).await {
-        Ok(true) => {
-            bot.send_message(msg.chat.id, i18n::t(lang, "sub_self_channel")).await?;
-            return Ok(());
-        }
-        Ok(false) => {}
-        Err(e) => {
-            bot.send_message(
-                msg.chat.id,
-                i18n::t(lang, "sub_check_failed")
-                    .replacen("{}", &push::escape_html(&format!("{:#}", e)), 1),
-            )
+    // Validate the source before posting the progress placeholder, so cookie
+    // / self-feed failures still arrive as a direct reply.
+    if let Err(e) = fetch::validate_command_source(state, &chat_id, &feed_url).await {
+        bot.send_message(msg.chat.id, fetch::test_error_text(lang, e))
             .parse_mode(ParseMode::Html)
             .await?;
-            return Ok(());
-        }
+        return Ok(());
     }
     // No longer silently truncating with .min(9): an out-of-range index is reported explicitly
     // by the "this feed only has N entries" error below, avoiding requesting entry 50 but silently
@@ -812,30 +721,24 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let progress_id = progress_msg.id;
 
     let fetch_started = std::time::Instant::now();
-    // Platform sources take the command-path semaphore (capacity 2, commands
-    // only). The scheduler's serial platform loop does not use it; total
-    // concurrent platform fetches stay ≤3. Released right after the fetch.
-    let is_platform = crate::platforms::platform_for_url(&feed_url).is_some();
-    let platform_permit = if is_platform {
-        match state.platform_command_semaphore.acquire().await {
-            Ok(p) => Some(p),
-            Err(_) => {
-                test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "platform_busy").to_string()).await;
-                return Ok(());
-            }
-        }
-    } else {
-        None
-    };
-    let fr = match fetcher::fetch_feed(state, &feed_url, None, None, None, lang, allow_trusted_private).await {
+    let fr = match fetch::fetch_command_feed_unchecked(
+        state,
+        &feed_url,
+        lang,
+        allow_trusted_private,
+        fetcher::Enrichment::Full,
+    )
+    .await
+    {
         Ok(fr) => fr,
         Err(e) => {
-            tracing::warn!(feed_url = %feed_url, error = %e, "/test: fetch failed");
-            test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_fetch_failed").replace("{:#}", &format!("{:#}", e))).await;
+            if let fetch::CommandFetchError::FetchFailed(ref err) = e {
+                tracing::warn!(feed_url = %feed_url, error = %err, "/test: fetch failed");
+            }
+            test_report(bot, msg.chat.id, progress_id, fetch::test_error_text(lang, e)).await;
             return Ok(());
         }
     };
-    drop(platform_permit);
     let fetch_elapsed_ms = fetch_started.elapsed().as_millis() as u64;
 
     tracing::info!(

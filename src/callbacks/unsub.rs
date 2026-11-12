@@ -127,7 +127,7 @@ pub(super) async fn render_unsub_panel(
         let name = sub.feed_title.as_deref().unwrap_or(&sub.feed_url);
         let flag = if sub.active == 0 { " ⏸" } else { "" };
         buttons.push(vec![InlineKeyboardButton::callback(
-            format!("{}. {}{}", start + offset + 1, crate::fetcher::truncate_text(name, 30), flag),
+            format!("{}. {}{}", start + offset + 1, crate::htmltext::truncate_text(name, 30), flag),
             format!("c|unsub|{}|{}|{}|{}", sub.id, page, ch_page, chlist_page),
         )]);
     }

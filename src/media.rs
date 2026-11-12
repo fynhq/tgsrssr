@@ -183,7 +183,7 @@ impl MediaBudget {
                     .initialized
                     .load(std::sync::atomic::Ordering::Acquire)
             {
-                match crate::cleanup::dir_size(media_dir).await {
+                match crate::fsutil::dir_size(media_dir).await {
                     Ok(size) => {
                         self.used
                             .store(size, std::sync::atomic::Ordering::Release);

@@ -6,6 +6,7 @@ mod db;
 mod entrymeta;
 mod errors;
 mod fetcher;
+mod fsutil;
 mod htmlentities;
 mod htmltext;
 mod httpfollow;

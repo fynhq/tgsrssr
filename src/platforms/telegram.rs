@@ -16,6 +16,7 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use feed_rs::model::Entry;
 
+use crate::fetcher::FetchOptions;
 use crate::i18n::{self, Lang};
 use crate::state::AppState;
 
@@ -203,12 +204,11 @@ static RE_DIV_CLOSE: LazyLock<regex::Regex> =
 pub async fn fetch_by_url(
     state: &AppState,
     url: String,
-    _known_sent: Option<&std::collections::HashSet<String>>,
-    lang: Lang,
+    opts: &FetchOptions<'_>,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let channel = parse_channel_name(&url)
         .ok_or_else(|| anyhow::anyhow!("Invalid Telegram channel URL: {}", url))?;
-    fetch_telegram_channel(state, &channel, lang).await
+    fetch_telegram_channel(state, &channel, opts.lang).await
 }
 
 /// Fetch a Telegram public channel's web preview and convert to FetchResult.
@@ -450,7 +450,7 @@ fn message_to_entry(data_post: &str, block: &str, feed_title: &str, lang: Lang) 
             Some(if name.is_empty() {
                 "📎".to_string()
             } else {
-                format!("📎 {}", crate::push::escape_html(&name))
+                format!("📎 {}", crate::htmltext::escape_html(&name))
             })
         } else if RE_MSG_AUDIO.is_match(block) {
             Some("🎧".to_string())
@@ -461,7 +461,7 @@ fn message_to_entry(data_post: &str, block: &str, feed_title: &str, lang: Lang) 
         };
         match marker {
             Some(m) => {
-                body = format!("<a href=\"{}\">{}</a>", crate::push::escape_attr(&link), m);
+                body = format!("<a href=\"{}\">{}</a>", crate::htmltext::escape_attr(&link), m);
             }
             None => {
                 tracing::debug!(post = %data_post, "telegram message skipped (service or unsupported)");
@@ -526,7 +526,7 @@ fn extract_reply_blockquote(block: &str) -> String {
     let quoted = if author.is_empty() {
         text
     } else if href.is_empty() {
-        format!("{}:\n{}", crate::push::escape_html(&author), text)
+        format!("{}:\n{}", crate::htmltext::escape_html(&author), text)
     } else {
         // `href` comes from an HTML attribute and is already entity-encoded
         // (`&amp;`); the downstream anchor extraction unescapes it once, so
@@ -534,7 +534,7 @@ fn extract_reply_blockquote(block: &str) -> String {
         format!(
             "<a href=\"{}\">{}</a>:\n{}",
             href,
-            crate::push::escape_html(&author),
+            crate::htmltext::escape_html(&author),
             text
         )
     };
@@ -658,11 +658,11 @@ fn append_media_tags(body: &mut String, block: &str) {
     // `&amp;` in the query string.
     for caps in RE_PHOTO_BG.captures_iter(block) {
         let src = crate::htmltext::unescape_html(&caps[1]);
-        body.push_str(&format!("<img src=\"{}\">", crate::push::escape_attr(&src)));
+        body.push_str(&format!("<img src=\"{}\">", crate::htmltext::escape_attr(&src)));
     }
     for caps in RE_VIDEO_SRC.captures_iter(block) {
         let src = crate::htmltext::unescape_html(&caps[1]);
-        body.push_str(&format!("<video src=\"{}\"></video>", crate::push::escape_attr(&src)));
+        body.push_str(&format!("<video src=\"{}\"></video>", crate::htmltext::escape_attr(&src)));
     }
 }
 

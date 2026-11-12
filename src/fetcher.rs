@@ -4,7 +4,7 @@ use anyhow::Context;
 use feed_rs::model::Entry;
 use url::Url;
 
-use crate::htmltext::{unescape_html, RE_TAG};
+use crate::htmltext::{truncate_text, unescape_html, RE_TAG};
 use crate::i18n::{self, Lang};
 use crate::state::AppState;
 
@@ -192,8 +192,7 @@ fn linkify_bare_urls(text: &str, links: &mut Vec<(String, String)>) -> String {
 }
 
 /// Result of fetching a single feed.
-pub struct FetchResult {
-    pub feed_title: Option<String>,
+pub struct FetchResult {    pub feed_title: Option<String>,
     /// Entries sorted newest-first.
     pub entries: Vec<Entry>,
     /// Server returned 304 (source not updated): nothing to push; callers
@@ -225,6 +224,34 @@ impl FetchResult {
             metas: std::collections::HashMap::new(),
         }
     }
+}
+
+/// Platform-only enrichment depth. RSS sources ignore this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enrichment {
+    /// Fetch per-entry detail/vote data when the platform supports it.
+    Full,
+    /// Timeline data only. Used by `/sub`, which marks the whole visible
+    /// window as sent and therefore does not need detail enrichment.
+    None,
+}
+
+impl Enrichment {
+    pub fn is_full(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+/// One fetch request. Bundling the knobs keeps the platform fetch signature
+/// stable and lets `/sub`/`/test`/scheduler express their differences
+/// explicitly (conditional headers, sent-entry hint, enrichment depth).
+pub struct FetchOptions<'a> {
+    pub etag: Option<&'a str>,
+    pub last_modified: Option<&'a str>,
+    pub known_sent: Option<&'a std::collections::HashSet<String>>,
+    pub lang: Lang,
+    pub allow_trusted_private: bool,
+    pub enrichment: Enrichment,
 }
 
 /// Normalize a feed URL to a canonical form so that logically identical
@@ -355,26 +382,23 @@ pub async fn read_json_capped(resp: reqwest::Response, ctx: &str) -> anyhow::Res
 }
 
 /// Fetch and parse an RSS/Atom/JSON feed.
-/// Pass in the previously saved ETag / Last-Modified for a conditional
-/// request: when the source has not been updated the server returns 304,
-/// saving body transfer and parsing (`not_modified` = true).
+/// `opts` carries the saved ETag / Last-Modified for a conditional request
+/// (a 304 means the source has not updated) plus platform-routing hints
+/// (`known_sent`, `lang`, `enrichment`).
 pub async fn fetch_feed(
     state: &AppState,
     feed_url: &str,
-    etag: Option<&str>,
-    last_modified: Option<&str>,
-    known_sent: Option<&std::collections::HashSet<String>>,
-    lang: Lang,
-    allow_trusted_private: bool,
+    opts: &FetchOptions<'_>,
 ) -> anyhow::Result<FetchResult> {
     // Native platform fetch (weibo / X / Telegram): bypass the RSS/HTTP
     // pipeline entirely. Registry-driven — new platforms route automatically.
-    // `known_sent` lets platform fetchers skip enrichment requests for entries
-    // the scheduler already pushed (currently Weibo long-text/vote detail; X
-    // ignores the snapshot and always walks the cursor).
-    // `lang` selects the owner's language for user-visible fallback labels.
+    // `opts.known_sent` lets platform fetchers skip enrichment requests for
+    // entries the scheduler already pushed (currently Weibo long-text/vote
+    // detail; X ignores the snapshot and always walks the cursor).
+    // `opts.lang` selects the owner's language for user-visible fallback
+    // labels; `opts.enrichment` lets /sub skip detail enrichment entirely.
     if let Some(p) = crate::platforms::platform_for_url(feed_url) {
-        return (p.fetch)(state, feed_url.to_string(), known_sent, lang).await;
+        return (p.fetch)(state, feed_url.to_string(), opts).await;
     }
 
     let _permit = state.fetch_semaphore.acquire().await
@@ -409,7 +433,7 @@ pub async fn fetch_feed(
     let resp = crate::httpfollow::get_follow_redirects(
         state,
         feed_url,
-        allow_trusted_private,
+        opts.allow_trusted_private,
         None,
         "feed",
         MAX_REDIRECTS,
@@ -422,10 +446,10 @@ pub async fn fetch_feed(
             // they must be sent on every hop: a redirected feed (http→https,
             // short links, RSSHub front pages) would otherwise never receive
             // its conditional headers and would always transfer the full body.
-            if let Some(e) = etag {
+            if let Some(e) = opts.etag {
                 req = req.header("If-None-Match", e);
             }
-            if let Some(lm) = last_modified {
+            if let Some(lm) = opts.last_modified {
                 req = req.header("If-Modified-Since", lm);
             }
             req
@@ -933,20 +957,6 @@ pub fn html_to_telegram_html(html: &str) -> String {
 
     let out = collapse_blank_lines(&out);
     out.trim().to_string()
-}
-
-/// Truncate text at a char boundary, appending ellipsis if truncated.
-pub fn truncate_text(s: &str, max_units: usize) -> String {
-    // Use the same UTF-16 unit as Telegram and visible_len; counting Unicode
-    // chars would under-count emoji and make this helper disagree with the
-    // rest of the display pipeline.
-    if crate::htmltext::utf16_len(s) <= max_units {
-        return s.to_string();
-    }
-    format!(
-        "{}…",
-        crate::htmltext::take_utf16_prefix(s, max_units.saturating_sub(1))
-    )
 }
 
 #[cfg(test)]

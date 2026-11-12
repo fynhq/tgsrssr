@@ -23,6 +23,7 @@ use feed_rs::model::Entry;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::fetcher::FetchOptions;
 use crate::i18n::{self, Lang};
 use crate::state::AppState;
 // Set-Cookie value extraction is a pure text helper; it lives in htmltext
@@ -121,12 +122,11 @@ pub fn parse_screen_name(url: &str) -> Option<String> {
 pub async fn fetch_by_url(
     state: &AppState,
     url: String,
-    known_sent: Option<&std::collections::HashSet<String>>,
-    lang: Lang,
+    opts: &FetchOptions<'_>,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let screen_name = parse_screen_name(&url)
         .ok_or_else(|| anyhow::anyhow!("Invalid X user profile URL: {}", url))?;
-    fetch_x_user(state, &screen_name, known_sent, lang).await
+    fetch_x_user(state, &screen_name, opts.known_sent, opts.lang).await
 }
 
 /// Fetch an X user's timeline and convert to FetchResult.
@@ -1090,7 +1090,7 @@ fn append_media_tags(body: &mut String, legacy: &Value) {
             "photo" => {
                 if let Some(url) = m["media_url_https"].as_str() {
                     let orig = x_photo_orig(url);
-                    body.push_str(&format!("<img src=\"{}\">", crate::push::escape_attr(&orig)));
+                    body.push_str(&format!("<img src=\"{}\">", crate::htmltext::escape_attr(&orig)));
                 }
             }
             "video" | "animated_gif" => {
@@ -1121,12 +1121,12 @@ fn append_media_tags(body: &mut String, legacy: &Value) {
                         match poster {
                             Some(p) => body.push_str(&format!(
                                 "<video src=\"{}\" poster=\"{}\"></video>",
-                                crate::push::escape_attr(url),
-                                crate::push::escape_attr(&p)
+                                crate::htmltext::escape_attr(url),
+                                crate::htmltext::escape_attr(&p)
                             )),
                             None => body.push_str(&format!(
                                 "<video src=\"{}\"></video>",
-                                crate::push::escape_attr(url)
+                                crate::htmltext::escape_attr(url)
                             )),
                         }
                     }
@@ -1256,8 +1256,8 @@ fn linkify_text_segment(text: &str, names: &[String]) -> String {
         out.push_str(&text[last_end..*start]);
         out.push_str(&format!(
             "<a href=\"https://x.com/{}\">{}</a>",
-            crate::push::escape_attr(name),
-            crate::push::escape_html(&text[*start..*end])
+            crate::htmltext::escape_attr(name),
+            crate::htmltext::escape_html(&text[*start..*end])
         ));
         last_end = *end;
     }
@@ -1359,14 +1359,14 @@ fn linkify_hashtags_in_text(text: &str) -> String {
         let tag_text = &text[start..end];
         let tag_body = &text[start + 1..end]; // without sigil
         let href = if is_cashtag {
-            format!("https://x.com/search?q=%24{}", crate::push::escape_attr(tag_body))
+            format!("https://x.com/search?q=%24{}", crate::htmltext::escape_attr(tag_body))
         } else {
-            format!("https://x.com/hashtag/{}", crate::push::escape_attr(tag_body))
+            format!("https://x.com/hashtag/{}", crate::htmltext::escape_attr(tag_body))
         };
         out.push_str(&format!(
             "<a href=\"{}\">{}</a>",
             href,
-            crate::push::escape_html(tag_text)
+            crate::htmltext::escape_html(tag_text)
         ));
         last_end = end;
     }
@@ -1430,8 +1430,8 @@ fn append_quote_block(body: &mut String, result: &Value, prefix: &str) {
             };
             format!(
                 "<a href=\"{}\">@{}</a>: ",
-                crate::push::escape_attr(&link),
-                crate::push::escape_html(s)
+                crate::htmltext::escape_attr(&link),
+                crate::htmltext::escape_html(s)
             )
         }
         None => String::new(),
@@ -1629,7 +1629,7 @@ fn tweet_text_to_html(text: &str) -> String {
     for caps in RE_URL.captures_iter(text) {
         let m = caps.get(0).unwrap();
         // Escape and append the text before this URL.
-        out.push_str(&crate::push::escape_html(&text[last..m.start()]));
+        out.push_str(&crate::htmltext::escape_html(&text[last..m.start()]));
         // `[^\s<>"]+` also swallows CJK/full-width text glued to the end of a
         // URL (`https://x.com/a，然后`). Stop the URL at the first non-ASCII
         // character so the trailing prose stays outside the anchor; the
@@ -1666,16 +1666,16 @@ fn tweet_text_to_html(text: &str) -> String {
         }
         out.push_str(&format!(
             "<a href=\"{}\">{}</a>",
-            crate::push::escape_attr(url),
-            crate::push::escape_html(url)
+            crate::htmltext::escape_attr(url),
+            crate::htmltext::escape_html(url)
         ));
         // Emit the stripped trailing punctuation/CJK prose after the link
         // (otherwise the body would lose periods or glue them to the href).
         let stripped = &raw[url.len()..];
-        out.push_str(&crate::push::escape_html(stripped));
+        out.push_str(&crate::htmltext::escape_html(stripped));
         last = m.end();
     }
-    out.push_str(&crate::push::escape_html(&text[last..]));
+    out.push_str(&crate::htmltext::escape_html(&text[last..]));
     // Convert newlines to <br>
     out.replace('\n', "<br>")
 }

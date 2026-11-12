@@ -17,7 +17,6 @@ pub mod x;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::i18n::Lang;
 use crate::state::AppState;
 use feed_rs::model::{Content, Entry, Link, Person, Text};
 
@@ -132,14 +131,13 @@ pub fn rate_limited(platform: &'static str, status: u16) -> anyhow::Error {
 }
 
 /// Async fetch function registered per platform. Receives the full feed URL
-/// (owned, moved into the future); returns entries newest-first.
-/// Higher-ranked over the `AppState` borrow so the returned future may borrow
-/// from it.
+/// (owned, moved into the future) and the shared fetch options; returns
+/// entries newest-first. Higher-ranked over the borrows so the returned future
+/// may borrow from them.
 pub type PlatformFetchFn = for<'a> fn(
     &'a AppState,
     String,
-    Option<&'a std::collections::HashSet<String>>,
-    Lang,
+    &'a crate::fetcher::FetchOptions<'a>,
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<crate::fetcher::FetchResult>> + Send + 'a>>;
 
 /// Platform descriptor: identity (cookie panel) + routing (URL match,
@@ -172,7 +170,7 @@ pub const PLATFORMS: &[PlatformDef] = &[
         needs_cookie: true,
         match_url: weibo::is_weibo_url,
         canonical_url: |url| weibo::parse_uid(url).map(|uid| format!("https://weibo.com/u/{}", uid)),
-        fetch: |state, url, known, lang| Box::pin(weibo::fetch_by_url(state, url, known, lang)),
+        fetch: |state, url, opts| Box::pin(weibo::fetch_by_url(state, url, opts)),
     },
     PlatformDef {
         id: "x",
@@ -189,7 +187,7 @@ pub const PLATFORMS: &[PlatformDef] = &[
             x::parse_screen_name(url)
                 .map(|name| format!("https://x.com/{}", name.to_ascii_lowercase()))
         },
-        fetch: |state, url, known, lang| Box::pin(x::fetch_by_url(state, url, known, lang)),
+        fetch: |state, url, opts| Box::pin(x::fetch_by_url(state, url, opts)),
     },
     PlatformDef {
         id: "telegram",
@@ -203,7 +201,7 @@ pub const PLATFORMS: &[PlatformDef] = &[
             telegram::parse_channel_name(url)
                 .map(|ch| format!("https://t.me/{}", ch.to_ascii_lowercase()))
         },
-        fetch: |state, url, known, lang| Box::pin(telegram::fetch_by_url(state, url, known, lang)),
+        fetch: |state, url, opts| Box::pin(telegram::fetch_by_url(state, url, opts)),
     },
 ];
 

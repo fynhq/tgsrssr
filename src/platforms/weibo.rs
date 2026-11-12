@@ -22,6 +22,7 @@ use feed_rs::model::Entry;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::fetcher::FetchOptions;
 use crate::i18n::{self, Lang};
 use crate::state::AppState;
 
@@ -136,21 +137,31 @@ pub fn parse_uid(url: &str) -> Option<String> {
 pub async fn fetch_by_url(
     state: &AppState,
     url: String,
-    known_sent: Option<&std::collections::HashSet<String>>,
-    lang: Lang,
+    opts: &FetchOptions<'_>,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let uid = parse_uid(&url)
         .ok_or_else(|| anyhow::anyhow!("invalid weibo user homepage URL: {}", url))?;
-    fetch_weibo_user(state, &uid, known_sent, lang).await
+    fetch_weibo_user(state, &uid, opts).await
+}
+
+/// Whether detail/vote enrichment should be skipped for this mblog.
+/// `Enrichment::None` (used by `/sub`) skips the whole window; `Full` still
+/// skips entries the scheduler already pushed.
+fn should_skip_detail(
+    enrichment: crate::fetcher::Enrichment,
+    known_sent: Option<&std::collections::HashSet<String>>,
+    mblog_id: &str,
+) -> bool {
+    !enrichment.is_full() || known_sent.is_some_and(|s| s.contains(mblog_id))
 }
 
 /// Fetch a weibo user timeline and convert to FetchResult.
 pub async fn fetch_weibo_user(
     state: &AppState,
     uid: &str,
-    known_sent: Option<&std::collections::HashSet<String>>,
-    lang: Lang,
+    opts: &FetchOptions<'_>,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
+    let lang = opts.lang;
     let cookies = match state.get_cookie("weibo").await {
         Some(c) if !c.trim().is_empty() => c,
         _ => anyhow::bail!("weibo feeds require an admin-configured login cookie (/cookies command)"),
@@ -313,8 +324,9 @@ pub async fn fetch_weibo_user(
         // Already-pushed entries still appear in the timeline. Their detail /
         // vote enrichment is pure overhead (and extra risk-control exposure),
         // so skip those requests; the scheduler filters them from the push
-        // list via the same sent-entry set.
-        let known_entry = known_sent.is_some_and(|s| s.contains(&mblog_id));
+        // list via the same sent-entry set. `/sub` disables enrichment
+        // entirely: it marks the whole visible window as sent afterwards.
+        let skip_detail = should_skip_detail(opts.enrichment, opts.known_sent, &mblog_id);
 
         // Mutable copy: once detail data is fetched, overwrite pics in place /
         // extract the full text
@@ -330,7 +342,7 @@ pub async fn fetch_weibo_user(
         // the complete list.
         // The long-text full content and the extra images share this single
         // request; on failure fall back to the list data without losing the entry.
-        if !known_entry && detail_budget > 0 && status_needs_detail(&mblog) {
+        if !skip_detail && detail_budget > 0 && status_needs_detail(&mblog) {
             detail_budget -= 1;
             if let Some(detail) = fetch_status_show(state, &cookies, &mblog_id).await {
                 if mblog["isLongText"].as_bool() == Some(true) {
@@ -343,7 +355,7 @@ pub async fn fetch_weibo_user(
             }
         }
         // The retweeted status can also be long text / pic-truncated; same fix.
-        if !known_entry && detail_budget > 0 && status_needs_detail(&mblog["retweeted_status"]) {
+        if !skip_detail && detail_budget > 0 && status_needs_detail(&mblog["retweeted_status"]) {
             detail_budget -= 1;
             let rt_mid = status_id_str(&mblog["retweeted_status"]).unwrap_or_default();
             if let Some(detail) = fetch_status_show(state, &cookies, &rt_mid).await {
@@ -360,7 +372,7 @@ pub async fn fetch_weibo_user(
         // details (question/options/multi-select) must be fetched via the
         // desktop ajax/statuses/show endpoint. A failure does not block the
         // entry push (it degrades to plain text).
-        let vote_obj = if !known_entry && detail_budget > 0 && mblog["is_vote"].as_i64() == Some(1) {
+        let vote_obj = if !skip_detail && detail_budget > 0 && mblog["is_vote"].as_i64() == Some(1) {
             detail_budget -= 1;
             fetch_vote_object(state, &cookies, &mblog_id).await
         } else {
@@ -758,7 +770,7 @@ fn extract_inline_images(text: &str, lang: Lang) -> (String, Vec<String>) {
             // Extract visible label from inner content (strip tags).
             let label = crate::fetcher::html_to_plain(&caps[2]);
             let label = if label.trim().is_empty() { i18n::t(lang, "weibo_image_label").to_string() } else { label.trim().to_string() };
-            format!("<a href=\"{}\">{}</a>", crate::push::escape_attr(sinaurl), crate::push::escape_html(&label))
+            format!("<a href=\"{}\">{}</a>", crate::htmltext::escape_attr(sinaurl), crate::htmltext::escape_html(&label))
         })
         .to_string();
 
@@ -770,7 +782,7 @@ fn extract_inline_images(text: &str, lang: Lang) -> (String, Vec<String>) {
             if let Some(real) = decode_sinaurl(sinaurl) {
                 urls.push(real);
             }
-            format!("<a href=\"{}\">{}</a>", crate::push::escape_attr(sinaurl), crate::push::escape_html(&caps[1]))
+            format!("<a href=\"{}\">{}</a>", crate::htmltext::escape_attr(sinaurl), crate::htmltext::escape_html(&caps[1]))
         })
         .to_string();
 
@@ -782,7 +794,7 @@ fn extract_inline_images(text: &str, lang: Lang) -> (String, Vec<String>) {
 /// escaped here (attribute context). Extracted because this exact template
 /// was repeated verbatim at every append_weibo_media push site.
 fn img_tag(url: &str) -> String {
-    format!("<img src=\"{}\" referrerpolicy=\"no-referrer\">", crate::push::escape_attr(url))
+    format!("<img src=\"{}\" referrerpolicy=\"no-referrer\">", crate::htmltext::escape_attr(url))
 }
 
 /// Append a status's media to the HTML body: pics[].large.url images
@@ -870,19 +882,19 @@ fn append_weibo_media(body: &mut String, mblog: &Value, owner_mid: &str) {
             let owner_attr = if owner_mid.is_empty() {
                 String::new()
             } else {
-                format!(" data-weibo-mid=\"{}\"", crate::push::escape_attr(owner_mid))
+                format!(" data-weibo-mid=\"{}\"", crate::htmltext::escape_attr(owner_mid))
             };
             if !page_pic_url.is_empty() {
                 body.push_str(&format!(
                     "<video src=\"{}\"{} poster=\"{}\"></video>",
-                    crate::push::escape_attr(&video_url),
+                    crate::htmltext::escape_attr(&video_url),
                     owner_attr,
-                    crate::push::escape_attr(page_pic_url)
+                    crate::htmltext::escape_attr(page_pic_url)
                 ));
             } else {
                 body.push_str(&format!(
                     "<video src=\"{}\"{}></video>",
-                    crate::push::escape_attr(&video_url),
+                    crate::htmltext::escape_attr(&video_url),
                     owner_attr
                 ));
             }
@@ -1013,15 +1025,15 @@ fn mblog_to_entry(
             Some(rt_uid) if !rt_bid.is_empty() => format!(
                 "<a href=\"https://weibo.com/{}/{}\">@{}</a>",
                 rt_uid,
-                crate::push::escape_attr(rt_bid),
-                crate::push::escape_html(rt_user)
+                crate::htmltext::escape_attr(rt_bid),
+                crate::htmltext::escape_html(rt_user)
             ),
             Some(rt_uid) => format!(
                 "<a href=\"https://weibo.com/u/{}\">@{}</a>",
                 rt_uid,
-                crate::push::escape_html(rt_user)
+                crate::htmltext::escape_html(rt_user)
             ),
-            None => format!("@{}", crate::push::escape_html(rt_user)),
+            None => format!("@{}", crate::htmltext::escape_html(rt_user)),
         };
         // Long retweets: use the full text fetched from statuses/show.
         // Absolutize relative hrefs so @user / hashtag links survive.
@@ -1076,7 +1088,7 @@ fn mblog_to_entry(
     // &, so both the raw and escaped forms are compared.
     let mut rt_images: Vec<String> = Vec::new();
     for img_url in &main_inline_imgs {
-        let escaped = crate::push::escape_attr(img_url);
+        let escaped = crate::htmltext::escape_attr(img_url);
         if body.contains(img_url.as_str()) || body.contains(escaped.as_str()) {
             continue;
         }
@@ -1263,7 +1275,7 @@ fn render_md_inline(text: &str) -> String {
     // text decoder (single pass, no re-decoding), and leaves bare `&`/`<`
     // untouched, so the round trip is idempotent for already-escaped input and
     // correct for literal input.
-    let s = crate::push::escape_html(&crate::htmltext::decode_entities(&s));
+    let s = crate::htmltext::escape_html(&crate::htmltext::decode_entities(&s));
 
     // 4) Bold **...** (before italic, to avoid ** being split into two *)
     let s = RE_MD_BOLD.replace_all(&s, "<b>$1</b>").to_string();
@@ -1282,7 +1294,7 @@ fn render_md_inline(text: &str) -> String {
             &token,
             &format!(
                 "<code>{}</code>",
-                crate::push::escape_html(&crate::htmltext::decode_entities(code))
+                crate::htmltext::escape_html(&crate::htmltext::decode_entities(code))
             ),
         );
     }
@@ -1304,8 +1316,8 @@ fn render_md_inline(text: &str) -> String {
                 &token,
                 &format!(
                     "<a href=\"{}\">{}</a>",
-                    crate::push::escape_attr(&crate::htmltext::decode_entities(url)),
-                    crate::push::escape_html(&crate::htmltext::decode_entities(link_text))
+                    crate::htmltext::escape_attr(&crate::htmltext::decode_entities(url)),
+                    crate::htmltext::escape_html(&crate::htmltext::decode_entities(link_text))
                 ),
             );
         }
@@ -1404,7 +1416,7 @@ fn render_weibo_markdown(text: &str) -> String {
         let open_tag = if lang.is_empty() {
             "<pre><code>".to_string()
         } else {
-            format!("<pre><code class=\"language-{}\">", crate::push::escape_attr(lang))
+            format!("<pre><code class=\"language-{}\">", crate::htmltext::escape_attr(lang))
         };
         let html = format!(
             "{}{}</code></pre>",
@@ -1412,7 +1424,7 @@ fn render_weibo_markdown(text: &str) -> String {
             // Same decode-once-escape-once rule as render_md_inline (P1-2):
             // fenced content comes from the same pre-escaped editor storage,
             // so `&amp;` inside a code block must not become `&amp;amp;`.
-            crate::push::escape_html(&crate::htmltext::decode_entities(&content))
+            crate::htmltext::escape_html(&crate::htmltext::decode_entities(&content))
         );
         // Store as a placeholder to prevent the trailing RE_BLANK_LINES
         // (fetcher::RE_BLANK_LINES, applied at the end of rendering) from
@@ -1741,6 +1753,36 @@ fn convert_emoji_markers(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enrichment_none_skips_detail_for_the_whole_window() {
+        let known = std::collections::HashSet::from(["m1".to_string()]);
+        assert!(should_skip_detail(
+            crate::fetcher::Enrichment::None,
+            None,
+            "m1"
+        ));
+        assert!(should_skip_detail(
+            crate::fetcher::Enrichment::None,
+            Some(&known),
+            "m2"
+        ));
+        assert!(!should_skip_detail(
+            crate::fetcher::Enrichment::Full,
+            None,
+            "m1"
+        ));
+        assert!(!should_skip_detail(
+            crate::fetcher::Enrichment::Full,
+            Some(&known),
+            "m2"
+        ));
+        assert!(should_skip_detail(
+            crate::fetcher::Enrichment::Full,
+            Some(&known),
+            "m1"
+        ));
+    }
 
     #[test]
     fn parse_uid_valid() {

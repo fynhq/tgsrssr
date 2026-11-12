@@ -136,6 +136,19 @@ pub fn take_utf16_prefix(s: &str, max_units: usize) -> &str {
     s
 }
 
+/// Truncate text at a char boundary, appending ellipsis if truncated.
+/// Uses UTF-16 units like the rest of the display pipeline (emoji count as 2),
+/// so callers stay consistent with Telegram's limits.
+pub fn truncate_text(s: &str, max_units: usize) -> String {
+    if utf16_len(s) <= max_units {
+        return s.to_string();
+    }
+    format!(
+        "{}…",
+        take_utf16_prefix(s, max_units.saturating_sub(1))
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Visible-text truncation with hyperlink preservation
 // ---------------------------------------------------------------------------
