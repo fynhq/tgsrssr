@@ -1,3 +1,8 @@
+mod policy;
+mod send_effects;
+
+use send_effects::SendSuccessCtx;
+
 use teloxide::prelude::*;
 use tokio::sync::Semaphore;
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -405,7 +410,13 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         // happens to fail) is not evidence that the whole platform is down.
         // If the active-count query failed, fall back to the due sample.
         let active_count = stats.active_counts.get(p).copied().unwrap_or(seen_count);
-        if seen_count < active_count {
+        let verdict = policy::platform_round_verdict(
+            seen_count,
+            active_count,
+            ok_set.contains(&p),
+            failed.contains(&p),
+        );
+        if verdict == policy::PlatformRound::Skip {
             tracing::debug!(
                 platform = p,
                 seen = seen_count,
@@ -421,13 +432,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             Ok(Some(v)) if v == "down"
         );
 
-        let has_failed = failed.contains(&p);
-        let has_ok = ok_set.contains(&p);
-        // Nature of this round: all-failed / all-ok / mixed (or no valid signal)
-        let all_failed = has_failed && !has_ok;
-        let all_ok = has_ok && !has_failed;
-
-        if all_failed {
+        if verdict == policy::PlatformRound::AllFailed {
             // All failed this round: increment the failure streak counter
             // (positive = failure streak, starting from 1; if the previous
             // direction was success (negative), reset to 1).
@@ -447,7 +452,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     maybe_notify_platform_down(bot, state, p, err).await;
                 }
             }
-        } else if all_ok {
+        } else if verdict == policy::PlatformRound::AllOk {
             // All succeeded this round: increment the success streak counter.
             // Same "defer on read error" rule as the failure branch.
             if let Some(streak) = read_streak(state, &streak_key, p).await {
@@ -695,8 +700,15 @@ async fn process_feed(
                 }
             }
 
-            // Push new entries (skip already-sent)
-            let feed_title = sub.feed_title.clone().unwrap_or_default();
+            // Push new entries (skip already-sent). Use the title from this
+            // fetch when the subscription is not manually overridden, so the
+            // round that discovers a rename already renders the new title
+            // instead of lagging one cycle behind the DB update above.
+            let feed_title = policy::effective_feed_title(
+                sub.title_overridden != 0,
+                fr.feed_title.as_deref(),
+                sub.feed_title.as_deref(),
+            );
             let opts = push::RenderOpts {
                 mode: ContentMode::from_str(&cfg.content_mode),
                 source: push::SourceDisplay::from_str(&cfg.source_display),
@@ -959,7 +971,6 @@ async fn process_feed(
                     }
                     // Download failures: notify immediately.
                     if has_download_warnings {
-                        const MEDIA_DL_MAX_RETRIES: i64 = 10;
                         let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, &eid);
                         // Read the current counter, distinguishing a genuine
                         // DB error from a missing/invalid value. On a DB error we
@@ -979,56 +990,67 @@ async fn process_feed(
                                 continue;
                             }
                         };
-                        let fail_count: i64 = stored + 1;
-                        if fail_count >= MEDIA_DL_MAX_RETRIES {
-                            // Cap reached: abandon this entry and notify the
-                            // owner.
-                            warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "MediaOnly download retries exhausted, abandoning");
-                            let msg = push_fail_msg(
-                                lang,
-                                i18n::t(lang, "notif_abandoned"),
-                                &feed_title,
-                                &i18n::t(lang, "notif_media_dl_fail").replacen("{}", &fail_count.to_string(), 1),
-                                "label_entry",
-                                &entry_link,
-                            );
-                            notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                            // Delete the counter key BEFORE marking sent: if the
-                            // mark fails (and `?` returns), the counter is
-                            // already cleared, so the next round re-counts from 0
-                            // instead of re-triggering the abandon branch every
-                            // round and spamming the owner with "abandoned".
-                            db::delete_setting(&state.db, &retry_key).await.ok();
-                            db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
-                        } else {
-                            // A failed counter write must not be swallowed: the
-                            // next round would re-read the old value and notify
-                            // forever while the retry cap is never reached.
-                            if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
-                                warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
-                                deferred = true;
-                                continue;
-                            }
-                            // The entry is still unresolved: keep the old
-                            // conditional-request headers so the next round
-                            // re-fetches the body and retries the media
-                            // instead of returning 304.
-                            deferred = true;
-                            if !notify_warnings.is_empty() {
-                                notify_download_failed(
-                                    bot,
+                        let step = policy::media_retry_step(
+                            true,
+                            true,
+                            Ok(stored),
+                            !notify_warnings.is_empty(),
+                        );
+                        match step {
+                            policy::MediaRetryStep::Abandon { fail_count } => {
+                                // Cap reached: abandon this entry and notify
+                                // the owner.
+                                warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "MediaOnly download retries exhausted, abandoning");
+                                let msg = push_fail_msg(
                                     lang,
-                                    owner_id,
+                                    i18n::t(lang, "notif_abandoned"),
                                     &feed_title,
-                                    &notify_warnings,
-                                    &i18n::t(lang, "notif_dl_note")
-                                        .replacen("{}", &fail_count.to_string(), 1)
-                                        .replacen("{}", &MEDIA_DL_MAX_RETRIES.to_string(), 1),
-                                    None,
+                                    &i18n::t(lang, "notif_media_dl_fail").replacen("{}", &fail_count.to_string(), 1),
+                                    "label_entry",
                                     &entry_link,
-                                )
-                                .await;
+                                );
+                                notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+                                // Delete the counter key BEFORE marking sent:
+                                // if the mark fails (and `?` returns), the
+                                // counter is already cleared, so the next round
+                                // re-counts from 0 instead of re-triggering the
+                                // abandon branch every round and spamming the
+                                // owner with "abandoned".
+                                db::delete_setting(&state.db, &retry_key).await.ok();
+                                db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
                             }
+                            policy::MediaRetryStep::Retry { fail_count, notify } => {
+                                // A failed counter write must not be swallowed:
+                                // the next round would re-read the old value and
+                                // notify forever while the retry cap is never
+                                // reached.
+                                if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
+                                    warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
+                                    deferred = true;
+                                    continue;
+                                }
+                                // The entry is still unresolved: keep the old
+                                // conditional-request headers so the next round
+                                // re-fetches the body and retries the media
+                                // instead of returning 304.
+                                deferred = true;
+                                if notify {
+                                    notify_download_failed(
+                                        bot,
+                                        lang,
+                                        owner_id,
+                                        &feed_title,
+                                        &notify_warnings,
+                                        &i18n::t(lang, "notif_dl_note")
+                                            .replacen("{}", &fail_count.to_string(), 1)
+                                            .replacen("{}", &policy::MEDIA_DL_MAX_RETRIES.to_string(), 1),
+                                        None,
+                                        &entry_link,
+                                    )
+                                    .await;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if !has_download_warnings {
@@ -1062,7 +1084,6 @@ async fn process_feed(
                     // round also delays the entry's text, and an entry that
                     // rolls out of the source's sliding window mid-retry is
                     // lost the same way MediaOnly deferrals are.
-                    const MEDIA_DL_MAX_DEFER_ROUNDS: i64 = 3;
                     let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, &eid);
                     // Same DB-error discipline as the MediaOnly branch: a read
                     // error must not reset the streak (cap would never fire),
@@ -1076,26 +1097,31 @@ async fn process_feed(
                             continue;
                         }
                     };
-                    let fail_count: i64 = stored + 1;
-                    if fail_count < MEDIA_DL_MAX_DEFER_ROUNDS {
-                        if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
-                            warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
+                    let step = policy::media_retry_step(false, true, Ok(stored), false);
+                    match step {
+                        policy::MediaRetryStep::Retry { fail_count, .. } => {
+                            if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
+                                warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
+                                deferred = true;
+                                continue;
+                            }
+                            info!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "media download failed, deferring entry to next fetch round");
                             deferred = true;
                             continue;
                         }
-                        info!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "media download failed, deferring entry to next fetch round");
-                        deferred = true;
-                        continue;
+                        policy::MediaRetryStep::Degrade { fail_count } => {
+                            // Cap reached: fall through to the normal send path —
+                            // the entry goes out with whatever media survived
+                            // (cover fallback or none) and the owner notification
+                            // below carries the retry note. Delete the counter
+                            // first so a later `?` abort cannot leave it behind.
+                            warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "media download retries exhausted, degrading entry");
+                            db::delete_setting(&state.db, &retry_key).await.ok();
+                            dl_retry_note = i18n::t(lang, "notif_dl_retried")
+                                .replacen("{}", &fail_count.to_string(), 1);
+                        }
+                        _ => {}
                     }
-                    // Cap reached: fall through to the normal send path — the
-                    // entry goes out with whatever media survived (cover
-                    // fallback or none) and the owner notification below
-                    // carries the retry note. Delete the counter first so a
-                    // later `?` abort cannot leave it behind.
-                    warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "media download retries exhausted, degrading entry");
-                    db::delete_setting(&state.db, &retry_key).await.ok();
-                    dl_retry_note = i18n::t(lang, "notif_dl_retried")
-                        .replacen("{}", &fail_count.to_string(), 1);
                 }
 
                 // Reaching here means the entry is sent this round (a MediaOnly
@@ -1170,30 +1196,22 @@ async fn process_feed(
                 match result {
                     Ok(send_outcome) => {
                         let entry_link = fetcher::entry_link(entry).unwrap_or_default();
+                        let effects = SendSuccessCtx {
+                            bot,
+                            state,
+                            chat_id: &cfg.chat_id,
+                            feed_url: &cfg.feed_url,
+                            entry_id: &eid,
+                            chat_title: &chat_title,
+                            lang,
+                        };
                         // A1 policy: the rich main message may have been
                         // delivered even though the API call reported an error
                         // (timeout/reset/5xx). The entry is still marked sent
                         // below (no outbox, no duplicate resend); tell the
                         // owner to verify the channel manually.
-                        if send_outcome.uncertain {
-                            let mut msg = i18n::t(lang, "notif_send_uncertain")
-                                .replacen("{}", &push::escape_html(&chat_title), 1);
-                            if let Some(el) = &send_outcome.entry_link {
-                                push_line(&mut msg, lang, "label_entry", el);
-                            }
-                            notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                        }
-                        if send_outcome.text_partial {
-                            let mut msg = i18n::t(lang, "notif_text_partial")
-                                .replacen("{}", &push::escape_html(&chat_title), 1);
-                            if let Some(tg) = &send_outcome.delivered_tg_link {
-                                push_line(&mut msg, lang, "label_message", tg);
-                            }
-                            if let Some(el) = &send_outcome.entry_link {
-                                push_line(&mut msg, lang, "label_entry", el);
-                            }
-                            notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                        }
+                        effects.notify_uncertain(&send_outcome).await;
+                        effects.notify_text_partial(&send_outcome).await;
                         // A successful send resets the per-source failure
                         // streak; the next isolated failure starts from 1.
                         clear_send_failure(state, &cfg.chat_id, &cfg.feed_url).await;
@@ -1215,17 +1233,7 @@ async fn process_feed(
                         }
                         // Media send failed (text delivered but media not
                         // attached): notify immediately.
-                        if send_outcome.media_failed {
-                            let mut msg = i18n::t(lang, "notif_media_failed")
-                                .replacen("{}", &push::escape_html(&chat_title), 1);
-                            if let Some(tg) = &send_outcome.delivered_tg_link {
-                                push_line(&mut msg, lang, "label_message", tg);
-                            }
-                            if let Some(el) = &send_outcome.entry_link {
-                                push_line(&mut msg, lang, "label_entry", el);
-                            }
-                            notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                        }
+                        effects.notify_media_failed(&send_outcome).await;
                         // Oversized videos: notify immediately (unless muted
                         // by NOTIFY_OVERSIZED_MEDIA).
                         if notify_oversized {
@@ -1243,29 +1251,16 @@ async fn process_feed(
                                 .await;
                             }
                         }
-                        // Register the sent message: TG message id → RSS entry,
-                        // for /find reverse lookup. Registration failure does
-                        // not affect the main push flow.
-                        if let Some(mid) = send_outcome.delivered_message_id {
-                            db::record_sent_message(
-                                &state.db,
-                                &cfg.chat_id,
-                                mid,
-                                &cfg.feed_url,
-                                &eid,
-                                send_outcome.entry_link.as_deref(),
+                        // Register the sent message and mark the entry sent.
+                        // A persistence failure after Telegram delivery must
+                        // not abort (the next round's re-fetch would push the
+                        // entry again); the helper logs a warning instead.
+                        effects
+                            .record_and_mark_sent(
+                                &send_outcome,
+                                "mark_entry_sent failed after successful delivery (may re-push next cycle)",
                             )
-                            .await
-                            .ok();
-                        }
-                        // Message already delivered to TG: a persistence failure
-                        // must not abort (the original `?` would discard the
-                        // "delivered" fact, and the next round's re-fetch would
-                        // push it again, producing duplicate messages).
-                        // Best-effort + warn.
-                        if let Err(e) = db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await {
-                            warn!(feed = %cfg.feed_url, entry_id = %eid, error = %e, "mark_entry_sent failed after successful delivery (may re-push next cycle)");
-                        }
+                            .await;
                     }
                     Err(e) => {
                         // Group upgraded to a supergroup: migrate every
@@ -2188,8 +2183,12 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         match result {
             Ok(send_outcome) => {
                 info!(entry_id = %row.entry_id, feed = %row.feed_url, "outbox retry succeeded");
-                clear_send_failure(state, &row.chat_id, &row.feed_url).await;
-                if send_outcome.text_partial {
+                // Resolve the owner-facing context only when a notice is
+                // actually needed; a successful retry usually needs none.
+                let needs_notice = send_outcome.text_partial
+                    || send_outcome.media_failed
+                    || send_outcome.uncertain;
+                let (chat_title, lang) = if needs_notice {
                     let chat_title = db::get_chat(&state.db, &row.chat_id)
                         .await
                         .ok()
@@ -2200,58 +2199,38 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                         Ok(Some(owner)) => owner_lang(state, owner).await,
                         _ => Lang::En,
                     };
-                    let mut msg = i18n::t(lang, "notif_text_partial")
-                        .replacen("{}", &push::escape_html(&chat_title), 1);
-                    if let Some(tg) = &send_outcome.delivered_tg_link {
-                        push_line(&mut msg, lang, "label_message", tg);
-                    }
-                    if let Some(el) = &send_outcome.entry_link {
-                        push_line(&mut msg, lang, "label_entry", el);
-                    }
-                    notify_owner_html(bot, state, &row.chat_id, &msg).await;
-                }
+                    (chat_title, lang)
+                } else {
+                    (String::new(), Lang::En)
+                };
+                let effects = SendSuccessCtx {
+                    bot,
+                    state,
+                    chat_id: &row.chat_id,
+                    feed_url: &row.feed_url,
+                    entry_id: &row.entry_id,
+                    chat_title: &chat_title,
+                    lang,
+                };
+                clear_send_failure(state, &row.chat_id, &row.feed_url).await;
+                effects.notify_text_partial(&send_outcome).await;
+                // The retry path uses the standard send chain (allow_rich is
+                // false), so `uncertain` should not occur here; handling it
+                // anyway keeps this path aligned with the fetch path if the
+                // send chain changes.
+                effects.notify_uncertain(&send_outcome).await;
                 // The retry may deliver the text while its media is
                 // permanently lost (expired/rejected). Surface the same
                 // media_failed notice as the main path; otherwise the owner
                 // only sees the earlier "queued" message and never learns that
                 // the media was dropped.
-                if send_outcome.media_failed {
-                    let chat_title = db::get_chat(&state.db, &row.chat_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|c| c.title.or(c.username))
-                        .unwrap_or_else(|| row.chat_id.clone());
-                    let lang = match db::get_chat_owner(&state.db, &row.chat_id).await {
-                        Ok(Some(owner)) => owner_lang(state, owner).await,
-                        _ => Lang::En,
-                    };
-                    let mut msg = i18n::t(lang, "notif_media_failed")
-                        .replacen("{}", &push::escape_html(&chat_title), 1);
-                    if let Some(tg) = &send_outcome.delivered_tg_link {
-                        push_line(&mut msg, lang, "label_message", tg);
-                    }
-                    if let Some(el) = &send_outcome.entry_link {
-                        push_line(&mut msg, lang, "label_entry", el);
-                    }
-                    notify_owner_html(bot, state, &row.chat_id, &msg).await;
-                }
-                if let Some(mid) = send_outcome.delivered_message_id {
-                    db::record_sent_message(
-                        &state.db,
-                        &row.chat_id,
-                        mid,
-                        &row.feed_url,
-                        &row.entry_id,
-                        send_outcome.entry_link.as_deref(),
+                effects.notify_media_failed(&send_outcome).await;
+                effects
+                    .record_and_mark_sent(
+                        &send_outcome,
+                        "outbox: failed to mark entry sent (may re-push on re-subscribe)",
                     )
-                    .await
-                    .ok();
-                }
-                // Mark sent so a later re-fetch/re-subscribe won't double-post.
-                if let Err(e) = db::mark_entry_sent(&state.db, &row.chat_id, &row.feed_url, &row.entry_id).await {
-                    warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to mark entry sent (may re-push on re-subscribe)");
-                }
+                    .await;
                 if let Err(e) = db::outbox_delete(&state.db, row.id).await {
                     warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete entry");
                 }
