@@ -1160,6 +1160,175 @@ async fn prepare_entry_for_send(
     }))
 }
 
+enum EntrySendAction {
+    Continue,
+    DeferContinue,
+    DeferBreak,
+}
+
+struct SendAndHandleCtx<'a> {
+    state: &'a AppState,
+    bot: &'a Bot,
+    sub: &'a db::SubRow,
+    cfg: &'a db::EffectiveConfig,
+    lang: Lang,
+    owner_id: Option<i64>,
+    chat_id: i64,
+    chat_title: &'a str,
+    feed_title: &'a str,
+    entry: &'a feed_rs::model::Entry,
+    entry_id: &'a str,
+    opts: push::RenderOpts,
+    prepared: &'a crate::media::PreparedMedia,
+    meta: Option<&'a crate::entrymeta::EntryMeta>,
+    notify_warnings: &'a [String],
+    notify_oversized: bool,
+    oversized: &'a [crate::media::OversizedVideo],
+    dl_retry_note: &'a str,
+    transport: &'a crate::media::MediaTransport,
+}
+
+/// Send one prepared entry and apply success side effects or failure recovery.
+async fn send_and_handle(ctx: &SendAndHandleCtx<'_>) -> anyhow::Result<EntrySendAction> {
+    let state = ctx.state;
+    let bot = ctx.bot;
+    let sub = ctx.sub;
+    let cfg = ctx.cfg;
+    let lang = ctx.lang;
+    let owner_id = ctx.owner_id;
+    let chat_id = ctx.chat_id;
+    let chat_title = ctx.chat_title;
+    let feed_title = ctx.feed_title;
+    let entry = ctx.entry;
+    let eid = ctx.entry_id;
+    let opts = ctx.opts;
+    let prepared = ctx.prepared;
+    let meta = ctx.meta;
+    let notify_warnings = ctx.notify_warnings;
+    let notify_oversized = ctx.notify_oversized;
+    let oversized = ctx.oversized;
+    let dl_retry_note = ctx.dl_retry_note;
+    let transport = ctx.transport;
+
+    let author = fetcher::entry_author(entry);
+    // No whole-entry retry for sending: the segment/op-level resume inside
+    // the push functions already avoids replaying delivered parts; persistent
+    // failures go to the outbox.
+    let result: anyhow::Result<push::SendOutcome> = if prepared.items.is_empty() {
+        push::send_text_only(
+            bot,
+            chat_id,
+            entry,
+            feed_title,
+            author.as_deref(),
+            opts,
+            meta,
+        )
+        .await
+    } else {
+        push::send_entry_with_media(
+            bot,
+            &state.db,
+            chat_id,
+            push::PushCtx {
+                entry,
+                feed_title,
+                author: author.as_deref(),
+                opts,
+                caption_above_media: cfg.caption_above_media,
+                aspect_threshold: crate::config::LONG_IMAGE_ASPECT_RATIO,
+                media: &prepared.items,
+                meta,
+            },
+            transport,
+        )
+        .await
+    };
+
+    match result {
+        Ok(send_outcome) => {
+            let entry_link = fetcher::entry_link(entry).unwrap_or_default();
+            let effects = SendSuccessCtx {
+                bot,
+                state,
+                chat_id: &cfg.chat_id,
+                feed_url: &cfg.feed_url,
+                entry_id: eid,
+                chat_title,
+                lang,
+            };
+            // A1 policy: a rich-message ambiguity still marks the entry sent
+            // but asks the owner to verify the channel.
+            effects.notify_uncertain(&send_outcome).await;
+            effects.notify_text_partial(&send_outcome).await;
+            clear_send_failure(state, &cfg.chat_id, &cfg.feed_url).await;
+            if !notify_warnings.is_empty() {
+                notify_download_failed(
+                    bot,
+                    lang,
+                    owner_id,
+                    feed_title,
+                    notify_warnings,
+                    dl_retry_note,
+                    send_outcome.delivered_tg_link.as_deref(),
+                    &entry_link,
+                )
+                .await;
+            }
+            effects.notify_media_failed(&send_outcome).await;
+            if notify_oversized {
+                for ov in oversized {
+                    notify_oversized_video(
+                        bot,
+                        lang,
+                        owner_id,
+                        chat_title,
+                        &entry_link,
+                        send_outcome.delivered_tg_link.as_deref(),
+                        send_outcome.text_only,
+                        ov,
+                    )
+                    .await;
+                }
+            }
+            effects
+                .record_and_mark_sent(
+                    &send_outcome,
+                    "mark_entry_sent failed after successful delivery (may re-push next cycle)",
+                )
+                .await;
+            Ok(EntrySendAction::Continue)
+        }
+        Err(e) => {
+            let failure = SendFailureCtx {
+                state,
+                bot,
+                sub,
+                cfg,
+                lang,
+                owner_id,
+                chat_title,
+                feed_title,
+                entry,
+                entry_id: eid,
+                author: author.as_deref(),
+                notify_warnings,
+                oversized,
+                notify_oversized,
+                dl_retry_note,
+                media_items: &prepared.items,
+                meta,
+                error: &e,
+            };
+            match handle_send_failure(&failure).await? {
+                SendFailureAction::Continue => Ok(EntrySendAction::Continue),
+                SendFailureAction::DeferContinue => Ok(EntrySendAction::DeferContinue),
+                SendFailureAction::DeferBreak => Ok(EntrySendAction::DeferBreak),
+            }
+        }
+    }
+}
+
 /// Process a single source: fetch + push new entries in chronological order.
 /// Parallel across sources, serial within a source.
 /// All failure notifications are sent immediately, no longer batched until the
@@ -1559,151 +1728,36 @@ async fn process_feed(
                 } = prep;
                 let meta = fr.metas.get(&eid);
 
-                let author = fetcher::entry_author(entry);
-                // No whole-entry retry for sending (#11 fix: removed the
-                // SEND_ATTEMPTS=1 infinite loop): send_entry_msg (text
-                // segments) and send_entry_with_media (media ops) already have
-                // segment-level/op-level resume internally (only the failed
-                // current segment is resent, delivered segments are not).
-                // A whole-entry retry would resend already-delivered
-                // segments/ops under compound failures, producing duplicate
-                // messages. Persistent failures are caught by the outbox
-                // persistent retry queue (exponential backoff, abandon at 72h).
-                let result: anyhow::Result<push::SendOutcome> = if prepared.items.is_empty() {
-                    // The pure-text path uniformly goes through send_text_only
-                    // (H1 fix: it used to be a verbatim duplicate of the outbox
-                    // retry path; the poll-resend logic was fixed twice because
-                    // of this, v1.9.3/v1.9.6).
-                    push::send_text_only(
-                        bot,
-                        chat_id,
-                        entry,
-                        &feed_title,
-                        author.as_deref(),
-                        opts,
-                        meta,
-                    )
-                    .await
-                } else {
-                    push::send_entry_with_media(
-                        bot,
-                        &state.db,
-                        chat_id,
-                        push::PushCtx {
-                            entry,
-                            feed_title: &feed_title,
-                            author: author.as_deref(),
-                            opts,
-                            caption_above_media: cfg.caption_above_media,
-                            aspect_threshold: crate::config::LONG_IMAGE_ASPECT_RATIO,
-                            media: &prepared.items,
-                            meta,
-                        },
-                        &transport,
-                    )
-                    .await
-                };
-
-                match result {
-                    Ok(send_outcome) => {
-                        let entry_link = fetcher::entry_link(entry).unwrap_or_default();
-                        let effects = SendSuccessCtx {
-                            bot,
-                            state,
-                            chat_id: &cfg.chat_id,
-                            feed_url: &cfg.feed_url,
-                            entry_id: &eid,
-                            chat_title: &chat_title,
-                            lang,
-                        };
-                        // A1 policy: the rich main message may have been
-                        // delivered even though the API call reported an error
-                        // (timeout/reset/5xx). The entry is still marked sent
-                        // below (no outbox, no duplicate resend); tell the
-                        // owner to verify the channel manually.
-                        effects.notify_uncertain(&send_outcome).await;
-                        effects.notify_text_partial(&send_outcome).await;
-                        // A successful send resets the per-source failure
-                        // streak; the next isolated failure starts from 1.
-                        clear_send_failure(state, &cfg.chat_id, &cfg.feed_url).await;
-                        // Download failures: notify the owner immediately
-                        // (including the delivered-message link and the source
-                        // entry link).
-                        if !notify_warnings.is_empty() {
-                            notify_download_failed(
-                                bot,
-                                lang,
-                                owner_id,
-                                &feed_title,
-                                &notify_warnings,
-                                &dl_retry_note,
-                                send_outcome.delivered_tg_link.as_deref(),
-                                &entry_link,
-                            )
-                            .await;
-                        }
-                        // Media send failed (text delivered but media not
-                        // attached): notify immediately.
-                        effects.notify_media_failed(&send_outcome).await;
-                        // Oversized videos: notify immediately (unless muted
-                        // by NOTIFY_OVERSIZED_MEDIA).
-                        if notify_oversized {
-                            for ov in &oversized {
-                                notify_oversized_video(
-                                    bot,
-                                    lang,
-                                    owner_id,
-                                    &chat_title,
-                                    &entry_link,
-                                    send_outcome.delivered_tg_link.as_deref(),
-                                    send_outcome.text_only,
-                                    ov,
-                                )
-                                .await;
-                            }
-                        }
-                        // Register the sent message and mark the entry sent.
-                        // A persistence failure after Telegram delivery must
-                        // not abort (the next round's re-fetch would push the
-                        // entry again); the helper logs a warning instead.
-                        effects
-                            .record_and_mark_sent(
-                                &send_outcome,
-                                "mark_entry_sent failed after successful delivery (may re-push next cycle)",
-                            )
-                            .await;
+                let action = send_and_handle(&SendAndHandleCtx {
+                    state,
+                    bot,
+                    sub: &sub,
+                    cfg: &cfg,
+                    lang,
+                    owner_id,
+                    chat_id,
+                    chat_title: &chat_title,
+                    feed_title: &feed_title,
+                    entry,
+                    entry_id: &eid,
+                    opts,
+                    prepared: &prepared,
+                    meta,
+                    notify_warnings: &notify_warnings,
+                    notify_oversized,
+                    oversized: &oversized,
+                    dl_retry_note: &dl_retry_note,
+                    transport: &transport,
+                })
+                .await?;
+                match action {
+                    EntrySendAction::Continue => {}
+                    EntrySendAction::DeferContinue => {
+                        deferred = true;
                     }
-                    Err(e) => {
-                        let failure = SendFailureCtx {
-                            state,
-                            bot,
-                            sub: &sub,
-                            cfg: &cfg,
-                            lang,
-                            owner_id,
-                            chat_title: &chat_title,
-                            feed_title: &feed_title,
-                            entry,
-                            entry_id: &eid,
-                            author: author.as_deref(),
-                            notify_warnings: &notify_warnings,
-                            oversized: &oversized,
-                            notify_oversized,
-                            dl_retry_note: &dl_retry_note,
-                            media_items: &prepared.items,
-                            meta,
-                            error: &e,
-                        };
-                        match handle_send_failure(&failure).await? {
-                            SendFailureAction::Continue => {}
-                            SendFailureAction::DeferContinue => {
-                                deferred = true;
-                            }
-                            SendFailureAction::DeferBreak => {
-                                deferred = true;
-                                break;
-                            }
-                        }
+                    EntrySendAction::DeferBreak => {
+                        deferred = true;
+                        break;
                     }
                 }
                 // Send rate limiting is handled by the push module's ChatPacer,
