@@ -1329,29 +1329,20 @@ async fn send_and_handle(ctx: &SendAndHandleCtx<'_>) -> anyhow::Result<EntrySend
     }
 }
 
-/// Process a single source: fetch + push new entries in chronological order.
-/// Parallel across sources, serial within a source.
-/// All failure notifications are sent immediately, no longer batched until the
-/// end of the cycle.
-/// `stats` records this round's platform-level scheduling and success/failure
-/// outcomes, for run_fetch_cycle to perform hysteresis evaluation after the
-/// whole round ends.
-async fn process_feed(
-    state: &AppState,
-    bot: &Bot,
-    sub: db::SubRow,
-    cfg: db::EffectiveConfig,
-    stats: &PlatRoundStats,
-) -> anyhow::Result<FeedStatus> {
-    let transport = crate::media::MediaTransport::new(&state.config);
+struct FeedOwnerCtx {
+    owner_id: Option<i64>,
+    lang: Lang,
+    allow_trusted_private: bool,
+}
 
-    // Resolve the chat owner early: used for owner-routed notifications
-    // (auto-disable / media failures / oversized video) and language preference.
-    // On a DB query error, log a warn and treat it as "no owner" (do not
-    // silently swallow the error).
-    // v1.11.0: after cookies were globalized, platform-source fetching no
-    // longer depends on the owner; channels without an owner can also fetch
-    // normally.
+/// Resolve the owner, notification language, trusted-private permission and
+/// record the platform as scheduled this round. Returns None when the owner is
+/// no longer whitelisted (the feed is skipped).
+async fn resolve_feed_owner(
+    state: &AppState,
+    sub: &db::SubRow,
+    stats: &PlatRoundStats,
+) -> Option<FeedOwnerCtx> {
     let owner_id = match db::get_chat_owner(&state.db, &sub.chat_id).await {
         Ok(o) => o,
         Err(e) => {
@@ -1359,9 +1350,6 @@ async fn process_feed(
             None
         }
     };
-    // Removing a user from ALLOWED_USER_IDS must revoke the data channel too,
-    // not just interactive commands. Their subscriptions stop before any
-    // fetch/media work; the row is kept so re-adding the user resumes it.
     if let Some(owner) = owner_id {
         if !state.config.is_allowed(owner) {
             info!(
@@ -1370,47 +1358,44 @@ async fn process_feed(
                 feed = %sub.feed_url,
                 "subscription owner is no longer whitelisted; skipping feed"
             );
-            return Ok(FeedStatus::Ok);
+            return None;
         }
     }
-
-    // Owner's language preference (for notification copy i18n); no owner
-    // defaults to English.
     let lang = match owner_id {
         Some(o) => owner_lang(state, o).await,
         None => Lang::En,
     };
-
-    // Trusted private RSSHub allowlist is scoped to the subscription owner:
-    // background fetches use the same caller contract as interactive commands.
-    // No owner resolves to false (allowlist is an explicit private bypass).
     let allow_trusted_private = match owner_id {
         Some(o) => state.config.trusted_private_allowed(o),
         None => false,
     };
-
-    // Record the platforms scheduled this round (regardless of outcome), for
-    // whole-round recovery evaluation (global criterion).
     if let Some(p) = platform_of_url(&sub.feed_url) {
         *stats.seen.lock().await.entry(p).or_insert(0) += 1;
     }
+    Some(FeedOwnerCtx {
+        owner_id,
+        lang,
+        allow_trusted_private,
+    })
+}
 
-    // v1.10.3: debounce retry for transient errors on RSS sources (1 retry,
-    // 2s backoff). Applies only to non-platform sources — platform sources
-    // (weibo/x/telegram) have serial delays and risk-control strategies, and
-    // blind retries may trigger rate limiting. Typical scenario: transient
-    // proxy/network connection errors that recover on their own after a few
-    // seconds; a single retry can save the round.
+enum FeedFetchError {
+    /// The pre-fetch sent-entry snapshot query failed; defer the feed.
+    Deferred,
+    /// The actual fetch failed (already retried once for transient RSS errors).
+    Failed(anyhow::Error),
+}
+
+/// Fetch one feed with the RSS transient debounce and the Weibo enrichment
+/// snapshot. The snapshot is bounded and released as soon as fetching ends.
+async fn fetch_feed_with_retry(
+    state: &AppState,
+    sub: &db::SubRow,
+    cfg: &db::EffectiveConfig,
+    lang: Lang,
+    allow_trusted_private: bool,
+) -> Result<fetcher::FetchResult, FeedFetchError> {
     let is_rss_source = platform_of_url(&sub.feed_url).is_none();
-    // Batch sent-entry snapshot for platform enrichment only (Weibo detail /
-    // vote). X/TG/RSS ignore the parameter entirely, so only Weibo pays for
-    // this full-history query. If another platform starts consuming
-    // `known_sent`, extend this gate instead of loading it unconditionally.
-    // It is deliberately not used for the final push
-    // filter: it is taken before the fetch and can go stale while an
-    // overlapping outbox retry finishes the same entry. A failed read must
-    // also fail closed — treating it as "nothing sent" would re-push the whole
-    // source window.
     let known_sent_snapshot: Option<std::collections::HashSet<String>> =
         if platform_of_url(&sub.feed_url) == Some("weibo") {
             match db::sent_entry_ids_recent(
@@ -1429,7 +1414,7 @@ async fn process_feed(
                         error = %e,
                         "sent-entry batch query failed, deferring feed"
                     );
-                    return Ok(FeedStatus::Failed);
+                    return Err(FeedFetchError::Deferred);
                 }
             }
         } else {
@@ -1445,14 +1430,7 @@ async fn process_feed(
     };
     let result = fetcher::fetch_feed(state, &sub.feed_url, &fetch_opts).await;
     let result = match result {
-        // Render the anyhow error chain with `{:#}` (alternates Display):
-        // fetcher::fetch_feed wraps reqwest errors via `.with_context(...)`
-        // so plain `e.to_string()` returns only the outer "request failed:
-        // <url>" and the inner reqwest source string ("error sending request
-        // for url ...", "connection closed", etc.) is dropped — is_net_error
-        // would then never match on RSS connection-class failures. `{:#}`
-        // appends the full source chain separated by ": ", letting the
-        // substring check see the underlying reqwest error text.
+        // `{:#}` preserves the reqwest source chain for is_net_error.
         Err(ref e) if is_rss_source && sendpolicy::is_net_error(&format!("{:#}", e)) => {
             warn!(
                 feed = %sub.feed_url,
@@ -1464,11 +1442,37 @@ async fn process_feed(
         }
         other => other,
     };
-    // The enrichment snapshot is no longer needed once fetching (including the
-    // one-shot retry) is done; release it before the much slower send loop.
     drop(known_sent_snapshot);
+    result.map_err(FeedFetchError::Failed)
+}
 
+/// Process a single source: fetch + push new entries in chronological order.
+/// Parallel across sources, serial within a source.
+/// All failure notifications are sent immediately, no longer batched until the
+/// end of the cycle.
+/// `stats` records this round's platform-level scheduling and success/failure
+/// outcomes, for run_fetch_cycle to perform hysteresis evaluation after the
+/// whole round ends.
+async fn process_feed(
+    state: &AppState,
+    bot: &Bot,
+    sub: db::SubRow,
+    cfg: db::EffectiveConfig,
+    stats: &PlatRoundStats,
+) -> anyhow::Result<FeedStatus> {
+    let transport = crate::media::MediaTransport::new(&state.config);
+    let Some(owner) = resolve_feed_owner(state, &sub, stats).await else {
+        return Ok(FeedStatus::Ok);
+    };
+    let FeedOwnerCtx {
+        owner_id,
+        lang,
+        allow_trusted_private,
+    } = owner;
+
+    let result = fetch_feed_with_retry(state, &sub, &cfg, lang, allow_trusted_private).await;
     let mut feed_failed = false;
+
     match result {
         Ok(fr) => {
             // Reset error count on success (a 304 "source not updated" also
@@ -1782,7 +1786,8 @@ async fn process_feed(
                 .ok();
             }
         }
-        Err(e) => {
+        Err(FeedFetchError::Deferred) => return Ok(FeedStatus::Failed),
+        Err(FeedFetchError::Failed(e)) => {
             feed_failed = true;
             handle_fetch_failure(state, bot, &sub, lang, &e, stats).await?;
         }
