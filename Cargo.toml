@@ -1,6 +1,6 @@
 [package]
 name = "tgsrssr"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 rust-version = "1.96"
 description = "Telegram's RSS Rust — RSS subscription Telegram bot (Rust)"
