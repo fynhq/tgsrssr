@@ -909,6 +909,96 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
     Ok(MediaGateAction::Proceed { dl_retry_note })
 }
 
+/// Handle one feed fetch failure: platform round stats, cookie-expiry flag,
+/// error counter, auto-disable and the first-disable owner notification.
+async fn handle_fetch_failure(
+    state: &AppState,
+    bot: &Bot,
+    sub: &db::SubRow,
+    lang: Lang,
+    e: &anyhow::Error,
+    stats: &PlatRoundStats,
+) -> anyhow::Result<()> {
+    let err_msg = format!("{:#}", e);
+    warn!(feed = %sub.feed_url, error = %err_msg, "fetch failed");
+
+    // Record that this platform had a failure this round + save the last error
+    // message (for whole-round hysteresis evaluation).
+    if let Some(p) = platform_of_url(&sub.feed_url) {
+        stats.failed.lock().await.insert(p);
+        stats.last_err.lock().await.insert(p, err_msg.clone());
+    }
+
+    // Cookie-expired flag (for the /cookies panel status display): set
+    // immediately (global); this is NOT a push notification. The admin alert
+    // follows the platform-health hysteresis (two consecutive all-failed
+    // rounds), so one jitter round stays quiet. Detection is typed first
+    // (PlatformError::AuthExpired); the legacy "cookie" substring is kept as a
+    // fallback for "cookie not configured" messages that predate the typed
+    // error.
+    let auth_expired = e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::platforms::PlatformError>(),
+            Some(crate::platforms::PlatformError::AuthExpired { .. })
+        )
+    });
+    if auth_expired || err_msg.to_lowercase().contains("cookie") {
+        if let Some(p) = platform_of_url(&sub.feed_url) {
+            db::set_setting(&state.db, &db::setting_key::cookie_expired_notified(p), "1")
+                .await
+                .ok();
+        }
+    }
+
+    let count = db::increment_error_count(&state.db, sub.id, &err_msg).await?;
+
+    if count >= state.config.max_fetch_errors && sub.active == 1 {
+        // Auto-disable (marked as system-auto-disabled; the self-heal job
+        // auto-recovers it after the cooldown). The UPDATE carries an
+        // `active = 1` guard closing the manual-pause race: the round-start
+        // snapshot may be stale if the user paused the source mid-round, in
+        // which case the disable is skipped (rows_affected = 0).
+        if !db::auto_disable_subscription(&state.db, sub.id).await? {
+            info!(
+                feed = %sub.feed_url,
+                "skip auto-disable: subscription paused by user during this round"
+            );
+            return Ok(());
+        }
+        info!(feed = %sub.feed_url, errors = count, "subscription auto-disabled");
+        // Edge deduplication: no duplicate notification when the same source
+        // goes disable → self-heal → fail again. A successful fetch clears the
+        // flag so the next failure can notify again.
+        let notify_key = db::setting_key::auto_disable_notified(&sub.chat_id, &sub.feed_url);
+        let already_notified = db::get_setting(&state.db, &notify_key)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !already_notified {
+            db::set_setting(&state.db, &notify_key, "1").await.ok();
+            let name = sub
+                .feed_title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(|t| {
+                    format!(
+                        "<a href=\"{}\">{}</a>",
+                        crate::push::escape_attr(&sub.feed_url),
+                        crate::push::escape_html(t)
+                    )
+                })
+                .unwrap_or_else(|| crate::push::escape_html(&sub.feed_url));
+            let auto_disable_msg = i18n::fill(
+                i18n::t(lang, "notif_auto_disable"),
+                &[&name, &crate::push::escape_html(&sub.chat_id)],
+            );
+            notify_owner_html(bot, state, &sub.chat_id, &auto_disable_msg).await;
+        }
+    }
+    Ok(())
+}
+
 /// Process a single source: fetch + push new entries in chronological order.
 /// Parallel across sources, serial within a source.
 /// All failure notifications are sent immediately, no longer batched until the
@@ -1522,94 +1612,7 @@ async fn process_feed(
         }
         Err(e) => {
             feed_failed = true;
-            let err_msg = format!("{:#}", e);
-            warn!(feed = %sub.feed_url, error = %err_msg, "fetch failed");
-
-            // Record that this platform had a failure this round + save the
-            // last error message (for whole-round hysteresis evaluation).
-            if let Some(p) = platform_of_url(&sub.feed_url) {
-                stats.failed.lock().await.insert(p);
-                stats.last_err.lock().await.insert(p, err_msg.clone());
-            }
-
-            // Cookie-expired flag (for the /cookies panel status display):
-            // set immediately (global); this is NOT a push notification. The
-            // admin alert follows the platform-health hysteresis (two
-            // consecutive all-failed rounds), so one jitter round stays quiet.
-            // Detection is typed first (PlatformError::AuthExpired); the
-            // legacy "cookie" substring is kept as a fallback for "cookie not
-            // configured" messages that predate the typed error.
-            let auth_expired = e.chain().any(|cause| {
-                matches!(
-                    cause.downcast_ref::<crate::platforms::PlatformError>(),
-                    Some(crate::platforms::PlatformError::AuthExpired { .. })
-                )
-            });
-            if auth_expired || err_msg.to_lowercase().contains("cookie") {
-                if let Some(p) = platform_of_url(&sub.feed_url) {
-                    db::set_setting(&state.db, &db::setting_key::cookie_expired_notified(p), "1")
-                        .await
-                        .ok();
-                }
-            }
-
-            let count = db::increment_error_count(&state.db, sub.id, &err_msg).await?;
-
-            if count >= state.config.max_fetch_errors && sub.active == 1 {
-                // Auto-disable (marked as system-auto-disabled; the self-heal
-                // job auto-recovers it after the cooldown). The UPDATE carries
-                // an `active = 1` guard closing the manual-pause race: the
-                // round-start snapshot above may be stale if the user paused
-                // the source mid-round, in which case the disable is skipped
-                // (rows_affected = 0) — a manual pause must not be converted
-                // into an auto-disable that the self-heal job would undo.
-                if !db::auto_disable_subscription(&state.db, sub.id).await? {
-                    info!(
-                        feed = %sub.feed_url,
-                        "skip auto-disable: subscription paused by user during this round"
-                    );
-                    return Ok(FeedStatus::Failed);
-                }
-                info!(feed = %sub.feed_url, errors = count, "subscription auto-disabled");
-                // Edge deduplication (#9 fix): no duplicate notification when
-                // the same source goes disable → self-heal → fail again.
-                // Notify only on the first disable; a successful fetch clears
-                // the flag so the next failure can notify again.
-                let notify_key = db::setting_key::auto_disable_notified(&sub.chat_id, &sub.feed_url);
-                let already_notified = db::get_setting(&state.db, &notify_key)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if !already_notified {
-                    db::set_setting(&state.db, &notify_key, "1").await.ok();
-                    // Format: title = source-name hyperlink; body = check hint
-                    // + /set command (inline code).
-                    let name = sub
-                        .feed_title
-                        .as_deref()
-                        .filter(|t| !t.is_empty())
-                        .map(|t| format!(
-                            "<a href=\"{}\">{}</a>",
-                            crate::push::escape_attr(&sub.feed_url),
-                            crate::push::escape_html(t)
-                        ))
-                        .unwrap_or_else(|| crate::push::escape_html(&sub.feed_url));
-                    // i18n::fill: single-pass substitution, so a source name
-                    // containing literal `{}` cannot swallow the chat-id slot.
-                    let auto_disable_msg = i18n::fill(
-                        i18n::t(lang, "notif_auto_disable"),
-                        &[&name, &crate::push::escape_html(&sub.chat_id)],
-                    );
-                    notify_owner_html(
-                        bot,
-                        state,
-                        &sub.chat_id,
-                        &auto_disable_msg,
-                    )
-                    .await;
-                }
-            }
+            handle_fetch_failure(state, bot, &sub, lang, &e, stats).await?;
         }
     }
 
