@@ -9,7 +9,7 @@ use super::GuardTarget;
 
 /// All callback operations the bot understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CallbackOp {
+pub(crate) enum CallbackOp {
     Channel,
     ChannelList,
     Language,
