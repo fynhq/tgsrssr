@@ -8,6 +8,7 @@ use teloxide::types::{
     CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode,
 };
 
+use crate::callbacks::wire;
 use crate::db;
 use crate::i18n::{self, Lang};
 use crate::push::{no_preview, ContentMode, SourceDisplay};
@@ -47,7 +48,7 @@ pub(crate) fn paginate(len: usize, page: usize) -> (usize, usize, usize, usize) 
 pub(crate) fn close_row(lang: Lang) -> Vec<InlineKeyboardButton> {
     vec![InlineKeyboardButton::callback(
         i18n::t(lang, "close"),
-        "c|cancelop",
+        wire::cancelop(),
     )]
 }
 
@@ -61,7 +62,7 @@ pub(crate) fn back_close_row(
 ) -> Vec<InlineKeyboardButton> {
     vec![
         InlineKeyboardButton::callback(i18n::t(lang, back_key), back_cb),
-        InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop"),
+        InlineKeyboardButton::callback(i18n::t(lang, "close"), wire::cancelop()),
     ]
 }
 
@@ -86,7 +87,7 @@ pub(crate) fn nav_row(
     }
     nav.push(InlineKeyboardButton::callback(
         format!("{} / {}", page + 1, total_pages),
-        "c|page",
+        wire::page(),
     ));
     if page + 1 < total_pages {
         nav.push(InlineKeyboardButton::callback(
@@ -239,7 +240,7 @@ pub(crate) async fn render_cookies_panel(
             // read-only, no configuration flow.
             buttons.push(vec![InlineKeyboardButton::callback(
                 i18n::t(lang, "ck_no_config").replacen("{}", p.label, 1),
-                format!("c|ck|{}", p.id),
+                wire::cookies(p.id),
             )]);
             continue;
         }
@@ -263,7 +264,7 @@ pub(crate) async fn render_cookies_panel(
         };
         buttons.push(vec![InlineKeyboardButton::callback(
             format!("{}（{}）", p.label, status),
-            format!("c|ck|{}", p.id),
+            wire::cookies(p.id),
         )]);
     }
 
@@ -354,7 +355,7 @@ pub(crate) async fn render_channel_list(
                 crate::htmltext::truncate_text(&title, 32),
                 cnt_label
             ),
-            format!("c|ch|{}|0|{}", chat.chat_id, page),
+            wire::channel(&chat.chat_id, 0, page),
         ));
         if row.len() >= 2 {
             buttons.push(std::mem::take(&mut row));
@@ -363,13 +364,13 @@ pub(crate) async fn render_channel_list(
     if !row.is_empty() {
         buttons.push(row);
     }
-    if let Some(nav) = nav_row(page, total_pages, lang, |p| format!("c|chlist|{}", p)) {
+    if let Some(nav) = nav_row(page, total_pages, lang, wire::channel_list) {
         buttons.push(nav);
     }
     // Language picker entry (shows current language; opens the picker on tap)
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "lang_btn"),
-        "c|lang",
+        wire::op_prefix(wire::CallbackOp::Language),
     )]);
     buttons.push(close_row(lang));
 
@@ -393,10 +394,10 @@ pub(crate) async fn render_language_picker(
         let mark = if option == lang { "✓ " } else { "" };
         buttons.push(vec![InlineKeyboardButton::callback(
             format!("{mark}{label}"),
-            format!("c|lang|{}", option.db_value()),
+            wire::language(option.db_value()),
         )]);
     }
-    buttons.push(back_close_row(lang, "back", "c|chlist|0".to_string()));
+    buttons.push(back_close_row(lang, "back", wire::channel_list(0)));
     deliver(
         bot,
         &target,
@@ -468,12 +469,12 @@ pub(crate) async fn render_channel_page(
                 crate::htmltext::truncate_text(name, 36),
                 flag
             ),
-            format!("c|src|{}|{}|{}", sub.id, page, chlist_page),
+            wire::source(sub.id, page, chlist_page),
         )]);
     }
 
     if let Some(nav) = nav_row(page, total_pages, lang, |p| {
-        format!("c|ch|{}|{}|{}", chat_id, p, chlist_page)
+        wire::channel(chat_id, p, chlist_page)
     }) {
         buttons.push(nav);
     }
@@ -481,11 +482,11 @@ pub(crate) async fn render_channel_page(
     buttons.push(vec![
         InlineKeyboardButton::callback(
             i18n::t(lang, "chpage_settings"),
-            format!("c|cfg|{}|{}|{}", chat_id, page, chlist_page),
+            wire::config(chat_id, page, chlist_page),
         ),
         InlineKeyboardButton::callback(
             i18n::t(lang, "chpage_unsub"),
-            format!("c|unsubpg|{}|0|{}|{}", chat_id, page, chlist_page),
+            wire::unsub_page(chat_id, 0, page, chlist_page),
         ),
     ]);
     // When paused sources exist, offer a one-click enable-all (reset error counts and resume fetching immediately)
@@ -494,13 +495,13 @@ pub(crate) async fn render_channel_page(
     if paused_count > 0 {
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "chpage_resume_all").replacen("{}", &paused_count.to_string(), 1),
-            format!("c|resumeall|{}|{}|{}", chat_id, chlist_page, page),
+            wire::resume_all(chat_id, chlist_page, page),
         )]);
     }
     buttons.push(back_close_row(
         lang,
         "chpage_back",
-        format!("c|chlist|{}", chlist_page),
+        wire::channel_list(chlist_page),
     ));
 
     let kb = InlineKeyboardMarkup::new(buttons);
@@ -642,19 +643,19 @@ async fn render_feed_page_impl(
     if sub.active == 1 {
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "feed_pause"),
-            format!("c|srcpause|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(wire::CallbackOp::SourcePause, sub_id, ch_page, chlist_page),
         )]);
     } else {
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "feed_resume"),
-            format!("c|srcresume|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(wire::CallbackOp::SourceResume, sub_id, ch_page, chlist_page),
         )]);
     }
 
     // Rename / reset name
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "feed_rename"),
-        format!("c|srcrename|{}|{}|{}", sub_id, ch_page, chlist_page),
+        wire::source_action(wire::CallbackOp::SourceRename, sub_id, ch_page, chlist_page),
     )]);
 
     // Feed-level overrides: interval/mode/source open second-level pages;
@@ -668,11 +669,21 @@ async fn render_feed_page_impl(
                 &fmt_interval(lang, c.interval_minutes),
                 1,
             ),
-            format!("c|srcfip|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(
+                wire::CallbackOp::SourceIntervalPage,
+                sub_id,
+                ch_page,
+                chlist_page,
+            ),
         )]);
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "feed_mode").replacen("{}", fmt_content_mode(lang, &c.content_mode), 1),
-            format!("c|srcfmp|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(
+                wire::CallbackOp::SourceModePage,
+                sub_id,
+                ch_page,
+                chlist_page,
+            ),
         )]);
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "feed_source").replacen(
@@ -680,7 +691,12 @@ async fn render_feed_page_impl(
                 fmt_source_display(lang, &c.source_display),
                 1,
             ),
-            format!("c|srcfsp|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(
+                wire::CallbackOp::SourceSourcePage,
+                sub_id,
+                ch_page,
+                chlist_page,
+            ),
         )]);
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_caption").replacen(
@@ -692,7 +708,12 @@ async fn render_feed_page_impl(
                 },
                 1,
             ),
-            format!("c|srcfcp|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(
+                wire::CallbackOp::SourceCaption,
+                sub_id,
+                ch_page,
+                chlist_page,
+            ),
         )]);
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_lp").replacen(
@@ -704,7 +725,12 @@ async fn render_feed_page_impl(
                 },
                 1,
             ),
-            format!("c|srcflp|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(
+                wire::CallbackOp::SourceLinkPreview,
+                sub_id,
+                ch_page,
+                chlist_page,
+            ),
         )]);
         // Note: under Approach A, picking a value identical to the channel automatically clears
         // the override, so no global reset button is needed; each sub-page still keeps the
@@ -736,14 +762,14 @@ async fn render_feed_page_impl(
         };
         buttons.push(vec![InlineKeyboardButton::callback(
             label,
-            format!("c|srcfilter|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(wire::CallbackOp::SourceFilter, sub_id, ch_page, chlist_page),
         )]);
     }
 
     buttons.push(back_close_row(
         lang,
         "unsub_back",
-        format!("c|ch|{}|{}|{}", sub.chat_id, ch_page, chlist_page),
+        wire::channel(&sub.chat_id, ch_page, chlist_page),
     ));
 
     let kb = InlineKeyboardMarkup::new(buttons);
@@ -858,21 +884,32 @@ async fn render_feed_filter_impl(
     let buttons = vec![
         vec![InlineKeyboardButton::callback(
             toggle_label,
-            format!("c|srcftoggle|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(
+                wire::CallbackOp::SourceFilterToggle,
+                sub_id,
+                ch_page,
+                chlist_page,
+            ),
         )],
         vec![InlineKeyboardButton::callback(
             mode_btn_label,
-            format!("c|srcfmode|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(
+                wire::CallbackOp::SourceFilterMode,
+                sub_id,
+                ch_page,
+                chlist_page,
+            ),
         )],
         vec![InlineKeyboardButton::callback(
             i18n::t(lang, "filter_set_kw"),
-            format!("c|srcfkw|{}|{}|{}", sub_id, ch_page, chlist_page),
+            wire::source_action(
+                wire::CallbackOp::SourceFilterKeywords,
+                sub_id,
+                ch_page,
+                chlist_page,
+            ),
         )],
-        back_close_row(
-            lang,
-            "back",
-            format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page),
-        ),
+        back_close_row(lang, "back", wire::source(sub_id, ch_page, chlist_page)),
     ];
     let kb = InlineKeyboardMarkup::new(buttons);
     deliver(bot, &target, &text, Some(kb)).await?;

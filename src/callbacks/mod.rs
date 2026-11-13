@@ -23,6 +23,7 @@ pub mod unsub;
 
 mod data;
 mod dispatch;
+pub(crate) mod wire;
 
 /// Telegram callback-query toasts are limited to 200 characters; a long
 /// database error chain would otherwise make the toast itself fail and leave

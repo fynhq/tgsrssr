@@ -7,6 +7,7 @@ use teloxide::prelude::*;
 use teloxide::types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use tracing::{info, warn};
 
+use super::wire;
 use super::{fetch_sub_or_toast, toast_text};
 use crate::db;
 use crate::i18n::{self, Lang};
@@ -121,7 +122,7 @@ pub(super) async fn render_unsub_panel(
         // #15: the empty state provides a back-to-channel-page button; no dead page is left behind.
         let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
             i18n::t(lang, "unsub_back"),
-            format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
+            wire::channel(chat_id, ch_page, chlist_page),
         )]]);
         deliver(bot, &target, i18n::t(lang, "unsub_panel_empty"), Some(kb)).await?;
         return Ok(());
@@ -152,11 +153,11 @@ pub(super) async fn render_unsub_panel(
                 crate::htmltext::truncate_text(name, 30),
                 flag
             ),
-            format!("c|unsub|{}|{}|{}|{}", sub.id, page, ch_page, chlist_page),
+            wire::unsub(sub.id, page, ch_page, chlist_page),
         )]);
     }
     if let Some(nav) = nav_row(page, total_pages, lang, |p| {
-        format!("c|unsubpg|{}|{}|{}|{}", chat_id, p, ch_page, chlist_page)
+        wire::unsub_page(chat_id, p, ch_page, chlist_page)
     }) {
         buttons.push(nav);
     }
@@ -165,14 +166,11 @@ pub(super) async fn render_unsub_panel(
     // #36: pass through the current page number so the confirmation page's "Back" button can restore the original page.
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "unsub_all_btn"),
-        format!(
-            "c|unsuballask|{}|{}|{}|{}",
-            chat_id, page, ch_page, chlist_page
-        ),
+        wire::unsub_all_ask(chat_id, page, ch_page, chlist_page),
     )]);
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "unsub_back"),
-        format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
+        wire::channel(chat_id, ch_page, chlist_page),
     )]);
 
     let kb = InlineKeyboardMarkup::new(buttons);
@@ -204,7 +202,7 @@ pub(super) async fn render_unsub_all_confirm(
     if subs.is_empty() {
         let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
             i18n::t(lang, "unsub_back"),
-            format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
+            wire::channel(chat_id, ch_page, chlist_page),
         )]]);
         deliver(bot, &target, i18n::t(lang, "unsub_panel_empty"), Some(kb)).await?;
         return Ok(());
@@ -224,14 +222,11 @@ pub(super) async fn render_unsub_all_confirm(
     let kb = InlineKeyboardMarkup::new(vec![vec![
         InlineKeyboardButton::callback(
             i18n::t(lang, "unsuball_confirm_btn"),
-            format!(
-                "c|unsuball|{}|{}|{}|{}",
-                chat_id, ch_page, page, chlist_page
-            ),
+            wire::unsub_all(chat_id, ch_page, page, chlist_page),
         ),
         InlineKeyboardButton::callback(
             i18n::t(lang, "back"),
-            format!("c|unsubpg|{}|{}|{}|{}", chat_id, page, ch_page, chlist_page),
+            wire::unsub_page(chat_id, page, ch_page, chlist_page),
         ),
     ]]);
 
@@ -419,7 +414,7 @@ pub(super) async fn handle_unsub_all_callback(
     if let Some(m) = q.message.as_ref() {
         let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
             i18n::t(lang, "unsuball_view"),
-            format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
+            wire::channel(chat_id, ch_page, chlist_page),
         )]]);
         if let Err(e) = bot
             .edit_message_text(m.chat().id, m.id(), i18n::t(lang, "closed"))

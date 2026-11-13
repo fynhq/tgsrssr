@@ -49,6 +49,47 @@ pub(crate) enum CallbackOp {
 }
 
 impl CallbackOp {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Channel => "ch",
+            Self::ChannelList => "chlist",
+            Self::Language => "lang",
+            Self::Unsub => "unsub",
+            Self::UnsubPage => "unsubpg",
+            Self::UnsubAllAsk => "unsuballask",
+            Self::UnsubAll => "unsuball",
+            Self::ResumeAll => "resumeall",
+            Self::Config => "cfg",
+            Self::ConfigInterval => "cfgi",
+            Self::ConfigMode => "cfgm",
+            Self::ConfigSource => "cfgs",
+            Self::ConfigLinkPreview => "cfglp",
+            Self::ConfigCaption => "cfgcp",
+            Self::ConfigIntervalValue => "cfgiv",
+            Self::ConfigModeValue => "cfgmv",
+            Self::ConfigSourceValue => "cfgsv",
+            Self::Source => "src",
+            Self::SourcePause => "srcpause",
+            Self::SourceResume => "srcresume",
+            Self::SourceRename => "srcrename",
+            Self::SourceIntervalPage => "srcfip",
+            Self::SourceModePage => "srcfmp",
+            Self::SourceSourcePage => "srcfsp",
+            Self::SourceCaption => "srcfcp",
+            Self::SourceLinkPreview => "srcflp",
+            Self::SourceFilter => "srcfilter",
+            Self::SourceFilterToggle => "srcftoggle",
+            Self::SourceFilterMode => "srcfmode",
+            Self::SourceFilterKeywords => "srcfkw",
+            Self::SourceIntervalValue => "srcfi",
+            Self::SourceModeValue => "srcfm",
+            Self::SourceSourceValue => "srcfs",
+            Self::Cookies => "ck",
+            Self::CancelOp => "cancelop",
+            Self::Page => "page",
+        }
+    }
+
     pub(super) fn parse(raw: &str) -> Option<Self> {
         Some(match raw {
             "ch" => Self::Channel,

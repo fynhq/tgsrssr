@@ -5,6 +5,8 @@
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
+use super::wire;
+use super::wire::CallbackOp;
 use crate::db;
 use crate::i18n::{self, Lang};
 use crate::push::{ContentMode, SourceDisplay};
@@ -45,19 +47,18 @@ pub(super) async fn render_settings_page(
         &[&title_html, &iv_label, cm_label, sd_label, lp_label],
     );
 
-    let pages = format!("|{}|{}", ch_page, chlist_page);
     let buttons = vec![
         vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_interval"),
-            format!("c|cfgi|{}{}", chat_id, pages),
+            wire::config_page(CallbackOp::ConfigInterval, chat_id, ch_page, chlist_page),
         )],
         vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_mode"),
-            format!("c|cfgm|{}{}", chat_id, pages),
+            wire::config_page(CallbackOp::ConfigMode, chat_id, ch_page, chlist_page),
         )],
         vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_source"),
-            format!("c|cfgs|{}{}", chat_id, pages),
+            wire::config_page(CallbackOp::ConfigSource, chat_id, ch_page, chlist_page),
         )],
         vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_caption").replacen(
@@ -69,17 +70,13 @@ pub(super) async fn render_settings_page(
                 },
                 1,
             ),
-            format!("c|cfgcp|{}{}", chat_id, pages),
+            wire::config_page(CallbackOp::ConfigCaption, chat_id, ch_page, chlist_page),
         )],
         vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_lp").replacen("{}", lp_label, 1),
-            format!("c|cfglp|{}{}", chat_id, pages),
+            wire::config_page(CallbackOp::ConfigLinkPreview, chat_id, ch_page, chlist_page),
         )],
-        back_close_row(
-            lang,
-            "back",
-            format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
-        ),
+        back_close_row(lang, "back", wire::channel(chat_id, ch_page, chlist_page)),
     ];
 
     let kb = InlineKeyboardMarkup::new(buttons);
@@ -100,12 +97,13 @@ struct OptionPageSpec {
     /// When true (feed-level), ✓ is shown only if overridden AND value matches.
     /// When false (channel-level), ✓ is shown unconditionally on match.
     require_override_for_mark: bool,
-    /// Callback prefix (e.g. "c|cfgiv" or "c|srcfi").
-    cb_prefix: &'static str,
+    /// Value op (config/source interval/mode/source).
+    op: CallbackOp,
     /// ID segment (chat_id or sub_id as string).
     id_seg: String,
-    /// Suffix appended after value in callback (e.g. "|2" for ch_page, or "").
-    cb_suffix: String,
+    /// Page positions carried through the value selection.
+    ch_page: usize,
+    chlist_page: usize,
     /// Back button callback data.
     back_cb: String,
     /// Show the "follow channel" inherit button (feed-level only).
@@ -134,9 +132,12 @@ async fn render_option_page(
                 .map(|(label, value)| {
                     InlineKeyboardButton::callback(
                         format!("{}{}", mark(value), label),
-                        format!(
-                            "{}|{}|{}{}",
-                            spec.cb_prefix, spec.id_seg, value, spec.cb_suffix
+                        wire::value_callback(
+                            spec.op,
+                            &spec.id_seg,
+                            value,
+                            spec.ch_page,
+                            spec.chlist_page,
                         ),
                     )
                 })
@@ -146,9 +147,12 @@ async fn render_option_page(
     if spec.show_inherit {
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "follow_channel"),
-            format!(
-                "{}|{}|inherit{}",
-                spec.cb_prefix, spec.id_seg, spec.cb_suffix
+            wire::value_callback(
+                spec.op,
+                &spec.id_seg,
+                "inherit",
+                spec.ch_page,
+                spec.chlist_page,
             ),
         )]);
     }
@@ -190,10 +194,11 @@ pub(super) async fn render_settings_interval(
         current: cfg.interval_minutes.to_string(),
         overridden: false,
         require_override_for_mark: false,
-        cb_prefix: "c|cfgiv",
+        op: CallbackOp::ConfigIntervalValue,
         id_seg: chat_id.to_string(),
-        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
-        back_cb: format!("c|cfg|{}|{}|{}", chat_id, ch_page, chlist_page),
+        ch_page,
+        chlist_page,
+        back_cb: wire::config(chat_id, ch_page, chlist_page),
         show_inherit: false,
     };
     render_option_page(bot, &target, &spec, lang).await
@@ -227,10 +232,11 @@ pub(super) async fn render_settings_mode(
         current: content_mode_value(&cfg.content_mode).to_string(),
         overridden: false,
         require_override_for_mark: false,
-        cb_prefix: "c|cfgmv",
+        op: CallbackOp::ConfigModeValue,
         id_seg: chat_id.to_string(),
-        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
-        back_cb: format!("c|cfg|{}|{}|{}", chat_id, ch_page, chlist_page),
+        ch_page,
+        chlist_page,
+        back_cb: wire::config(chat_id, ch_page, chlist_page),
         show_inherit: false,
     };
     render_option_page(bot, &target, &spec, lang).await
@@ -261,10 +267,11 @@ pub(super) async fn render_settings_source(
         current: source_display_value(&cfg.source_display).to_string(),
         overridden: false,
         require_override_for_mark: false,
-        cb_prefix: "c|cfgsv",
+        op: CallbackOp::ConfigSourceValue,
         id_seg: chat_id.to_string(),
-        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
-        back_cb: format!("c|cfg|{}|{}|{}", chat_id, ch_page, chlist_page),
+        ch_page,
+        chlist_page,
+        back_cb: wire::config(chat_id, ch_page, chlist_page),
         show_inherit: false,
     };
     render_option_page(bot, &target, &spec, lang).await
@@ -369,10 +376,11 @@ pub(super) async fn render_feed_interval(
         current: cfg.interval_minutes.to_string(),
         overridden: cfg.iv_overridden,
         require_override_for_mark: true,
-        cb_prefix: "c|srcfi",
+        op: CallbackOp::SourceIntervalValue,
         id_seg: sub_id.to_string(),
-        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
-        back_cb: format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page),
+        ch_page,
+        chlist_page,
+        back_cb: wire::source(sub_id, ch_page, chlist_page),
         show_inherit: true,
     };
     render_option_page(bot, &target, &spec, lang).await
@@ -410,10 +418,11 @@ pub(super) async fn render_feed_mode(
         current: content_mode_value(&cfg.content_mode).to_string(),
         overridden: cfg.cm_overridden,
         require_override_for_mark: true,
-        cb_prefix: "c|srcfm",
+        op: CallbackOp::SourceModeValue,
         id_seg: sub_id.to_string(),
-        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
-        back_cb: format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page),
+        ch_page,
+        chlist_page,
+        back_cb: wire::source(sub_id, ch_page, chlist_page),
         show_inherit: true,
     };
     render_option_page(bot, &target, &spec, lang).await
@@ -448,10 +457,11 @@ pub(super) async fn render_feed_source(
         current: source_display_value(&cfg.source_display).to_string(),
         overridden: cfg.sd_overridden,
         require_override_for_mark: true,
-        cb_prefix: "c|srcfs",
+        op: CallbackOp::SourceSourceValue,
         id_seg: sub_id.to_string(),
-        cb_suffix: format!("|{}|{}", ch_page, chlist_page),
-        back_cb: format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page),
+        ch_page,
+        chlist_page,
+        back_cb: wire::source(sub_id, ch_page, chlist_page),
         show_inherit: true,
     };
     render_option_page(bot, &target, &spec, lang).await
