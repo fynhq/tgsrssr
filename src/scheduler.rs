@@ -1043,6 +1043,123 @@ async fn handle_fetch_failure(
     Ok(())
 }
 
+enum EntryPrepAction {
+    Continue,
+    DeferContinue,
+    DeferBreak,
+}
+
+struct EntryPrep {
+    prepared: crate::media::PreparedMedia,
+    dl_retry_note: String,
+    notify_warnings: Vec<String>,
+    notify_oversized: bool,
+    oversized: Vec<crate::media::OversizedVideo>,
+}
+
+/// Prepare one entry for sending: media download, MediaOnly/defer gate and the
+/// final pre-send dedup recheck. Returns an action when the entry should be
+/// skipped/deferred instead of sent.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_entry_for_send(
+    state: &AppState,
+    bot: &Bot,
+    cfg: &db::EffectiveConfig,
+    lang: Lang,
+    owner_id: Option<i64>,
+    chat_title: &str,
+    feed_title: &str,
+    entry: &feed_rs::model::Entry,
+    fr: &fetcher::FetchResult,
+    opts: push::RenderOpts,
+    transport: &crate::media::MediaTransport,
+    allow_trusted_private: bool,
+    entry_id: &str,
+    storage_notice_sent: &mut bool,
+) -> anyhow::Result<Result<EntryPrep, EntryPrepAction>> {
+    let eid = entry_id;
+    // Group-C sidecar: structured metadata by entry_id (empty for RSS).
+    let meta = fr.metas.get(eid);
+    let prepared = if opts.mode.skip_media() {
+        crate::media::PreparedMedia::empty()
+    } else {
+        crate::media::prepare_entry_media(
+            state,
+            entry,
+            transport,
+            meta,
+            lang,
+            &cfg.feed_url,
+            opts.mode.single_media(),
+            allow_trusted_private,
+        )
+        .await
+    };
+    // The media root/year-level directory could not be created. This is an
+    // environment failure, not "the entry has no media": defer the entry so
+    // nothing is marked sent as text, keep the negotiation headers stale, and
+    // notify the owner once for this feed.
+    if prepared.setup_failed {
+        if !*storage_notice_sent {
+            *storage_notice_sent = true;
+            let name = if feed_title.is_empty() {
+                &cfg.feed_url
+            } else {
+                feed_title
+            };
+            let msg =
+                i18n::t(lang, "notif_media_storage").replacen("{}", &push::escape_html(name), 1);
+            notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+        }
+        return Ok(Err(EntryPrepAction::DeferContinue));
+    }
+    let gate = media_gate(&MediaGateCtx {
+        state,
+        bot,
+        cfg,
+        lang,
+        owner_id,
+        chat_title,
+        feed_title,
+        entry,
+        entry_id: eid,
+        prepared: &prepared,
+        mode: opts.mode,
+    })
+    .await?;
+    let dl_retry_note = match gate {
+        MediaGateAction::Continue => return Ok(Err(EntryPrepAction::Continue)),
+        MediaGateAction::DeferContinue => return Ok(Err(EntryPrepAction::DeferContinue)),
+        MediaGateAction::Proceed { dl_retry_note } => dl_retry_note,
+    };
+    let notify_warnings = prepared.notify_warnings(state.config.notify_oversized_media);
+    let notify_oversized = state.config.notify_oversized_media;
+    let oversized = prepared.oversized_videos.clone();
+
+    // Final pre-send dedup recheck: media preparation can take minutes, long
+    // enough for an overlapping outbox retry to deliver the same entry.
+    match entry_already_handled(state, &cfg.chat_id, &cfg.feed_url, eid).await {
+        Ok(true) => return Ok(Err(EntryPrepAction::Continue)),
+        Ok(false) => {}
+        Err(e) => {
+            warn!(
+                feed = %cfg.feed_url,
+                entry_id = %eid,
+                error = %e,
+                "pre-send dedup recheck failed, deferring remaining entries"
+            );
+            return Ok(Err(EntryPrepAction::DeferBreak));
+        }
+    }
+    Ok(Ok(EntryPrep {
+        prepared,
+        dl_retry_note,
+        notify_warnings,
+        notify_oversized,
+        oversized,
+    }))
+}
+
 /// Process a single source: fetch + push new entries in chronological order.
 /// Parallel across sources, serial within a source.
 /// All failure notifications are sent immediately, no longer batched until the
@@ -1404,102 +1521,43 @@ async fn process_feed(
                         break;
                     }
                 }
-                // Group-C sidecar: look up structured metadata by entry_id
-                // (populated by platform sources, always empty for RSS sources).
-                let meta = fr.metas.get(&eid);
-
-                // Title+link / title-only modes: never fetch media, always take
-                // the pure-text path.
-                let prepared = if opts.mode.skip_media() {
-                    crate::media::PreparedMedia::empty()
-                } else {
-                    // Reuse the round-level owner language resolved once at the
-                    // top of process_feed; re-querying the settings row per
-                    // entry wasted a DB round-trip and fell back to En via a
-                    // different (owner_id.unwrap_or(0)) path.
-                    crate::media::prepare_entry_media(
-                        state,
-                        entry,
-                        &transport,
-                        meta,
-                        lang,
-                        &cfg.feed_url,
-                        opts.mode.single_media(),
-                        allow_trusted_private,
-                    )
-                    .await
-                };
-                // The media root/year-level directory could not be created.
-                // This is an environment failure, not "the entry has no
-                // media": defer the entry so nothing is marked sent as text,
-                // keep the negotiation headers stale, and notify the owner
-                // once for this feed. Text-only entries continue normally.
-                if prepared.setup_failed {
-                    deferred = true;
-                    if !storage_notice_sent {
-                        storage_notice_sent = true;
-                        let name = if feed_title.is_empty() {
-                            &cfg.feed_url
-                        } else {
-                            &feed_title
-                        };
-                        let msg = i18n::t(lang, "notif_media_storage").replacen(
-                            "{}",
-                            &push::escape_html(name),
-                            1,
-                        );
-                        notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                    }
-                    continue;
-                }
-                let gate = media_gate(&MediaGateCtx {
+                let prep = match prepare_entry_for_send(
                     state,
                     bot,
-                    cfg: &cfg,
+                    &cfg,
                     lang,
                     owner_id,
-                    chat_title: &chat_title,
-                    feed_title: &feed_title,
+                    &chat_title,
+                    &feed_title,
                     entry,
-                    entry_id: &eid,
-                    prepared: &prepared,
-                    mode: opts.mode,
-                })
-                .await?;
-                let dl_retry_note = match gate {
-                    MediaGateAction::Continue => continue,
-                    MediaGateAction::DeferContinue => {
+                    &fr,
+                    opts,
+                    &transport,
+                    allow_trusted_private,
+                    &eid,
+                    &mut storage_notice_sent,
+                )
+                .await?
+                {
+                    Ok(p) => p,
+                    Err(EntryPrepAction::Continue) => continue,
+                    Err(EntryPrepAction::DeferContinue) => {
                         deferred = true;
                         continue;
                     }
-                    MediaGateAction::Proceed { dl_retry_note } => dl_retry_note,
-                };
-                let notify_warnings = prepared.notify_warnings(state.config.notify_oversized_media);
-                let notify_oversized = state.config.notify_oversized_media;
-                let oversized = prepared.oversized_videos;
-
-                // Second recheck directly before the send: media preparation
-                // can take minutes (downloads + ffprobe), long enough for an
-                // overlapping outbox retry to deliver this same entry. The
-                // batch sets are already stale by now; this is the last cheap
-                // guard before the Telegram call.
-                match entry_already_handled(state, &cfg.chat_id, &cfg.feed_url, &eid).await {
-                    Ok(true) => {
-                        debug!(feed = %cfg.feed_url, entry_id = %eid, "entry handled during preparation, skipping send");
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        warn!(
-                            feed = %cfg.feed_url,
-                            entry_id = %eid,
-                            error = %e,
-                            "pre-send dedup recheck failed, deferring remaining entries"
-                        );
+                    Err(EntryPrepAction::DeferBreak) => {
                         deferred = true;
                         break;
                     }
-                }
+                };
+                let EntryPrep {
+                    prepared,
+                    dl_retry_note,
+                    notify_warnings,
+                    notify_oversized,
+                    oversized,
+                } = prep;
+                let meta = fr.metas.get(&eid);
 
                 let author = fetcher::entry_author(entry);
                 // No whole-entry retry for sending (#11 fix: removed the
