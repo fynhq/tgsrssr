@@ -754,6 +754,161 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
     Ok(SendFailureAction::Continue)
 }
 
+enum MediaGateAction {
+    /// Entry handled (skipped/marked sent); continue with the next entry.
+    Continue,
+    /// Defer the current entry (keep conditional headers stale).
+    DeferContinue,
+    /// Proceed to send, carrying the degrade-after-retries note.
+    Proceed { dl_retry_note: String },
+}
+
+struct MediaGateCtx<'a> {
+    state: &'a AppState,
+    bot: &'a Bot,
+    cfg: &'a db::EffectiveConfig,
+    lang: Lang,
+    owner_id: Option<i64>,
+    chat_title: &'a str,
+    feed_title: &'a str,
+    entry: &'a feed_rs::model::Entry,
+    entry_id: &'a str,
+    prepared: &'a crate::media::PreparedMedia,
+    mode: ContentMode,
+}
+
+/// Apply the MediaOnly skip rules and the cross-round download retry ledger.
+/// Returns whether the entry should be skipped, deferred or sent.
+async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
+    let state = ctx.state;
+    let bot = ctx.bot;
+    let cfg = ctx.cfg;
+    let lang = ctx.lang;
+    let owner_id = ctx.owner_id;
+    let chat_title = ctx.chat_title;
+    let feed_title = ctx.feed_title;
+    let entry = ctx.entry;
+    let eid = ctx.entry_id;
+    let prepared = ctx.prepared;
+    // Owner-facing warning texts. Per-file oversized skips are muted when
+    // NOTIFY_OVERSIZED_MEDIA=false; the raw warning list still drives MediaOnly
+    // retry / mark-sent control flow, so the gate never changes delivery.
+    let notify_warnings = prepared.notify_warnings(state.config.notify_oversized_media);
+    let has_download_warnings = !prepared.warnings.is_empty();
+    let notify_oversized = state.config.notify_oversized_media;
+    let oversized = &prepared.oversized_videos;
+
+    // Media-only mode: silently skip when there is no media. Mark as sent only
+    // when the entry itself has no media at all (no download warnings);
+    // otherwise leave it for the next round's retry. Retry cap is 10: once
+    // exceeded, mark as sent and notify the owner.
+    if ctx.mode == ContentMode::MediaOnly && prepared.items.is_empty() {
+        let entry_link = fetcher::entry_link(entry).unwrap_or_default();
+        if notify_oversized {
+            for ov in oversized {
+                notify_oversized_video(bot, lang, owner_id, chat_title, &entry_link, None, false, ov).await;
+            }
+        }
+        if has_download_warnings {
+            let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, eid);
+            // On a DB read error, do NOT treat the counter as 0: that would
+            // reset the failure streak and defeat the cap. Defer the round.
+            let stored = match db::get_setting(&state.db, &retry_key).await {
+                Ok(v) => v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+                Err(e) => {
+                    warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter read failed, deferring to next round");
+                    return Ok(MediaGateAction::DeferContinue);
+                }
+            };
+            let step = policy::media_retry_step(true, true, Ok(stored), !notify_warnings.is_empty());
+            match step {
+                policy::MediaRetryStep::Abandon { fail_count } => {
+                    warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "MediaOnly download retries exhausted, abandoning");
+                    let msg = push_fail_msg(
+                        lang,
+                        i18n::t(lang, "notif_abandoned"),
+                        feed_title,
+                        &i18n::t(lang, "notif_media_dl_fail").replacen("{}", &fail_count.to_string(), 1),
+                        "label_entry",
+                        &entry_link,
+                    );
+                    notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+                    // Clear the counter before marking sent: a failed mark
+                    // (`?`) must not leave the key to re-trigger this branch.
+                    db::delete_setting(&state.db, &retry_key).await.ok();
+                    db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, eid).await?;
+                }
+                policy::MediaRetryStep::Retry { fail_count, notify } => {
+                    if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
+                        warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
+                        return Ok(MediaGateAction::DeferContinue);
+                    }
+                    if notify {
+                        notify_download_failed(
+                            bot,
+                            lang,
+                            owner_id,
+                            feed_title,
+                            &notify_warnings,
+                            &i18n::t(lang, "notif_dl_note")
+                                .replacen("{}", &fail_count.to_string(), 1)
+                                .replacen("{}", &policy::MEDIA_DL_MAX_RETRIES.to_string(), 1),
+                            None,
+                            &entry_link,
+                        )
+                        .await;
+                    }
+                    return Ok(MediaGateAction::DeferContinue);
+                }
+                _ => {}
+            }
+        }
+        if !has_download_warnings {
+            db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, eid).await?;
+        }
+        return Ok(MediaGateAction::Continue);
+    }
+
+    let mut dl_retry_note = String::new();
+    // Other modes: a download error is usually transient; defer and re-download
+    // instead of immediately losing media. Deterministic warnings alone do not
+    // defer (`download_failed` is only set on a real error).
+    if ctx.mode != ContentMode::MediaOnly && prepared.download_failed {
+        let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, eid);
+        let stored = match db::get_setting(&state.db, &retry_key).await {
+            Ok(v) => v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+            Err(e) => {
+                warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter read failed, deferring to next round");
+                return Ok(MediaGateAction::DeferContinue);
+            }
+        };
+        match policy::media_retry_step(false, true, Ok(stored), false) {
+            policy::MediaRetryStep::Retry { fail_count, .. } => {
+                if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
+                    warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
+                    return Ok(MediaGateAction::DeferContinue);
+                }
+                info!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "media download failed, deferring entry to next fetch round");
+                return Ok(MediaGateAction::DeferContinue);
+            }
+            policy::MediaRetryStep::Degrade { fail_count } => {
+                warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "media download retries exhausted, degrading entry");
+                db::delete_setting(&state.db, &retry_key).await.ok();
+                dl_retry_note = i18n::t(lang, "notif_dl_retried")
+                    .replacen("{}", &fail_count.to_string(), 1);
+            }
+            _ => {}
+        }
+    }
+
+    // Entry is sent this round: clear any stale retry counter.
+    if ctx.mode == ContentMode::MediaOnly || !prepared.download_failed {
+        let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, eid);
+        db::delete_setting(&state.db, &retry_key).await.ok();
+    }
+    Ok(MediaGateAction::Proceed { dl_retry_note })
+}
+
 /// Process a single source: fetch + push new entries in chronological order.
 /// Parallel across sources, serial within a source.
 /// All failure notifications are sent immediately, no longer batched until the
@@ -1156,199 +1311,31 @@ async fn process_feed(
                     }
                     continue;
                 }
-                // Owner-facing warning texts. Per-file oversized skips are
-                // muted when NOTIFY_OVERSIZED_MEDIA=false; the raw warning
-                // list still drives MediaOnly retry / mark-sent control flow
-                // below, so the gate never changes delivery behavior.
+                let gate = media_gate(&MediaGateCtx {
+                    state,
+                    bot,
+                    cfg: &cfg,
+                    lang,
+                    owner_id,
+                    chat_title: &chat_title,
+                    feed_title: &feed_title,
+                    entry,
+                    entry_id: &eid,
+                    prepared: &prepared,
+                    mode: opts.mode,
+                })
+                .await?;
+                let dl_retry_note = match gate {
+                    MediaGateAction::Continue => continue,
+                    MediaGateAction::DeferContinue => {
+                        deferred = true;
+                        continue;
+                    }
+                    MediaGateAction::Proceed { dl_retry_note } => dl_retry_note,
+                };
                 let notify_warnings = prepared.notify_warnings(state.config.notify_oversized_media);
-                let has_download_warnings = !prepared.warnings.is_empty();
                 let notify_oversized = state.config.notify_oversized_media;
-
-                // Oversized videos: stash for now, record after a successful
-                // send (the TG message link is needed).
                 let oversized = prepared.oversized_videos;
-
-                // Media-only mode: silently skip when there is no media.
-                // Mark as sent only when the entry itself has no media at all
-                // (no download warnings), avoiding repeated re-checks later;
-                // if there was media but all downloads failed (warnings
-                // non-empty), do not mark it — leave it for the next round's
-                // retry, preventing the entry from being silently lost.
-                // Retry cap is 10: once exceeded, mark as sent and notify the
-                // owner to prevent an infinite loop.
-                if opts.mode == ContentMode::MediaOnly && prepared.items.is_empty() {
-                    // Oversized videos: notify the owner immediately (media-only
-                    // mode, entry not pushed).
-                    let entry_link = fetcher::entry_link(entry).unwrap_or_default();
-                    if notify_oversized {
-                        for ov in &oversized {
-                            notify_oversized_video(bot, lang, owner_id, &chat_title, &entry_link, None, false, ov).await;
-                        }
-                    }
-                    // Download failures: notify immediately.
-                    if has_download_warnings {
-                        let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, &eid);
-                        // Read the current counter, distinguishing a genuine
-                        // DB error from a missing/invalid value. On a DB error we
-                        // must NOT treat it as 0: that would reset the failure
-                        // streak every time the DB hiccups, so the 10-retry cap
-                        // is never reached and the entry retries forever. Skip
-                        // the counter step this round and let the next round
-                        // re-read (the entry is not marked sent, so it is safe).
-                        let stored = match db::get_setting(&state.db, &retry_key).await {
-                            Ok(v) => v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
-                            Err(e) => {
-                                warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter read failed, deferring to next round");
-                                // Keep the previous conditional-request headers:
-                                // saving this round's ETag would freeze the
-                                // retry behind a 304 on the next round.
-                                deferred = true;
-                                continue;
-                            }
-                        };
-                        let step = policy::media_retry_step(
-                            true,
-                            true,
-                            Ok(stored),
-                            !notify_warnings.is_empty(),
-                        );
-                        match step {
-                            policy::MediaRetryStep::Abandon { fail_count } => {
-                                // Cap reached: abandon this entry and notify
-                                // the owner.
-                                warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "MediaOnly download retries exhausted, abandoning");
-                                let msg = push_fail_msg(
-                                    lang,
-                                    i18n::t(lang, "notif_abandoned"),
-                                    &feed_title,
-                                    &i18n::t(lang, "notif_media_dl_fail").replacen("{}", &fail_count.to_string(), 1),
-                                    "label_entry",
-                                    &entry_link,
-                                );
-                                notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                                // Delete the counter key BEFORE marking sent:
-                                // if the mark fails (and `?` returns), the
-                                // counter is already cleared, so the next round
-                                // re-counts from 0 instead of re-triggering the
-                                // abandon branch every round and spamming the
-                                // owner with "abandoned".
-                                db::delete_setting(&state.db, &retry_key).await.ok();
-                                db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
-                            }
-                            policy::MediaRetryStep::Retry { fail_count, notify } => {
-                                // A failed counter write must not be swallowed:
-                                // the next round would re-read the old value and
-                                // notify forever while the retry cap is never
-                                // reached.
-                                if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
-                                    warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
-                                    deferred = true;
-                                    continue;
-                                }
-                                // The entry is still unresolved: keep the old
-                                // conditional-request headers so the next round
-                                // re-fetches the body and retries the media
-                                // instead of returning 304.
-                                deferred = true;
-                                if notify {
-                                    notify_download_failed(
-                                        bot,
-                                        lang,
-                                        owner_id,
-                                        &feed_title,
-                                        &notify_warnings,
-                                        &i18n::t(lang, "notif_dl_note")
-                                            .replacen("{}", &fail_count.to_string(), 1)
-                                            .replacen("{}", &policy::MEDIA_DL_MAX_RETRIES.to_string(), 1),
-                                        None,
-                                        &entry_link,
-                                    )
-                                    .await;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !has_download_warnings {
-                        db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
-                    }
-                    continue;
-                }
-
-                // Owner notification note for the degrade-after-retries case
-                // below; empty for a first-time (non-deferred) failure.
-                let mut dl_retry_note = String::new();
-
-                // Other modes: a download error is usually a transient network
-                // fault, and the per-download retries only span a few seconds —
-                // far shorter than the multi-minute outage windows actually
-                // observed. Instead of degrading to text immediately (permanent
-                // media loss), defer the entry to the next fetch round and
-                // re-download; marking `deferred` keeps the negotiation headers
-                // stale so the next round re-fetches the full body and the
-                // entry reappears (sent_entries dedup prevents double-push).
-                // Deterministic warnings alone (oversized skip / empty response)
-                // do not defer: `download_failed` is only set on a real
-                // download error. MediaOnly keeps its own counter branch above;
-                // a MediaOnly partial success (items non-empty) preserves the
-                // historical send-what-we-have behavior.
-                if opts.mode != ContentMode::MediaOnly && prepared.download_failed {
-                    // Cap on failed fetch rounds, including the final degrading
-                    // round; rounds in between defer the entry. With the 30 min
-                    // default feed interval, 3 rounds span roughly one hour of
-                    // transient outages. Kept low on purpose: every deferred
-                    // round also delays the entry's text, and an entry that
-                    // rolls out of the source's sliding window mid-retry is
-                    // lost the same way MediaOnly deferrals are.
-                    let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, &eid);
-                    // Same DB-error discipline as the MediaOnly branch: a read
-                    // error must not reset the streak (cap would never fire),
-                    // and a write error must not be swallowed (the counter
-                    // would never advance).
-                    let stored = match db::get_setting(&state.db, &retry_key).await {
-                        Ok(v) => v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
-                        Err(e) => {
-                            warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter read failed, deferring to next round");
-                            deferred = true;
-                            continue;
-                        }
-                    };
-                    let step = policy::media_retry_step(false, true, Ok(stored), false);
-                    match step {
-                        policy::MediaRetryStep::Retry { fail_count, .. } => {
-                            if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
-                                warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
-                                deferred = true;
-                                continue;
-                            }
-                            info!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "media download failed, deferring entry to next fetch round");
-                            deferred = true;
-                            continue;
-                        }
-                        policy::MediaRetryStep::Degrade { fail_count } => {
-                            // Cap reached: fall through to the normal send path —
-                            // the entry goes out with whatever media survived
-                            // (cover fallback or none) and the owner notification
-                            // below carries the retry note. Delete the counter
-                            // first so a later `?` abort cannot leave it behind.
-                            warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "media download retries exhausted, degrading entry");
-                            db::delete_setting(&state.db, &retry_key).await.ok();
-                            dl_retry_note = i18n::t(lang, "notif_dl_retried")
-                                .replacen("{}", &fail_count.to_string(), 1);
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Reaching here means the entry is sent this round (a MediaOnly
-                // entry with items, or a normal-mode entry whose media either
-                // succeeded or exhausted its defer budget): clear the retry
-                // counter key, preventing keys written by earlier failed rounds
-                // from lingering in the settings table forever.
-                if opts.mode == ContentMode::MediaOnly || !prepared.download_failed {
-                    let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, &eid);
-                    db::delete_setting(&state.db, &retry_key).await.ok();
-                }
 
                 // Second recheck directly before the send: media preparation
                 // can take minutes (downloads + ffprobe), long enough for an
