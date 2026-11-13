@@ -5,9 +5,23 @@
 //! rate-limiting / retry-strategy concern lives apart from message rendering
 //! and media orchestration. Pure policy — no rendering, no DB.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+
+/// Error-chain URLs are diagnostic data, not classification signals. A path
+/// such as `/timeout` or `/HTTP-400` must not change how a failure is retried.
+static RE_URL: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"https?://[^\s<>()]+").unwrap());
+
+fn mask_urls(err_str: &str) -> Cow<'_, str> {
+    if RE_URL.is_match(err_str) {
+        Cow::Owned(RE_URL.replace_all(err_str, "<url>").into_owned())
+    } else {
+        Cow::Borrowed(err_str)
+    }
+}
 
 /// Retry seconds extracted from a Telegram flood control error.
 /// Case-insensitive: teloxide/Telegram Display text has been observed with
@@ -25,8 +39,9 @@ static RE_RETRY_AFTER: LazyLock<regex::Regex> =
 /// minute-level outbox instead of waiting once. Returns None for non-flood
 /// errors. Shared by both the text and media send paths.
 pub fn flood_retry_secs(err_str: &str) -> Option<u64> {
+    let err_str = mask_urls(err_str);
     RE_RETRY_AFTER
-        .captures(err_str)
+        .captures(&err_str)
         .map(|caps| caps[1].parse().unwrap_or(5).min(300))
 }
 
@@ -48,6 +63,7 @@ pub fn is_net_error(err_str: &str) -> bool {
     // instead of counting it on the first round; a *sustained* DNS outage
     // still escalates (the retry fails too and the error is counted), which is
     // correct — repeated unreachability should eventually disable the source.
+    let err_str = mask_urls(err_str);
     (err_str.contains("error sending request")
         || err_str.contains("connection")
         || err_str.contains("dns resolve failed"))
@@ -75,7 +91,7 @@ pub fn error_chain_string(err: &(dyn std::error::Error + 'static)) -> String {
 /// the caller disables the chat immediately and keeps its data for a later
 /// re-add.
 pub fn is_permanent_chat_error(err_str: &str) -> bool {
-    let lower = err_str.to_lowercase();
+    let lower = mask_urls(err_str).to_lowercase();
     lower.contains("chat not found")
         || lower.contains("bot was kicked")
         || lower.contains("bot is not a member")
@@ -90,6 +106,7 @@ pub fn is_permanent_chat_error(err_str: &str) -> bool {
 /// failed after the request bytes were written (timeout, reset, closed,
 /// interrupted response, 5xx), so those must not be retried inline.
 pub fn is_send_retryable_error(err_str: &str) -> bool {
+    let err_str = mask_urls(err_str);
     err_str.contains("dns resolve failed")
         || err_str.contains("tcp connect error")
         || err_str.contains("client error (Connect)")
@@ -102,6 +119,7 @@ pub fn is_send_retryable_error(err_str: &str) -> bool {
 /// intentionally does not match this list, so it falls through to the
 /// ambiguous checks below.
 fn is_explicitly_undelivered(err_str: &str) -> bool {
+    let err_str = mask_urls(err_str);
     err_str.contains("Too Many Requests")
         || err_str.contains("Retry after")
         || err_str.contains("HTTP 400")
@@ -142,6 +160,7 @@ pub fn is_ambiguous_send_error(err_str: &str) -> bool {
     if is_explicitly_undelivered(err_str) {
         return false;
     }
+    let err_str = mask_urls(err_str);
     err_str.contains("timed out")
         || err_str.contains("timeout")
         || err_str.contains("connection reset")
@@ -186,7 +205,7 @@ pub fn classify_send_error(err_str: &str) -> SendFailureClass {
     if flood_retry_secs(err_str).is_some() {
         return SendFailureClass::Flood;
     }
-    let lower = err_str.to_lowercase();
+    let lower = mask_urls(err_str).to_lowercase();
     if lower.contains("file_id") || lower.contains("file identifier") {
         return SendFailureClass::FileId;
     }
@@ -377,12 +396,28 @@ impl ChatPacer {
     // per-chat Telegram limit cited above allows; a tighter interval would
     // only converge through passive 429 backoff under sustained load.
     const MIN_INTERVAL: Duration = Duration::from_millis(3000);
+    /// Defensive bound: chat ids come from the subscription table (finite),
+    /// but a future regression must not grow this map without limit.
+    const MAX_TRACKED_CHATS: usize = 4096;
+    /// Idle entries older than this are pruned when the map is full.
+    const STALE_AFTER: Duration = Duration::from_secs(600);
 
     async fn wait(&self, chat_id: i64) {
         loop {
             let delay = {
                 let mut m = self.last.lock().await;
                 let now = Instant::now();
+                if m.len() >= Self::MAX_TRACKED_CHATS && !m.contains_key(&chat_id) {
+                    m.retain(|_, t| now.duration_since(*t) < Self::STALE_AFTER);
+                    if m.len() >= Self::MAX_TRACKED_CHATS {
+                        // All tracked chats were active recently: evict the
+                        // least-recently-paced one. It may get one unpaced
+                        // message, which is safer than unbounded growth.
+                        if let Some(oldest) = m.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
+                            m.remove(&oldest);
+                        }
+                    }
+                }
                 match m.get(&chat_id).copied() {
                     Some(t) if t + Self::MIN_INTERVAL > now => {
                         Some(t + Self::MIN_INTERVAL - now)
@@ -419,7 +454,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        classify_send_error, is_ambiguous_send_error, is_send_retryable_error, SendFailureClass,
+        classify_send_error, flood_retry_secs, is_ambiguous_send_error,
+        is_explicitly_undelivered, is_net_error, is_send_retryable_error, SendFailureClass,
         SendRetryAction, SendRetryPolicy, SendRetryState,
     };
 
@@ -653,5 +689,28 @@ mod tests {
         ] {
             assert!(!is_ambiguous_send_error(err), "{err}");
         }
+    }
+
+    #[test]
+    fn url_contents_do_not_change_classification() {
+        // A URL path containing "timeout" must not suppress the connection
+        // retry, and URL text containing "connection"/"HTTP 400" must not
+        // invent a failure class.
+        assert!(is_net_error(
+            "error sending request for url (https://example.com/timeout)"
+        ));
+        assert!(!is_net_error(
+            "request failed: https://example.com/connection"
+        ));
+        assert!(!is_explicitly_undelivered(
+            "request failed: https://example.com/HTTP 400"
+        ));
+        assert!(!is_send_retryable_error(
+            "request failed: https://example.com/dns resolve failed"
+        ));
+        assert_eq!(
+            flood_retry_secs("request failed: https://example.com/Retry after 30"),
+            None
+        );
     }
 }
