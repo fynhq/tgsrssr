@@ -95,8 +95,18 @@ pub fn parse_screen_name(url: &str) -> Option<String> {
     let name = segs[0];
     // Reject reserved paths.
     const RESERVED: &[&str] = &[
-        "i", "home", "search", "explore", "notifications", "messages",
-        "settings", "compose", "login", "signup", "logout", "hashtag",
+        "i",
+        "home",
+        "search",
+        "explore",
+        "notifications",
+        "messages",
+        "settings",
+        "compose",
+        "login",
+        "signup",
+        "logout",
+        "hashtag",
     ];
     // Paths are case-insensitive in practice and canonical_url lowercases the
     // name; compare in lowercase so /Home or /I is rejected here too instead
@@ -106,7 +116,10 @@ pub fn parse_screen_name(url: &str) -> Option<String> {
         return None;
     }
     // Screen names: 1-15 alphanumeric/underscore chars.
-    if name.is_empty() || name.len() > 15 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if name.is_empty()
+        || name.len() > 15
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return None;
     }
     Some(name.to_string())
@@ -138,7 +151,9 @@ pub async fn fetch_x_user(
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let auth_token = match state.get_cookie("x").await {
         Some(c) if !c.trim().is_empty() => c,
-        _ => anyhow::bail!("X feeds require an admin-configured login cookie (use the /cookies command)"),
+        _ => anyhow::bail!(
+            "X feeds require an admin-configured login cookie (use the /cookies command)"
+        ),
     };
 
     // ct0 is cached (1h TTL): avoids every X feed hitting x.com once per fetch round.
@@ -147,18 +162,25 @@ pub async fn fetch_x_user(
     // The cached ct0 may have expired (403): clear the cache, re-fetch ct0 and
     // retry the whole flow once. Only a second 403 means the auth_token cookie
     // itself is dead.
-    let result = fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent, lang).await;
+    let result =
+        fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent, lang).await;
     let result = match result {
         Err(e) if e.downcast_ref::<StaleCt0Error>().is_some() => {
-            tracing::info!(screen_name = screen_name, "X ct0 looks stale; refreshing and retrying once");
+            tracing::info!(
+                screen_name = screen_name,
+                "X ct0 looks stale; refreshing and retrying once"
+            );
             clear_ct0_cache(&auth_token).await;
             ct0 = obtain_ct0(state, &auth_token).await?;
             {
                 let mut cache = ct0_cache().lock().await;
-                cache.insert(auth_token.clone(), Ct0Entry {
-                    ct0: ct0.clone(),
-                    fetched_at: Instant::now(),
-                });
+                cache.insert(
+                    auth_token.clone(),
+                    Ct0Entry {
+                        ct0: ct0.clone(),
+                        fetched_at: Instant::now(),
+                    },
+                );
             }
             fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent, lang).await
         }
@@ -230,7 +252,10 @@ async fn fetch_x_user_with_ct0(
     // Sort newest first.
     crate::platforms::sort_entries_newest_first(&mut entries);
 
-    Ok(crate::fetcher::FetchResult::platform(Some(display_name), entries))
+    Ok(crate::fetcher::FetchResult::platform(
+        Some(display_name),
+        entries,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +303,10 @@ async fn obtain_ct0(state: &AppState, auth_token: &str) -> anyhow::Result<String
         if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(crate::platforms::rate_limited("X", status.as_u16()));
         }
-        anyhow::bail!("X ct0 unavailable (HTTP {}); response shape may have changed", status);
+        anyhow::bail!(
+            "X ct0 unavailable (HTTP {}); response shape may have changed",
+            status
+        );
     }
     Ok(ct0)
 }
@@ -320,10 +348,13 @@ async fn obtain_ct0_cached(state: &AppState, auth_token: &str) -> anyhow::Result
     // old auth_token keys would linger forever and grow unboundedly with each
     // cookie change (~100 bytes per entry — slow growth, but worth preventing).
     cache.retain(|_, entry| entry.fetched_at.elapsed() < CT0_TTL);
-    cache.insert(auth_token.to_string(), Ct0Entry {
-        ct0: ct0.clone(),
-        fetched_at: Instant::now(),
-    });
+    cache.insert(
+        auth_token.to_string(),
+        Ct0Entry {
+            ct0: ct0.clone(),
+            fetched_at: Instant::now(),
+        },
+    );
     Ok(ct0)
 }
 
@@ -398,7 +429,10 @@ async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
     {
         let mut cache = query_id_cache().lock().await;
         if !force {
-            if cache.last_failure.is_some_and(|t| t.elapsed() < QUERY_ID_NEGATIVE_TTL) {
+            if cache
+                .last_failure
+                .is_some_and(|t| t.elapsed() < QUERY_ID_NEGATIVE_TTL)
+            {
                 return cache
                     .ids
                     .get(op)
@@ -461,7 +495,11 @@ async fn get_query_id(state: &AppState, op: &str, force: bool) -> String {
             // `{:#}` renders the full anyhow source chain (reqwest root cause
             // under the "query-ID document request failed" context), so a
             // proxy/TLS failure here is distinguishable from a parse failure.
-            tracing::warn!(error = format!("{:#}", e), op = op, "X query-ID refresh failed; using cached/fallback ID");
+            tracing::warn!(
+                error = format!("{:#}", e),
+                op = op,
+                "X query-ID refresh failed; using cached/fallback ID"
+            );
             let mut cache = query_id_cache().lock().await;
             cache.last_failure = Some(Instant::now());
             cache
@@ -494,7 +532,9 @@ async fn fetch_query_ids(state: &AppState) -> anyhow::Result<HashMap<String, Str
             // Supply-chain defense: the queryId is spliced into the URL path,
             // so validate its character set to prevent injection.
             let valid = !qid.is_empty()
-                && qid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                && qid
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
             if valid {
                 ids.insert(op.to_string(), qid.to_string());
             }
@@ -559,7 +599,10 @@ async fn gql_request(
     match gql_request_once(state, auth_token, ct0, op, params, false).await {
         Ok(v) => Ok(v),
         Err(e) if e.downcast_ref::<StaleQueryIdError>().is_some() => {
-            tracing::info!(op = op, "X queryId looks stale; force-refreshing and retrying once");
+            tracing::info!(
+                op = op,
+                "X queryId looks stale; force-refreshing and retrying once"
+            );
             gql_request_once(state, auth_token, ct0, op, params, true).await
         }
         Err(e) => Err(e),
@@ -691,11 +734,18 @@ async fn resolve_user(
     });
     let field_toggles = serde_json::json!({"withAuxiliaryUserLabels": false});
 
-    let json = gql_request(state, auth_token, ct0, OP_USER_BY_SCREEN_NAME, &[
-        ("variables", variables.to_string()),
-        ("features", FEATURES_USER.to_string()),
-        ("fieldToggles", field_toggles.to_string()),
-    ]).await?;
+    let json = gql_request(
+        state,
+        auth_token,
+        ct0,
+        OP_USER_BY_SCREEN_NAME,
+        &[
+            ("variables", variables.to_string()),
+            ("features", FEATURES_USER.to_string()),
+            ("fieldToggles", field_toggles.to_string()),
+        ],
+    )
+    .await?;
 
     let result = &json["data"]["user"]["result"];
     if result.is_null() {
@@ -704,10 +754,12 @@ async fn resolve_user(
     if result["__typename"].as_str() == Some("UserUnavailable") {
         anyhow::bail!("X user unavailable: @{}", screen_name);
     }
-    let rest_id = result["rest_id"].as_str()
+    let rest_id = result["rest_id"]
+        .as_str()
         .ok_or_else(|| anyhow::anyhow!("X API did not return rest_id"))?
         .to_string();
-    let display_name = result["legacy"]["name"].as_str()
+    let display_name = result["legacy"]["name"]
+        .as_str()
         .or_else(|| result["core"]["name"].as_str())
         .unwrap_or(screen_name)
         .to_string();
@@ -757,14 +809,22 @@ async fn fetch_user_tweets(
             variables["cursor"] = Value::String(c.clone());
         }
 
-        let json = gql_request(state, auth_token, ct0, OP_USER_TWEETS, &[
-            ("variables", variables.to_string()),
-            ("features", FEATURES_FEED.to_string()),
-        ]).await?;
+        let json = gql_request(
+            state,
+            auth_token,
+            ct0,
+            OP_USER_TWEETS,
+            &[
+                ("variables", variables.to_string()),
+                ("features", FEATURES_FEED.to_string()),
+            ],
+        )
+        .await?;
         pages_fetched += 1;
 
         // Navigate: data.user.result.timeline.timeline.instructions
-        let mut instructions = &json["data"]["user"]["result"]["timeline"]["timeline"]["instructions"];
+        let mut instructions =
+            &json["data"]["user"]["result"]["timeline"]["timeline"]["instructions"];
         if !instructions.is_array() {
             // Try alternate path (timeline_v2)
             let alt = &json["data"]["user"]["result"]["timeline_v2"]["timeline"]["instructions"];
@@ -813,7 +873,9 @@ async fn fetch_user_tweets(
         // download failure, deadline deferral) is intentionally left unsent
         // for the next round. Stopping here would make that page unreachable
         // until the account posts again, silently dropping the pending entry.
-        let Some(next) = page.bottom_cursor else { break };
+        let Some(next) = page.bottom_cursor else {
+            break;
+        };
         if Some(&next) == cursor.as_ref() {
             break;
         }
@@ -1002,7 +1064,8 @@ fn collect_tweet_results(entry: &Value, out: &mut Vec<Value>) {
     // tweet — unwrap before the rest_id check, otherwise such tweets are
     // silently dropped at the collection stage (never reaching tweet_to_entry,
     // so no warn and no dropped-count).
-    let tweet_result = unwrap_tweet_result(&entry["content"]["itemContent"]["tweet_results"]["result"]);
+    let tweet_result =
+        unwrap_tweet_result(&entry["content"]["itemContent"]["tweet_results"]["result"]);
     if !tweet_result.is_null() && tweet_result.get("rest_id").is_some() {
         out.push(tweet_result.clone());
         return;
@@ -1090,7 +1153,10 @@ fn append_media_tags(body: &mut String, legacy: &Value) {
             "photo" => {
                 if let Some(url) = m["media_url_https"].as_str() {
                     let orig = x_photo_orig(url);
-                    body.push_str(&format!("<img src=\"{}\">", crate::htmltext::escape_attr(&orig)));
+                    body.push_str(&format!(
+                        "<img src=\"{}\">",
+                        crate::htmltext::escape_attr(&orig)
+                    ));
                 }
             }
             "video" | "animated_gif" => {
@@ -1359,9 +1425,15 @@ fn linkify_hashtags_in_text(text: &str) -> String {
         let tag_text = &text[start..end];
         let tag_body = &text[start + 1..end]; // without sigil
         let href = if is_cashtag {
-            format!("https://x.com/search?q=%24{}", crate::htmltext::escape_attr(tag_body))
+            format!(
+                "https://x.com/search?q=%24{}",
+                crate::htmltext::escape_attr(tag_body)
+            )
         } else {
-            format!("https://x.com/hashtag/{}", crate::htmltext::escape_attr(tag_body))
+            format!(
+                "https://x.com/hashtag/{}",
+                crate::htmltext::escape_attr(tag_body)
+            )
         };
         out.push_str(&format!(
             "<a href=\"{}\">{}</a>",
@@ -1385,8 +1457,8 @@ fn tweet_full_text(result: &Value) -> String {
         .as_str()
         .or_else(|| legacy["full_text"].as_str())
         .unwrap_or_default();
-    let note_urls = result["note_tweet"]["note_tweet_results"]["result"]["entity_set"]["urls"]
-        .as_array();
+    let note_urls =
+        result["note_tweet"]["note_tweet_results"]["result"]["entity_set"]["urls"].as_array();
     clean_tweet_text(raw, legacy, note_urls)
 }
 
@@ -1466,7 +1538,12 @@ enum ConvertOutcome {
 }
 
 /// Convert a GraphQL tweet result object into a feed-rs Entry.
-fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str, lang: Lang) -> ConvertOutcome {
+fn tweet_to_entry(
+    tweet: &Value,
+    screen_name: &str,
+    display_name: &str,
+    lang: Lang,
+) -> ConvertOutcome {
     // Handle TweetWithVisibilityResults wrapper (shared with collect_tweet_results).
     let tweet = unwrap_tweet_result(tweet);
 
@@ -1474,7 +1551,10 @@ fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str, lang: La
     if legacy.is_null() {
         return ConvertOutcome::Failed;
     }
-    let Some(id_str) = legacy["id_str"].as_str().or_else(|| tweet["rest_id"].as_str()) else {
+    let Some(id_str) = legacy["id_str"]
+        .as_str()
+        .or_else(|| tweet["rest_id"].as_str())
+    else {
         return ConvertOutcome::Failed;
     };
     let id = id_str.to_string();
@@ -1536,7 +1616,13 @@ fn tweet_to_entry(tweet: &Value, screen_name: &str, display_name: &str, lang: La
     let link = format!("https://x.com/{}/status/{}", screen_name, id);
 
     ConvertOutcome::Ok(Box::new(crate::platforms::make_entry(
-        id, title, display_name.to_string(), body, "text/html", link, published,
+        id,
+        title,
+        display_name.to_string(),
+        body,
+        "text/html",
+        link,
+        published,
     )))
 }
 
@@ -1550,8 +1636,8 @@ fn quote_renderable(tr: &Value) -> bool {
     let has_id = legacy["id_str"].as_str().is_some_and(|s| !s.is_empty())
         || tr["rest_id"].as_str().is_some_and(|s| !s.is_empty());
     let has_text = !tweet_full_text(tr).trim().is_empty();
-    let has_media = legacy["extended_entities"]["media"].is_array()
-        || legacy["entities"]["media"].is_array();
+    let has_media =
+        legacy["extended_entities"]["media"].is_array() || legacy["entities"]["media"].is_array();
     has_id && (has_text || has_media)
 }
 
@@ -1579,7 +1665,6 @@ fn screen_name_opt(tweet_result: &Value) -> Option<&str> {
     // Path 5: legacy.screen_name (rare fallback)
     tr["legacy"]["screen_name"].as_str()
 }
-
 
 /// Clean tweet text by processing t.co URL entities:
 /// 1) Remove media placeholder t.co URLs (images/videos are sent as attachments).
@@ -1654,8 +1739,7 @@ fn tweet_text_to_html(text: &str) -> String {
                 url = &url[..url.len() - 1];
             }
             for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
-                while url.ends_with(close)
-                    && url.matches(close).count() > url.matches(open).count()
+                while url.ends_with(close) && url.matches(close).count() > url.matches(open).count()
                 {
                     url = &url[..url.len() - close.len_utf8()];
                 }
@@ -1706,9 +1790,18 @@ mod tests {
 
     #[test]
     fn parse_screen_name_valid() {
-        assert_eq!(parse_screen_name("https://x.com/elonmusk"), Some("elonmusk".into()));
-        assert_eq!(parse_screen_name("https://twitter.com/NASA"), Some("NASA".into()));
-        assert_eq!(parse_screen_name("https://www.x.com/some_user"), Some("some_user".into()));
+        assert_eq!(
+            parse_screen_name("https://x.com/elonmusk"),
+            Some("elonmusk".into())
+        );
+        assert_eq!(
+            parse_screen_name("https://twitter.com/NASA"),
+            Some("NASA".into())
+        );
+        assert_eq!(
+            parse_screen_name("https://www.x.com/some_user"),
+            Some("some_user".into())
+        );
         assert_eq!(parse_screen_name("https://x.com/a"), Some("a".into()));
     }
 
@@ -1735,7 +1828,10 @@ mod tests {
     #[test]
     fn extract_cookie_value_works() {
         let header = "ct0=abc123xyz; Max-Age=14400; Domain=.x.com; Path=/; Secure";
-        assert_eq!(extract_cookie_value(header, "ct0"), Some("abc123xyz".into()));
+        assert_eq!(
+            extract_cookie_value(header, "ct0"),
+            Some("abc123xyz".into())
+        );
         assert_eq!(extract_cookie_value(header, "other"), None);
     }
 
@@ -1745,8 +1841,14 @@ mod tests {
         // (some Set-Cookie headers carry attributes or extra cookies first);
         // aligned with media.rs semantics.
         let header = "guest_id=v1%3A123; ct0=abc123xyz; Path=/; Secure";
-        assert_eq!(extract_cookie_value(header, "ct0"), Some("abc123xyz".into()));
-        assert_eq!(extract_cookie_value(header, "guest_id"), Some("v1%3A123".into()));
+        assert_eq!(
+            extract_cookie_value(header, "ct0"),
+            Some("abc123xyz".into())
+        );
+        assert_eq!(
+            extract_cookie_value(header, "guest_id"),
+            Some("v1%3A123".into())
+        );
     }
 
     #[test]
@@ -1885,10 +1987,7 @@ mod tests {
         let names = vec!["elonmusk".to_string()];
         let html = "cc @ElonMusk";
         let out = linkify_mentions(html, &names);
-        assert_eq!(
-            out,
-            "cc <a href=\"https://x.com/elonmusk\">@ElonMusk</a>"
-        );
+        assert_eq!(out, "cc <a href=\"https://x.com/elonmusk\">@ElonMusk</a>");
     }
 
     #[test]
@@ -1943,8 +2042,16 @@ mod tests {
         let names = vec!["SpaceXSI".to_string(), "elonmusk".to_string()];
         let html = "Great work @SpaceXSI — @elonmusk";
         let out = linkify_mentions(html, &names);
-        assert!(out.contains(r#"<a href="https://x.com/SpaceXSI">@SpaceXSI</a>"#), "out: {}", out);
-        assert!(out.contains(r#"<a href="https://x.com/elonmusk">@elonmusk</a>"#), "out: {}", out);
+        assert!(
+            out.contains(r#"<a href="https://x.com/SpaceXSI">@SpaceXSI</a>"#),
+            "out: {}",
+            out
+        );
+        assert!(
+            out.contains(r#"<a href="https://x.com/elonmusk">@elonmusk</a>"#),
+            "out: {}",
+            out
+        );
     }
 
     #[test]
@@ -2156,11 +2263,12 @@ mod tests {
             .as_ref()
             .and_then(|c| c.body.as_deref())
             .unwrap_or_default();
-        assert!(body.contains("<blockquote>QT "), "quote block missing: {body}");
         assert!(
-            body.contains(
-                r#"<a href="https://x.com/quoted_user/status/2002">@quoted_user</a>"#
-            ),
+            body.contains("<blockquote>QT "),
+            "quote block missing: {body}"
+        );
+        assert!(
+            body.contains(r#"<a href="https://x.com/quoted_user/status/2002">@quoted_user</a>"#),
             "quote author link missing: {body}"
         );
         assert!(body.contains("quoted text"), "quoted text missing: {body}");
@@ -2211,19 +2319,35 @@ mod tests {
         // body non-empty: must have a \n separator
         let mut body = String::from("Grok <a href=\"https://x.com/Bot\">@Bot</a>");
         append_quote_block(&mut body, &tweet, "QT");
-        assert!(body.contains("@Bot</a>\n<blockquote>"), "missing \\n separator: {}", body);
-        assert!(!body.contains("@Bot</a><blockquote>"), "blockquote glued to anchor: {}", body);
+        assert!(
+            body.contains("@Bot</a>\n<blockquote>"),
+            "missing \\n separator: {}",
+            body
+        );
+        assert!(
+            !body.contains("@Bot</a><blockquote>"),
+            "blockquote glued to anchor: {}",
+            body
+        );
 
         // body empty (pure RT): no leading \n
         let mut empty_body = String::new();
         append_quote_block(&mut empty_body, &tweet, "RT");
-        assert!(empty_body.starts_with("<blockquote>"), "empty body should not have leading \\n: {}", empty_body);
+        assert!(
+            empty_body.starts_with("<blockquote>"),
+            "empty body should not have leading \\n: {}",
+            empty_body
+        );
     }
 
     #[test]
     fn linkify_hashtags_basic() {
         let out = linkify_hashtags("Hello #Tesla world");
-        assert!(out.contains("<a href=\"https://x.com/hashtag/Tesla\">#Tesla</a>"), "got: {}", out);
+        assert!(
+            out.contains("<a href=\"https://x.com/hashtag/Tesla\">#Tesla</a>"),
+            "got: {}",
+            out
+        );
         assert!(out.starts_with("Hello "), "prefix lost: {}", out);
         assert!(out.ends_with(" world"), "suffix lost: {}", out);
     }
@@ -2231,14 +2355,22 @@ mod tests {
     #[test]
     fn linkify_hashtags_cashtag() {
         let out = linkify_hashtags("Buy $TSLA now");
-        assert!(out.contains("<a href=\"https://x.com/search?q=%24TSLA\">$TSLA</a>"), "got: {}", out);
+        assert!(
+            out.contains("<a href=\"https://x.com/search?q=%24TSLA\">$TSLA</a>"),
+            "got: {}",
+            out
+        );
     }
 
     #[test]
     fn linkify_hashtags_skips_numeric_cashtag() {
         // $5, $100 are not cashtags (pure digits)
         let out = linkify_hashtags("Price is $5 and $100");
-        assert!(!out.contains("<a href"), "numeric should not linkify: {}", out);
+        assert!(
+            !out.contains("<a href"),
+            "numeric should not linkify: {}",
+            out
+        );
     }
 
     #[test]
@@ -2246,7 +2378,11 @@ mod tests {
         let out = linkify_hashtags("<a href=\"https://x.com/foo\">#Tesla</a> plain #SpaceX");
         // #Tesla inside anchor should NOT be double-wrapped
         assert_eq!(out.matches("<a href").count(), 2, "got: {}", out);
-        assert!(out.contains("#SpaceX</a>"), "plain hashtag should be linkified: {}", out);
+        assert!(
+            out.contains("#SpaceX</a>"),
+            "plain hashtag should be linkified: {}",
+            out
+        );
     }
 
     #[test]
@@ -2286,7 +2422,11 @@ mod tests {
         // In tweet_text_to_html output newlines have already become <br>;
         // a tag right after <br> must still match
         let out = linkify_hashtags("text<br>#Tesla<br>more");
-        assert!(out.contains("<a href=\"https://x.com/hashtag/Tesla\">#Tesla</a>"), "got: {}", out);
+        assert!(
+            out.contains("<a href=\"https://x.com/hashtag/Tesla\">#Tesla</a>"),
+            "got: {}",
+            out
+        );
     }
 
     #[test]
@@ -2332,7 +2472,10 @@ mod tests {
             "got: {}",
             out
         );
-        assert!(!out.contains("x.com/a，"), "CJK punctuation leaked into href: {out}");
+        assert!(
+            !out.contains("x.com/a，"),
+            "CJK punctuation leaked into href: {out}"
+        );
     }
 
     #[test]
@@ -2424,7 +2567,9 @@ mod tests {
             x_photo_orig("https://pbs.twimg.com/media/C.jpg?name=orig"),
             "https://pbs.twimg.com/media/C.jpg?name=orig"
         );
-        assert!(!x_photo_orig("https://pbs.twimg.com/media/D.jpg?name=small").contains("name=small"));
+        assert!(
+            !x_photo_orig("https://pbs.twimg.com/media/D.jpg?name=small").contains("name=small")
+        );
     }
 
     #[test]

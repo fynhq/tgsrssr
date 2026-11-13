@@ -185,7 +185,11 @@ fn preserve_rich_linebreaks(html: &str) -> String {
     let mut i = 0usize;
     while i < html.len() {
         let rest = &html[i..];
-        if let Some(tag_len) = rest.strip_prefix('<').and_then(|r| r.find('>')).map(|p| p + 2) {
+        if let Some(tag_len) = rest
+            .strip_prefix('<')
+            .and_then(|r| r.find('>'))
+            .map(|p| p + 2)
+        {
             let tag = &html[i..i + tag_len];
             let trimmed = tag.trim();
             let closing = trimmed.starts_with("</");
@@ -254,7 +258,12 @@ fn preserve_rich_linebreaks(html: &str) -> String {
 
 /// `caption_above_media` (the existing channel/source switch) decides whether
 /// the text block precedes or follows the media block.
-pub(super) fn rich_html(body: &str, footer: &str, media_html: &str, caption_above_media: bool) -> String {
+pub(super) fn rich_html(
+    body: &str,
+    footer: &str,
+    media_html: &str,
+    caption_above_media: bool,
+) -> String {
     let mut text = body.to_string();
     if !footer.is_empty() {
         if !text.is_empty() {
@@ -327,7 +336,12 @@ pub(super) fn truncate_display_text(s: &str, max_units: usize) -> String {
 }
 
 /// Source footer line, or empty string.
-pub(super) fn source_line(entry: &Entry, feed_title: &str, author: Option<&str>, sd: SourceDisplay) -> String {
+pub(super) fn source_line(
+    entry: &Entry,
+    feed_title: &str,
+    author: Option<&str>,
+    sd: SourceDisplay,
+) -> String {
     match sd {
         SourceDisplay::Source => {
             if feed_title.is_empty() {
@@ -387,7 +401,11 @@ pub(super) fn truncate_html_input(html: &str, cap: usize) -> &str {
 /// characters as Telegram-HTML with hyperlinks preserved, with "......"
 /// appended when truncated. Returns empty string when the body has no
 /// visible text.
-pub(super) fn entry_summary(entry: &Entry, max_chars: usize, meta: Option<&crate::entrymeta::EntryMeta>) -> String {
+pub(super) fn entry_summary(
+    entry: &Entry,
+    max_chars: usize,
+    meta: Option<&crate::entrymeta::EntryMeta>,
+) -> String {
     let source = fetcher::entry_body_source(entry);
     let capped = truncate_html_input(source, SUMMARY_INPUT_CAP);
     let mut html = fetcher::entry_body_html_from_source(capped, 100_000, meta);
@@ -429,8 +447,7 @@ pub(super) fn format_entry_parts(
     opts: RenderOpts,
     meta: Option<&crate::entrymeta::EntryMeta>,
 ) -> Option<(String, String)> {
-    render_parts(entry, feed_title, author, opts, meta)
-        .map(|r| (r.parts.join("\n\n"), r.footer))
+    render_parts(entry, feed_title, author, opts, meta).map(|r| (r.parts.join("\n\n"), r.footer))
 }
 
 /// Shared rendering for the plain-text and caption paths. These were two

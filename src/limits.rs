@@ -37,7 +37,9 @@ pub struct CommandRateLimiter {
 
 impl CommandRateLimiter {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Record a call for `user_id` and report whether it is allowed.
@@ -108,7 +110,10 @@ mod tests {
         for i in 0..COMMANDS_PER_MINUTE {
             assert!(limiter.allow_at(7, t0), "call {} should be allowed", i + 1);
         }
-        assert!(!limiter.allow_at(7, t0), "11th call in the window must be rejected");
+        assert!(
+            !limiter.allow_at(7, t0),
+            "11th call in the window must be rejected"
+        );
     }
 
     #[test]
@@ -119,7 +124,10 @@ mod tests {
             assert!(limiter.allow_at(7, t0));
         }
         let later = t0 + COMMAND_WINDOW + Duration::from_secs(1);
-        assert!(limiter.allow_at(7, later), "calls older than the window must not count");
+        assert!(
+            limiter.allow_at(7, later),
+            "calls older than the window must not count"
+        );
     }
 
     #[test]
@@ -130,7 +138,10 @@ mod tests {
             assert!(limiter.allow_at(1, t0));
         }
         assert!(!limiter.allow_at(1, t0));
-        assert!(limiter.allow_at(2, t0), "another user must not inherit the limit");
+        assert!(
+            limiter.allow_at(2, t0),
+            "another user must not inherit the limit"
+        );
     }
 
     #[test]
@@ -140,10 +151,16 @@ mod tests {
         for _ in 0..COMMANDS_PER_MINUTE {
             assert!(limiter.allow_at(7, t0));
         }
-        assert!(!allow_command(false, &limiter, 7), "non-admin is rate limited");
+        assert!(
+            !allow_command(false, &limiter, 7),
+            "non-admin is rate limited"
+        );
         // Admin bypasses the limiter entirely.
         for _ in 0..100 {
-            assert!(allow_command(true, &limiter, 1), "admin calls must always pass");
+            assert!(
+                allow_command(true, &limiter, 1),
+                "admin calls must always pass"
+            );
         }
     }
 
@@ -160,9 +177,15 @@ mod tests {
             }
         }
         let later = t0 + COMMAND_WINDOW + Duration::from_secs(1);
-        assert!(limiter.allow_at(99_999, later), "new user should be tracked after pruning stale queues");
+        assert!(
+            limiter.allow_at(99_999, later),
+            "new user should be tracked after pruning stale queues"
+        );
         let map = limiter.inner.lock().unwrap();
-        assert!(map.len() < MAX_TRACKED_USERS, "stale queues must be dropped at capacity");
+        assert!(
+            map.len() < MAX_TRACKED_USERS,
+            "stale queues must be dropped at capacity"
+        );
     }
 
     #[test]
@@ -190,7 +213,10 @@ mod tests {
     fn quota_caps_allow_exact_limit_and_zero_is_unlimited() {
         assert!(within_cap(99, 98, 1), "reaching the cap exactly is allowed");
         assert!(!within_cap(99, 99, 1), "exceeding by one is rejected");
-        assert!(!within_cap(99, 90, 10), "batch larger than remaining capacity is rejected");
+        assert!(
+            !within_cap(99, 90, 10),
+            "batch larger than remaining capacity is rejected"
+        );
         assert!(within_cap(0, 10_000, 10_000), "0 means unlimited");
         assert!(within_cap(20, 19, 1));
         assert!(!within_cap(20, 20, 1));

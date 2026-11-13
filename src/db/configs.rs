@@ -2,18 +2,15 @@
 
 use super::*;
 
-
 pub async fn ensure_chat_config(db: &Db, chat_id: &str) -> anyhow::Result<()> {
     // New channels default to a 30-minute fetch interval. The immutable
     // baseline DDL (001_init.sql) still declares DEFAULT 10, so every insert
     // path must pass 30 explicitly; the value must match
     // DEFAULT_INTERVAL_MINUTES (asserted by test_default_constants).
-    sqlx::query(
-        "INSERT OR IGNORE INTO chat_configs (chat_id, interval_minutes) VALUES (?, 30)",
-    )
-    .bind(chat_id)
-    .execute(db)
-    .await?;
+    sqlx::query("INSERT OR IGNORE INTO chat_configs (chat_id, interval_minutes) VALUES (?, 30)")
+        .bind(chat_id)
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -77,7 +74,8 @@ pub async fn set_chat_config_field(
         // Defense: ensure the value bound to an INTEGER column is a valid
         // number (callers usually validate already, but the db layer should
         // not assume so).
-        let v: i64 = value.parse()
+        let v: i64 = value
+            .parse()
             .map_err(|_| anyhow::anyhow!("interval_minutes must be numeric, got '{}'", value))?;
         if !(1..=MAX_INTERVAL_MINUTES).contains(&v) {
             anyhow::bail!("interval_minutes out of range: {}", v);
@@ -85,7 +83,11 @@ pub async fn set_chat_config_field(
         sqlx::query(sql).bind(v).bind(chat_id).execute(db).await?;
     } else {
         validate_config_value(field, value)?;
-        sqlx::query(sql).bind(value).bind(chat_id).execute(db).await?;
+        sqlx::query(sql)
+            .bind(value)
+            .bind(chat_id)
+            .execute(db)
+            .await?;
     }
     Ok(())
 }
@@ -109,7 +111,11 @@ pub async fn set_feed_config_field(
             "link_preview" => "UPDATE feed_configs SET link_preview = NULL, updated_at = datetime('now') WHERE chat_id = ? AND feed_url = ?",
             _ => anyhow::bail!("unknown field: {}", field),
         };
-        sqlx::query(sql).bind(chat_id).bind(feed_url).execute(db).await?;
+        sqlx::query(sql)
+            .bind(chat_id)
+            .bind(feed_url)
+            .execute(db)
+            .await?;
         // If all fields are NULL, delete the row.
         // The three filter columns are NOT NULL DEFAULT (0/'blacklist'/'') and
         // are never NULL, so we must judge by "filter completely unconfigured":
@@ -135,17 +141,27 @@ pub async fn set_feed_config_field(
         if field == "interval_minutes" {
             // Defense: ensure the value bound to an INTEGER column is a valid
             // number.
-            let n: i64 = v.parse()
+            let n: i64 = v
+                .parse()
                 .map_err(|_| anyhow::anyhow!("interval_minutes must be numeric, got '{}'", v))?;
             if !(1..=MAX_INTERVAL_MINUTES).contains(&n) {
                 anyhow::bail!("interval_minutes out of range: {}", n);
             }
-            sqlx::query(sql).bind(chat_id).bind(feed_url).bind(n).execute(db).await?;
+            sqlx::query(sql)
+                .bind(chat_id)
+                .bind(feed_url)
+                .bind(n)
+                .execute(db)
+                .await?;
         } else {
             validate_config_value(field, v)?;
-            sqlx::query(sql).bind(chat_id).bind(feed_url).bind(v).execute(db).await?;
+            sqlx::query(sql)
+                .bind(chat_id)
+                .bind(feed_url)
+                .bind(v)
+                .execute(db)
+                .await?;
         }
     }
     Ok(())
 }
-

@@ -196,7 +196,11 @@ mod tests {
             ("srcfcp", CallbackOp::SourceCaption, GuardTarget::Sub),
             ("srcflp", CallbackOp::SourceLinkPreview, GuardTarget::Sub),
             ("srcfilter", CallbackOp::SourceFilter, GuardTarget::Sub),
-            ("srcftoggle", CallbackOp::SourceFilterToggle, GuardTarget::Sub),
+            (
+                "srcftoggle",
+                CallbackOp::SourceFilterToggle,
+                GuardTarget::Sub,
+            ),
             ("srcfmode", CallbackOp::SourceFilterMode, GuardTarget::Sub),
             ("srcfkw", CallbackOp::SourceFilterKeywords, GuardTarget::Sub),
             ("srcfi", CallbackOp::SourceIntervalValue, GuardTarget::Sub),

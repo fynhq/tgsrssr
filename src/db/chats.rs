@@ -60,7 +60,12 @@ pub(super) async fn cleanup_chat_settings_keys(
     conn: &mut sqlx::SqliteConnection,
     chat_id: &str,
 ) -> anyhow::Result<()> {
-    for prefix in ["media_dl_fail", "auto_disable_notified", "stale_zero", "send_fail"] {
+    for prefix in [
+        "media_dl_fail",
+        "auto_disable_notified",
+        "stale_zero",
+        "send_fail",
+    ] {
         sqlx::query("DELETE FROM settings WHERE key LIKE ?")
             .bind(format!("{prefix}:{chat_id}:%"))
             .execute(&mut *conn)
@@ -238,13 +243,12 @@ pub async fn get_chat(db: &Db, chat_id: &str) -> anyhow::Result<Option<ChatRow>>
 /// Disabled chats are excluded from scheduling and outbox retries; the owner
 /// is preserved so a later re-add keeps the original ownership.
 pub async fn set_chat_enabled(db: &Db, chat_id: &str, enabled: bool) -> anyhow::Result<bool> {
-    let result = sqlx::query(
-        "UPDATE chats SET enabled = ?, updated_at = datetime('now') WHERE chat_id = ?",
-    )
-    .bind(if enabled { 1 } else { 0 })
-    .bind(chat_id)
-    .execute(db)
-    .await?;
+    let result =
+        sqlx::query("UPDATE chats SET enabled = ?, updated_at = datetime('now') WHERE chat_id = ?")
+            .bind(if enabled { 1 } else { 0 })
+            .bind(chat_id)
+            .execute(db)
+            .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -256,4 +260,3 @@ pub async fn can_manage_chat(db: &Db, user_id: i64, chat_id: &str) -> anyhow::Re
     };
     Ok(chat.enabled == 1 && chat.added_by.as_deref() == Some(&user_id.to_string()))
 }
-

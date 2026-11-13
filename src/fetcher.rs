@@ -27,8 +27,9 @@ static RE_MULTI_SPACE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[ \t]{2,}").unwrap());
 pub static RE_VIDEO_BLOCK: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?is)<video\b[^>]*>.*?</video>").unwrap());
-pub static RE_IMG_ALT: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?is)<img\b[^>]*?\balt\s*=\s*["']([^"']*)["'][^>]*>"#).unwrap());
+pub static RE_IMG_ALT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)<img\b[^>]*?\balt\s*=\s*["']([^"']*)["'][^>]*>"#).unwrap()
+});
 pub static RE_IMG: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?is)<img\b[^>]*>").unwrap());
 static RE_SOURCE: LazyLock<regex::Regex> =
@@ -71,8 +72,9 @@ static RE_BLOCKQUOTE_OPEN: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)<blockquote\b[^>]*>").unwrap());
 static RE_BLOCKQUOTE_CLOSE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)</blockquote\s*>").unwrap());
-static RE_ANCHOR: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?is)<a\b[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>"#).unwrap());
+static RE_ANCHOR: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)<a\b[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>"#).unwrap()
+});
 /// Bare URLs that Telegram would otherwise auto-linkify. The character class
 /// is deliberately ASCII-only so it stops before CJK text/punctuation even
 /// when the source text has no space after the URL.
@@ -91,11 +93,11 @@ static RE_BARE_URL: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// Bare `foo.txt/bar` must not become a link; explicit `https://foo.txt/bar`
 /// is still respected because the scheme is an unambiguous URL intent.
 const BARE_URL_FILE_EXT: &[&str] = &[
-    "txt", "md", "markdown", "rs", "js", "mjs", "cjs", "ts", "tsx", "jsx", "css", "html",
-    "htm", "xml", "json", "toml", "yaml", "yml", "png", "jpg", "jpeg", "gif", "webp", "svg",
-    "bmp", "ico", "mp4", "mov", "webm", "mkv", "mp3", "wav", "flac", "ogg", "pdf", "zip",
-    "tar", "gz", "tgz", "bz2", "xz", "exe", "dll", "so", "dylib", "apk", "ipa", "csv",
-    "tsv", "log", "lock", "db", "sqlite",
+    "txt", "md", "markdown", "rs", "js", "mjs", "cjs", "ts", "tsx", "jsx", "css", "html", "htm",
+    "xml", "json", "toml", "yaml", "yml", "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico",
+    "mp4", "mov", "webm", "mkv", "mp3", "wav", "flac", "ogg", "pdf", "zip", "tar", "gz", "tgz",
+    "bz2", "xz", "exe", "dll", "so", "dylib", "apk", "ipa", "csv", "tsv", "log", "lock", "db",
+    "sqlite",
 ];
 
 /// Return the prefix of a regex candidate that should become the link, trimming
@@ -192,7 +194,8 @@ fn linkify_bare_urls(text: &str, links: &mut Vec<(String, String)>) -> String {
 }
 
 /// Result of fetching a single feed.
-pub struct FetchResult {    pub feed_title: Option<String>,
+pub struct FetchResult {
+    pub feed_title: Option<String>,
     /// Entries sorted newest-first.
     pub entries: Vec<Entry>,
     /// Server returned 304 (source not updated): nothing to push; callers
@@ -305,7 +308,10 @@ fn normalize_plain_feed_url(url: &str) -> String {
     let (host, port) = if hostport.starts_with('[') {
         // IPv6 literal: the port, if present, follows the closing bracket.
         match hostport.find(']') {
-            Some(i) => (&hostport[..=i], hostport[i + 1..].strip_prefix(':').unwrap_or("")),
+            Some(i) => (
+                &hostport[..=i],
+                hostport[i + 1..].strip_prefix(':').unwrap_or(""),
+            ),
             None => (hostport, ""),
         }
     } else {
@@ -382,7 +388,10 @@ pub async fn read_body_capped(resp: reqwest::Response, ctx: &str) -> anyhow::Res
 /// the RSS pipeline uses — keep it that way: new platform JSON calls must use
 /// this helper, never bare `resp.json()`. `ctx` identifies the source in
 /// error messages.
-pub async fn read_json_capped(resp: reqwest::Response, ctx: &str) -> anyhow::Result<serde_json::Value> {
+pub async fn read_json_capped(
+    resp: reqwest::Response,
+    ctx: &str,
+) -> anyhow::Result<serde_json::Value> {
     let bytes = read_body_capped(resp, ctx).await?;
     let json: serde_json::Value =
         serde_json::from_slice(&bytes).with_context(|| format!("JSON parse failed for {}", ctx))?;
@@ -409,7 +418,10 @@ pub async fn fetch_feed(
         return (p.fetch)(state, feed_url.to_string(), opts).await;
     }
 
-    let _permit = state.fetch_semaphore.acquire().await
+    let _permit = state
+        .fetch_semaphore
+        .acquire()
+        .await
         .context("fetch semaphore closed")?;
 
     // SSRF protection (entry point): /sub and /test accept arbitrary URLs,
@@ -507,7 +519,10 @@ pub async fn fetch_feed(
     // keeping it alive alongside the parsed entries for the rest of the call.
     drop(bytes);
 
-    let feed_title = feed.title.map(|t| t.content).filter(|s| !s.trim().is_empty());
+    let feed_title = feed
+        .title
+        .map(|t| t.content)
+        .filter(|s| !s.trim().is_empty());
 
     // Sort entries newest first by published/updated date, then bound the
     // retained set. The parser has already built the full Vec (feed-rs is not
@@ -563,8 +578,14 @@ pub fn entry_id(entry: &Entry) -> String {
     // Fallback: title + published timestamp + body hash. The hash keeps
     // distinct entries with the same title and no timestamp from sharing a
     // dedup key (the old `t:title:` key made one of them skip forever).
-    let title = entry.title.as_ref().map(|t| t.content.clone()).unwrap_or_default();
-    let ts = entry.published.or(entry.updated)
+    let title = entry
+        .title
+        .as_ref()
+        .map(|t| t.content.clone())
+        .unwrap_or_default();
+    let ts = entry
+        .published
+        .or(entry.updated)
         .map(|d| d.timestamp().to_string())
         .unwrap_or_default();
     // Borrow the body: cloning it here would double a potentially large entry
@@ -666,7 +687,11 @@ pub fn entry_author(entry: &Entry) -> Option<String> {
 /// secret handshake), the body
 /// is already valid Telegram HTML — only media tags are stripped,
 /// formatting tags (<b>/<i>/<s>/<code>/<a>/<blockquote>) are preserved.
-pub fn entry_body_html(entry: &Entry, max: usize, meta: Option<&crate::entrymeta::EntryMeta>) -> String {
+pub fn entry_body_html(
+    entry: &Entry,
+    max: usize,
+    meta: Option<&crate::entrymeta::EntryMeta>,
+) -> String {
     entry_body_html_from_source(entry_body_source(entry), max, meta)
 }
 
@@ -778,7 +803,9 @@ pub fn is_media_href(href: &str) -> bool {
     }
     // Direct media file extensions.
     let path = lower.split('?').next().unwrap_or(&lower);
-    const MEDIA_EXT: [&str; 9] = [".mp4", ".mov", ".webm", ".m4v", ".jpg", ".jpeg", ".png", ".gif", ".webp"];
+    const MEDIA_EXT: [&str; 9] = [
+        ".mp4", ".mov", ".webm", ".m4v", ".jpg", ".jpeg", ".png", ".gif", ".webp",
+    ];
     MEDIA_EXT.iter().any(|e| path.ends_with(e))
 }
 
@@ -943,7 +970,11 @@ pub fn html_to_telegram_html(html: &str) -> String {
             // visible text but never emit an unsafe Telegram anchor.
             crate::htmltext::escape_html(text)
         } else {
-            format!("<a href=\"{}\">{}</a>", crate::htmltext::escape_attr(href), crate::htmltext::escape_html(text))
+            format!(
+                "<a href=\"{}\">{}</a>",
+                crate::htmltext::escape_attr(href),
+                crate::htmltext::escape_html(text)
+            )
         };
         out = out.replace(&token, &replacement);
     }
@@ -983,13 +1014,21 @@ mod tests {
         // Hashtag kept as a clickable hyperlink with decoded href.
         assert!(out.contains(r#"<a href="https://m.weibo.cn/search?containerid=231522type%3D1&amp;q=%23%E8%AF%9D%E9%A2%98B%23">#话题B#</a>"#), "out: {}", out);
         // Video card link kept as a clickable hyperlink.
-        assert!(out.contains(r#"<a href="https://video.weibo.com/show?fid=1034:1">微博视频</a>"#), "video link lost: {}", out);
+        assert!(
+            out.contains(r#"<a href="https://video.weibo.com/show?fid=1034:1">微博视频</a>"#),
+            "video link lost: {}",
+            out
+        );
         // Plain hashtag text preserved.
         assert!(out.contains("#话题A#"));
         // Media tag URLs must not leak.
         assert!(!out.contains("sinaimg.cn"), "out: {}", out);
         assert!(!out.contains("weibocdn.com"), "out: {}", out);
-        assert!(!out.contains("![") && !out.contains("]("), "md syntax leaked: {}", out);
+        assert!(
+            !out.contains("![") && !out.contains("]("),
+            "md syntax leaked: {}",
+            out
+        );
         // Body text preserved.
         assert!(out.contains("正文内容。"));
     }
@@ -1022,7 +1061,13 @@ mod tests {
         // only remove leaked copies outside anchors, not this one.
         let html = r#"正文<a href="https://video.weibo.com/show?fid=1034:123" data-hide=""><span class="url-icon"><img src="https://h5.sinaimg.cn/x.png"></span><span class="surl-text">某某的微博视频</span></a>"#;
         let out = html_to_telegram_html(html);
-        assert!(out.contains(r#"<a href="https://video.weibo.com/show?fid=1034:123">某某的微博视频</a>"#), "out: {}", out);
+        assert!(
+            out.contains(
+                r#"<a href="https://video.weibo.com/show?fid=1034:123">某某的微博视频</a>"#
+            ),
+            "out: {}",
+            out
+        );
         assert!(!out.contains("sinaimg.cn"), "icon leaked: {}", out);
         assert!(out.contains("正文"), "body lost: {}", out);
     }
@@ -1080,7 +1125,10 @@ mod tests {
     #[test]
     fn block_elements_are_separated_not_concatenated() {
         let out = html_to_telegram_html("<ul><li>first</li><li>second</li></ul>");
-        assert!(out.contains("first\nsecond"), "list items concatenated: {out:?}");
+        assert!(
+            out.contains("first\nsecond"),
+            "list items concatenated: {out:?}"
+        );
         let title = html_to_plain("<h1>Head</h1><p>Body</p>");
         assert_eq!(title, "Head Body");
         let cells = html_to_plain("<table><tr><td>A</td><td>B</td></tr></table>");
@@ -1147,14 +1195,18 @@ mod tests {
         // absorb the trailing text into the link.
         let out = html_to_telegram_html("解锁：github.com/example/repo。这个项目同样使用漏洞。");
         assert!(
-            out.contains(r#"<a href="https://github.com/example/repo">github.com/example/repo</a>。这个项目"#),
+            out.contains(
+                r#"<a href="https://github.com/example/repo">github.com/example/repo</a>。这个项目"#
+            ),
             "out: {out}"
         );
 
         // Also stop at CJK text without punctuation.
         let out = html_to_telegram_html("见 github.com/example/repo这个项目");
         assert!(
-            out.contains(r#"<a href="https://github.com/example/repo">github.com/example/repo</a>这个项目"#),
+            out.contains(
+                r#"<a href="https://github.com/example/repo">github.com/example/repo</a>这个项目"#
+            ),
             "out: {out}"
         );
     }
@@ -1180,13 +1232,21 @@ mod tests {
 
     #[test]
     fn bare_url_supports_scheme_www_tcn_and_domain_path() {
-        let out = html_to_telegram_html("http://example.com/a www.example.com/b t.cn/AX123 example.com/c");
-        assert!(out.contains(r#"<a href="http://example.com/a">http://example.com/a</a>"#), "out: {out}");
+        let out = html_to_telegram_html(
+            "http://example.com/a www.example.com/b t.cn/AX123 example.com/c",
+        );
+        assert!(
+            out.contains(r#"<a href="http://example.com/a">http://example.com/a</a>"#),
+            "out: {out}"
+        );
         assert!(
             out.contains(r#"<a href="https://www.example.com/b">www.example.com/b</a>"#),
             "out: {out}"
         );
-        assert!(out.contains(r#"<a href="https://t.cn/AX123">t.cn/AX123</a>"#), "out: {out}");
+        assert!(
+            out.contains(r#"<a href="https://t.cn/AX123">t.cn/AX123</a>"#),
+            "out: {out}"
+        );
         assert!(
             out.contains(r#"<a href="https://example.com/c">example.com/c</a>"#),
             "out: {out}"
@@ -1204,9 +1264,8 @@ mod tests {
 
     #[test]
     fn existing_anchor_is_not_double_linkified() {
-        let out = html_to_telegram_html(
-            r#"<a href="https://example.com/x">https://example.com/x</a>"#,
-        );
+        let out =
+            html_to_telegram_html(r#"<a href="https://example.com/x">https://example.com/x</a>"#);
         assert_eq!(out.matches("<a ").count(), 1, "out: {out}");
         assert!(out.contains(r#"<a href="https://example.com/x">https://example.com/x</a>"#));
     }
@@ -1234,7 +1293,10 @@ mod tests {
         // &amp; — users saw "张三&amp;nbsp;李四".
         let out = html_to_telegram_html("<p>作者：张三&nbsp;李四 &amp; 伙伴</p>");
         assert!(out.contains("张三 李四"), "nbsp not decoded: {out}");
-        assert!(out.contains("&amp; 伙伴"), "ampersand not re-escaped: {out}");
+        assert!(
+            out.contains("&amp; 伙伴"),
+            "ampersand not re-escaped: {out}"
+        );
         assert!(!out.contains("nbsp"), "entity leaked: {out}");
     }
 
@@ -1247,7 +1309,11 @@ mod tests {
         assert!(out.contains("</blockquote>"), "out: {}", out);
         assert!(out.contains("- 转发"), "out: {}", out);
         assert!(out.contains("原博内容"), "out: {}", out);
-        assert!(out.contains(r#"<a href="https://weibo.com/n/某人">@某人</a>"#), "out: {}", out);
+        assert!(
+            out.contains(r#"<a href="https://weibo.com/n/某人">@某人</a>"#),
+            "out: {}",
+            out
+        );
     }
 
     #[test]
@@ -1340,7 +1406,11 @@ mod tests {
             authors: Vec::new(),
             contributors: Vec::new(),
             content: None,
-            links: vec![empty_link("  "), empty_link(""), empty_link("https://example.com/x")],
+            links: vec![
+                empty_link("  "),
+                empty_link(""),
+                empty_link("https://example.com/x"),
+            ],
             summary: None,
             categories: Vec::new(),
             media: Vec::new(),
@@ -1350,7 +1420,11 @@ mod tests {
             base: None,
         };
         assert_eq!(entry_link(&entry).as_deref(), Some("https://example.com/x"));
-        assert!(entry_link(&Entry { links: vec![empty_link(" ")], ..entry }).is_none());
+        assert!(entry_link(&Entry {
+            links: vec![empty_link(" ")],
+            ..entry
+        })
+        .is_none());
     }
 
     #[test]
@@ -1367,8 +1441,16 @@ mod tests {
         let out = entry_body_html(&entry, 100_000, Some(&meta));
         assert!(out.contains("<b>粗体</b>"), "out: {}", out);
         assert!(out.contains("<i>斜体</i>"), "out: {}", out);
-        assert!(out.contains(r#"<a href="https://x.com">链接</a>"#), "out: {}", out);
-        assert!(out.contains("<blockquote>引用</blockquote>"), "out: {}", out);
+        assert!(
+            out.contains(r#"<a href="https://x.com">链接</a>"#),
+            "out: {}",
+            out
+        );
+        assert!(
+            out.contains("<blockquote>引用</blockquote>"),
+            "out: {}",
+            out
+        );
         assert!(!out.contains("img.example.com"), "img leaked: {}", out);
         assert!(!out.contains("v.example.com"), "video leaked: {}", out);
     }

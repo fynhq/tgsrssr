@@ -86,7 +86,9 @@ async fn main() -> anyhow::Result<()> {
     match db::normalize_telegram_entry_ids(&db_pool).await {
         Ok(0) => {}
         Ok(rows) => info!(rows, "normalized legacy Telegram entry ids"),
-        Err(e) => tracing::warn!(error = %e, "legacy Telegram entry id normalization failed; first fetch may re-push the visible window"),
+        Err(e) => {
+            tracing::warn!(error = %e, "legacy Telegram entry id normalization failed; first fetch may re-push the visible window")
+        }
     }
 
     // Build bot (optionally pointing at a local Bot API server).
@@ -137,7 +139,11 @@ async fn main() -> anyhow::Result<()> {
     // (those whose platform segment is not a known platform id).
     {
         let known_platforms: Vec<&str> = platforms::PLATFORMS.iter().map(|p| p.id).collect();
-        for prefix in ["platform_health:", "platform_streak:", "cookie_expired_notified:"] {
+        for prefix in [
+            "platform_health:",
+            "platform_streak:",
+            "cookie_expired_notified:",
+        ] {
             let rows = match db::get_settings_by_prefix(&db_pool, prefix).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -254,17 +260,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ===== Dispatching handler tree =====
     let handler = dptree::entry()
+        .branch(Update::filter_message().branch(dptree::endpoint(handle_message)))
+        .branch(Update::filter_callback_query().branch(dptree::endpoint(handle_callback_query)))
         .branch(
-            Update::filter_message()
-                .branch(dptree::endpoint(handle_message)),
-        )
-        .branch(
-            Update::filter_callback_query()
-                .branch(dptree::endpoint(handle_callback_query)),
-        )
-        .branch(
-            Update::filter_my_chat_member()
-                .branch(dptree::endpoint(handle_my_chat_member_update)),
+            Update::filter_my_chat_member().branch(dptree::endpoint(handle_my_chat_member_update)),
         );
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
@@ -381,8 +380,12 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
         let old_id = msg.chat.id.0.to_string();
         let new_id = new_chat_id.0.to_string();
         match db::migrate_chat_id(&state.db, &old_id, &new_id).await {
-            Ok(()) => info!(old_chat_id = %old_id, new_chat_id = %new_id, "chat id migrated after group upgrade"),
-            Err(e) => error!(old_chat_id = %old_id, new_chat_id = %new_id, error = format!("{:#}", e), "chat id migration failed"),
+            Ok(()) => {
+                info!(old_chat_id = %old_id, new_chat_id = %new_id, "chat id migrated after group upgrade")
+            }
+            Err(e) => {
+                error!(old_chat_id = %old_id, new_chat_id = %new_id, error = format!("{:#}", e), "chat id migration failed")
+            }
         }
         return Ok(());
     }
@@ -399,7 +402,13 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
         // Whitelist re-check: a user removed from the whitelist after
         // starting a flow no longer has their replies consumed.
         if !state.config.is_allowed(user_id) {
-            crate::commands::retire_prompt(&bot, msg.chat.id, op.prompt_msg_id(), i18n::t(lang, "cancelled")).await;
+            crate::commands::retire_prompt(
+                &bot,
+                msg.chat.id,
+                op.prompt_msg_id(),
+                i18n::t(lang, "cancelled"),
+            )
+            .await;
             return Ok(());
         }
         // Expired pending ops (user walked away): clean up the stale prompt
@@ -418,15 +427,33 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
             let prompt_msg_id = op.prompt_msg_id();
             // Retire the stale prompt (edit → status) instead of deleting,
             // so the client's reply-draft target stays alive.
-            crate::commands::retire_prompt(&bot, msg.chat.id, prompt_msg_id, i18n::t(lang, "timeout_cancelled")).await;
+            crate::commands::retire_prompt(
+                &bot,
+                msg.chat.id,
+                prompt_msg_id,
+                i18n::t(lang, "timeout_cancelled"),
+            )
+            .await;
             // Fall through to normal handling below.
         } else if is_command {
             let prompt_msg_id = op.prompt_msg_id();
-            crate::commands::retire_prompt(&bot, msg.chat.id, prompt_msg_id, i18n::t(lang, "cancelled")).await;
+            crate::commands::retire_prompt(
+                &bot,
+                msg.chat.id,
+                prompt_msg_id,
+                i18n::t(lang, "cancelled"),
+            )
+            .await;
             // Fall through to command handling below.
         } else if is_channel_forward {
             let prompt_msg_id = op.prompt_msg_id();
-            crate::commands::retire_prompt(&bot, msg.chat.id, prompt_msg_id, i18n::t(lang, "cancelled")).await;
+            crate::commands::retire_prompt(
+                &bot,
+                msg.chat.id,
+                prompt_msg_id,
+                i18n::t(lang, "cancelled"),
+            )
+            .await;
             // Fall through to implicit /find handling below.
         } else {
             return commands::handle_pending_op(&bot, &msg, &state, op, text).await;
@@ -462,7 +489,10 @@ async fn handle_callback_query(bot: Bot, q: CallbackQuery, state: AppState) -> R
 }
 
 /// My-chat-member handler (auto-register / purge on removal).
-async fn handle_my_chat_member_update(mcm: ChatMemberUpdated, state: AppState) -> ResponseResult<()> {
+async fn handle_my_chat_member_update(
+    mcm: ChatMemberUpdated,
+    state: AppState,
+) -> ResponseResult<()> {
     callbacks::handle_my_chat_member(mcm, state).await
 }
 
@@ -493,10 +523,7 @@ async fn register_cleanup_job(sched: &JobScheduler, state: AppState) -> anyhow::
     let interval = CLEANUP_INTERVAL_MINUTES;
     // Tick every minute and gate with the fixed interval. The gate keeps the
     // first run anchored to process start rather than the wall clock.
-    let (expr, gate_secs) = (
-        "0 * * * * *".to_string(),
-        Some(interval.saturating_mul(60)),
-    );
+    let (expr, gate_secs) = ("0 * * * * *".to_string(), Some(interval.saturating_mul(60)));
     // Startup cleanup already ran; count it as the last run so a long
     // interval is honored from process start.
     let last_run = std::sync::Arc::new(std::sync::Mutex::new(Some(std::time::Instant::now())));

@@ -5,14 +5,14 @@
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-use crate::ui::{
-    back_close_row, chat_display_title, deliver, deliver_error_page, fmt_content_mode,
-    fmt_interval, fmt_source_display, load_sub_or_deliver, PageTarget,
-};
 use crate::db;
 use crate::i18n::{self, Lang};
 use crate::push::{ContentMode, SourceDisplay};
 use crate::state::AppState;
+use crate::ui::{
+    back_close_row, chat_display_title, deliver, deliver_error_page, fmt_content_mode,
+    fmt_interval, fmt_source_display, load_sub_or_deliver, PageTarget,
+};
 
 /// Shows current values with a ✓ and lets the owner switch them in place.
 /// Settings main page: three second-level entries + link-preview toggle.
@@ -33,7 +33,11 @@ pub(super) async fn render_settings_page(
     let iv_label = fmt_interval(lang, cfg.interval_minutes);
     let cm_label = fmt_content_mode(lang, &cfg.content_mode);
     let sd_label = fmt_source_display(lang, &cfg.source_display);
-    let lp_label = if cfg.link_preview != 0 { i18n::t(lang, "on") } else { i18n::t(lang, "off") };
+    let lp_label = if cfg.link_preview != 0 {
+        i18n::t(lang, "on")
+    } else {
+        i18n::t(lang, "off")
+    };
 
     let title_html = crate::push::format_chat_title_html(&title, chat_id);
     let text = i18n::fill(
@@ -43,13 +47,26 @@ pub(super) async fn render_settings_page(
 
     let pages = format!("|{}|{}", ch_page, chlist_page);
     let buttons = vec![
-        vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_interval"), format!("c|cfgi|{}{}", chat_id, pages))],
-        vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_mode"), format!("c|cfgm|{}{}", chat_id, pages))],
-        vec![InlineKeyboardButton::callback(i18n::t(lang, "settings_source"), format!("c|cfgs|{}{}", chat_id, pages))],
+        vec![InlineKeyboardButton::callback(
+            i18n::t(lang, "settings_interval"),
+            format!("c|cfgi|{}{}", chat_id, pages),
+        )],
+        vec![InlineKeyboardButton::callback(
+            i18n::t(lang, "settings_mode"),
+            format!("c|cfgm|{}{}", chat_id, pages),
+        )],
+        vec![InlineKeyboardButton::callback(
+            i18n::t(lang, "settings_source"),
+            format!("c|cfgs|{}{}", chat_id, pages),
+        )],
         vec![InlineKeyboardButton::callback(
             i18n::t(lang, "settings_caption").replacen(
                 "{}",
-                if cfg.caption_above_media != 0 { i18n::t(lang, "on") } else { i18n::t(lang, "off") },
+                if cfg.caption_above_media != 0 {
+                    i18n::t(lang, "on")
+                } else {
+                    i18n::t(lang, "off")
+                },
                 1,
             ),
             format!("c|cfgcp|{}{}", chat_id, pages),
@@ -58,7 +75,11 @@ pub(super) async fn render_settings_page(
             i18n::t(lang, "settings_lp").replacen("{}", lp_label, 1),
             format!("c|cfglp|{}{}", chat_id, pages),
         )],
-        back_close_row(lang, "back", format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page)),
+        back_close_row(
+            lang,
+            "back",
+            format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
+        ),
     ];
 
     let kb = InlineKeyboardMarkup::new(buttons);
@@ -92,7 +113,12 @@ struct OptionPageSpec {
 }
 
 /// Render an option selection page from a declarative spec.
-async fn render_option_page(bot: &Bot, target: &PageTarget<'_>, spec: &OptionPageSpec, lang: Lang) -> ResponseResult<()> {
+async fn render_option_page(
+    bot: &Bot,
+    target: &PageTarget<'_>,
+    spec: &OptionPageSpec,
+    lang: Lang,
+) -> ResponseResult<()> {
     let mark = |opt: &str| -> &'static str {
         if spec.current == opt && (!spec.require_override_for_mark || spec.overridden) {
             "✓ "
@@ -108,7 +134,10 @@ async fn render_option_page(bot: &Bot, target: &PageTarget<'_>, spec: &OptionPag
                 .map(|(label, value)| {
                     InlineKeyboardButton::callback(
                         format!("{}{}", mark(value), label),
-                        format!("{}|{}|{}{}", spec.cb_prefix, spec.id_seg, value, spec.cb_suffix),
+                        format!(
+                            "{}|{}|{}{}",
+                            spec.cb_prefix, spec.id_seg, value, spec.cb_suffix
+                        ),
                     )
                 })
                 .collect()
@@ -117,7 +146,10 @@ async fn render_option_page(bot: &Bot, target: &PageTarget<'_>, spec: &OptionPag
     if spec.show_inherit {
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "follow_channel"),
-            format!("{}|{}|inherit{}", spec.cb_prefix, spec.id_seg, spec.cb_suffix),
+            format!(
+                "{}|{}|inherit{}",
+                spec.cb_prefix, spec.id_seg, spec.cb_suffix
+            ),
         )]);
     }
     buttons.push(back_close_row(lang, "back", spec.back_cb.clone()));
@@ -138,10 +170,22 @@ pub(super) async fn render_settings_interval(
 ) -> ResponseResult<()> {
     let cfg = load_chat_config(&state.db, chat_id).await;
     let spec = OptionPageSpec {
-        title: i18n::t(lang, "interval_title").replacen("{}", &fmt_interval(lang, cfg.interval_minutes), 1),
+        title: i18n::t(lang, "interval_title").replacen(
+            "{}",
+            &fmt_interval(lang, cfg.interval_minutes),
+            1,
+        ),
         rows: vec![
-            vec![(i18n::t(lang, "5min"), "5".into()), (i18n::t(lang, "10min"), "10".into()), (i18n::t(lang, "30min"), "30".into())],
-            vec![(i18n::t(lang, "3h"), "180".into()), (i18n::t(lang, "6h"), "360".into()), (i18n::t(lang, "12h"), "720".into())],
+            vec![
+                (i18n::t(lang, "5min"), "5".into()),
+                (i18n::t(lang, "10min"), "10".into()),
+                (i18n::t(lang, "30min"), "30".into()),
+            ],
+            vec![
+                (i18n::t(lang, "3h"), "180".into()),
+                (i18n::t(lang, "6h"), "360".into()),
+                (i18n::t(lang, "12h"), "720".into()),
+            ],
         ],
         current: cfg.interval_minutes.to_string(),
         overridden: false,
@@ -167,7 +211,11 @@ pub(super) async fn render_settings_mode(
 ) -> ResponseResult<()> {
     let cfg = load_chat_config(&state.db, chat_id).await;
     let spec = OptionPageSpec {
-        title: i18n::t(lang, "mode_title").replacen("{}", fmt_content_mode(lang, &cfg.content_mode), 1),
+        title: i18n::t(lang, "mode_title").replacen(
+            "{}",
+            fmt_content_mode(lang, &cfg.content_mode),
+            1,
+        ),
         rows: vec![
             vec![(i18n::t(lang, "mode_title_link"), "title_link".into())],
             vec![(i18n::t(lang, "mode_title_summary"), "title_summary".into())],
@@ -200,7 +248,11 @@ pub(super) async fn render_settings_source(
 ) -> ResponseResult<()> {
     let cfg = load_chat_config(&state.db, chat_id).await;
     let spec = OptionPageSpec {
-        title: i18n::t(lang, "source_title").replacen("{}", fmt_source_display(lang, &cfg.source_display), 1),
+        title: i18n::t(lang, "source_title").replacen(
+            "{}",
+            fmt_source_display(lang, &cfg.source_display),
+            1,
+        ),
         rows: vec![
             vec![(i18n::t(lang, "src_title"), "source".into())],
             vec![(i18n::t(lang, "src_author"), "author".into())],
@@ -295,12 +347,24 @@ pub(super) async fn render_feed_interval(
         return Ok(());
     };
     let iv_label = fmt_interval(lang, cfg.interval_minutes);
-    let iv_mark = if cfg.iv_overridden { "· ✏️" } else { "· 🔗" };
+    let iv_mark = if cfg.iv_overridden {
+        "· ✏️"
+    } else {
+        "· 🔗"
+    };
     let spec = OptionPageSpec {
         title: i18n::fill(i18n::t(lang, "interval_title_feed"), &[&iv_label, iv_mark]),
         rows: vec![
-            vec![(i18n::t(lang, "5min"), "5".into()), (i18n::t(lang, "10min"), "10".into()), (i18n::t(lang, "30min"), "30".into())],
-            vec![(i18n::t(lang, "3h"), "180".into()), (i18n::t(lang, "6h"), "360".into()), (i18n::t(lang, "12h"), "720".into())],
+            vec![
+                (i18n::t(lang, "5min"), "5".into()),
+                (i18n::t(lang, "10min"), "10".into()),
+                (i18n::t(lang, "30min"), "30".into()),
+            ],
+            vec![
+                (i18n::t(lang, "3h"), "180".into()),
+                (i18n::t(lang, "6h"), "360".into()),
+                (i18n::t(lang, "12h"), "720".into()),
+            ],
         ],
         current: cfg.interval_minutes.to_string(),
         overridden: cfg.iv_overridden,
@@ -328,7 +392,11 @@ pub(super) async fn render_feed_mode(
         return Ok(());
     };
     let cm_label = fmt_content_mode(lang, &cfg.content_mode);
-    let cm_mark = if cfg.cm_overridden { "· ✏️" } else { "· 🔗" };
+    let cm_mark = if cfg.cm_overridden {
+        "· ✏️"
+    } else {
+        "· 🔗"
+    };
     let spec = OptionPageSpec {
         title: i18n::fill(i18n::t(lang, "mode_title_feed"), &[cm_label, cm_mark]),
         rows: vec![
@@ -365,7 +433,11 @@ pub(super) async fn render_feed_source(
         return Ok(());
     };
     let sd_label = fmt_source_display(lang, &cfg.source_display);
-    let sd_mark = if cfg.sd_overridden { "· ✏️" } else { "· 🔗" };
+    let sd_mark = if cfg.sd_overridden {
+        "· ✏️"
+    } else {
+        "· 🔗"
+    };
     let spec = OptionPageSpec {
         title: i18n::fill(i18n::t(lang, "source_title_feed"), &[sd_label, sd_mark]),
         rows: vec![

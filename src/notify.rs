@@ -43,7 +43,11 @@ async fn send_message_with_pace_flood(
                 let err_str = error_chain_string(&e);
                 match retry.next_action(&err_str) {
                     SendRetryAction::RetryFlood { delay } => {
-                        warn!(chat_id = chat_id, wait_secs = delay.as_secs(), "notification flood control, backing off");
+                        warn!(
+                            chat_id = chat_id,
+                            wait_secs = delay.as_secs(),
+                            "notification flood control, backing off"
+                        );
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -81,7 +85,9 @@ pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) ->
     // alerts (media failures / disabled sources) can otherwise hit Telegram's
     // flood control. Flood errors back off and retry the notification once.
     let first_err = send_message_with_pace_flood(bot, user_id, &html_msg, true, &no_preview).await;
-    let Some(first_err) = first_err else { return true };
+    let Some(first_err) = first_err else {
+        return true;
+    };
     // 403 = the owner never /start'ed the bot (or blocked it): the plain-
     // text fallback would also inevitably 403, so log a prominent warn and
     // skip the fallback, saving one wasted API call.
@@ -110,7 +116,10 @@ pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) ->
     if first_err.contains("message is too long") {
         // The cap above should make this unreachable; do not send a second
         // equally over-long plain-text copy.
-        error!(user = user_id, "notification still too long after truncation; dropping fallback");
+        error!(
+            user = user_id,
+            "notification still too long after truncation; dropping fallback"
+        );
         return false;
     }
     // Downgrade to plain text while keeping anchor destinations visible:
@@ -134,7 +143,10 @@ pub(crate) async fn notify_owner_html(bot: &Bot, state: &AppState, chat_id: &str
             // Whitelist revocation also stops owner-routed alerts; otherwise a
             // removed user would keep receiving feed titles, URLs and errors.
             if !state.config.is_allowed(owner) {
-                warn!(chat_id = chat_id, owner, "cannot notify: owner is no longer whitelisted");
+                warn!(
+                    chat_id = chat_id,
+                    owner, "cannot notify: owner is no longer whitelisted"
+                );
                 return;
             }
             notify_user_html(bot, owner, html_msg).await;
@@ -189,7 +201,14 @@ pub(crate) fn push_line(msg: &mut String, lang: Lang, label_key: &str, value: &s
 /// inside the blockquote, link_label/link_url = optional source/entry link.
 /// i18n::fill (single pass, values never rescanned) keeps a feed title that
 /// contains literal `{}` from swallowing the reason placeholder.
-pub(crate) fn push_fail_msg(lang: Lang, header: &str, feed_title: &str, reason: &str, link_label_key: &str, link_url: &str) -> String {
+pub(crate) fn push_fail_msg(
+    lang: Lang,
+    header: &str,
+    feed_title: &str,
+    reason: &str,
+    link_label_key: &str,
+    link_url: &str,
+) -> String {
     let template = i18n::t(lang, "notif_push_failed");
     let title = push::escape_html(feed_title);
     // `reason` often carries platform response text or an error chain; escape
@@ -225,7 +244,9 @@ pub(crate) async fn notify_oversized_video(
     // extra spaces. The video direct link is no longer listed separately.
     let size_part = ov
         .size
-        .map(|s| i18n::t(lang, "notif_video_size").replacen("{}", &(s / (1024 * 1024)).to_string(), 1))
+        .map(|s| {
+            i18n::t(lang, "notif_video_size").replacen("{}", &(s / (1024 * 1024)).to_string(), 1)
+        })
         .unwrap_or_default();
     let mut msg = if delivered_as_text {
         i18n::t(lang, "notif_video_oversized")
@@ -288,10 +309,7 @@ mod tests {
         push_line(&mut zh, Lang::Zh, "label_message", "https://t.me/example");
         // Unicode escapes keep literal CJK out of the public source tree while
         // still asserting the exact Chinese locale output.
-        assert_eq!(
-            zh,
-            "\n\u{6d88}\u{606f}\u{ff1a}https://t.me/example"
-        );
+        assert_eq!(zh, "\n\u{6d88}\u{606f}\u{ff1a}https://t.me/example");
     }
 
     #[test]
@@ -300,7 +318,12 @@ mod tests {
         push_line(&mut msg, Lang::En, "label_source", "");
         assert!(msg.is_empty());
 
-        push_line(&mut msg, Lang::En, "label_source", "https://example.com/?a=1&b=2");
+        push_line(
+            &mut msg,
+            Lang::En,
+            "label_source",
+            "https://example.com/?a=1&b=2",
+        );
         assert_eq!(msg, "\nSource: https://example.com/?a=1&amp;b=2");
     }
 }

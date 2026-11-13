@@ -8,13 +8,11 @@ use teloxide::types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
 use tracing::{info, warn};
 
 use super::{fetch_sub_or_toast, toast_text};
-use crate::ui::{
-    chat_display_title, deliver, deliver_error_page, nav_row, paginate, PageTarget,
-};
-use crate::push::no_preview;
 use crate::db;
 use crate::i18n::{self, Lang};
+use crate::push::no_preview;
 use crate::state::AppState;
+use crate::ui::{chat_display_title, deliver, deliver_error_page, nav_row, paginate, PageTarget};
 
 /// Handle single unsub callback: delete subscription, notify, then refresh the
 /// panel in place (same page, clamped) so the removed button disappears.
@@ -39,12 +37,23 @@ pub(super) async fn handle_unsub_callback(
         return Ok(());
     };
 
-    let name = sub.feed_title.as_deref().unwrap_or(&sub.feed_url).to_string();
+    let name = sub
+        .feed_title
+        .as_deref()
+        .unwrap_or(&sub.feed_url)
+        .to_string();
     let feed_url = sub.feed_url.clone();
     let chat_id = sub.chat_id.clone();
 
     if let Err(e) = db::delete_subscription(&state.db, sub_id).await {
-        bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1))).await.ok();
+        bot.answer_callback_query(qid.clone())
+            .text(toast_text(i18n::t(lang, "op_failed").replacen(
+                "{:#}",
+                &format!("{:#}", e),
+                1,
+            )))
+            .await
+            .ok();
         return Ok(());
     }
 
@@ -65,11 +74,22 @@ pub(super) async fn handle_unsub_callback(
         bot.send_message(chat, msg)
             .parse_mode(ParseMode::Html)
             .link_preview_options(no_preview())
-            .await.ok();
+            .await
+            .ok();
     }
 
     // Refresh the panel in place so the deleted source's button disappears.
-    render_unsub_panel(bot, PageTarget::Edit(q), &chat_id, state, page, ch_page, chlist_page, lang).await?;
+    render_unsub_panel(
+        bot,
+        PageTarget::Edit(q),
+        &chat_id,
+        state,
+        page,
+        ch_page,
+        chlist_page,
+        lang,
+    )
+    .await?;
 
     Ok(())
 }
@@ -118,8 +138,7 @@ pub(super) async fn render_unsub_panel(
             &[&page_s, &pages_s, &count_s],
         )
     } else {
-        i18n::t(lang, "unsub_panel_single")
-            .replacen("{}", &subs.len().to_string(), 1)
+        i18n::t(lang, "unsub_panel_single").replacen("{}", &subs.len().to_string(), 1)
     };
 
     let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
@@ -127,11 +146,18 @@ pub(super) async fn render_unsub_panel(
         let name = sub.feed_title.as_deref().unwrap_or(&sub.feed_url);
         let flag = if sub.active == 0 { " ⏸" } else { "" };
         buttons.push(vec![InlineKeyboardButton::callback(
-            format!("{}. {}{}", start + offset + 1, crate::htmltext::truncate_text(name, 30), flag),
+            format!(
+                "{}. {}{}",
+                start + offset + 1,
+                crate::htmltext::truncate_text(name, 30),
+                flag
+            ),
             format!("c|unsub|{}|{}|{}|{}", sub.id, page, ch_page, chlist_page),
         )]);
     }
-    if let Some(nav) = nav_row(page, total_pages, lang, |p| format!("c|unsubpg|{}|{}|{}|{}", chat_id, p, ch_page, chlist_page)) {
+    if let Some(nav) = nav_row(page, total_pages, lang, |p| {
+        format!("c|unsubpg|{}|{}|{}|{}", chat_id, p, ch_page, chlist_page)
+    }) {
         buttons.push(nav);
     }
     // The "unsubscribe all" entry point appears only in this panel (there is no /unsub_all command);
@@ -139,7 +165,10 @@ pub(super) async fn render_unsub_panel(
     // #36: pass through the current page number so the confirmation page's "Back" button can restore the original page.
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "unsub_all_btn"),
-        format!("c|unsuballask|{}|{}|{}|{}", chat_id, page, ch_page, chlist_page),
+        format!(
+            "c|unsuballask|{}|{}|{}|{}",
+            chat_id, page, ch_page, chlist_page
+        ),
     )]);
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "unsub_back"),
@@ -193,8 +222,17 @@ pub(super) async fn render_unsub_all_confirm(
     );
 
     let kb = InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback(i18n::t(lang, "unsuball_confirm_btn"), format!("c|unsuball|{}|{}|{}|{}", chat_id, ch_page, page, chlist_page)),
-        InlineKeyboardButton::callback(i18n::t(lang, "back"), format!("c|unsubpg|{}|{}|{}|{}", chat_id, page, ch_page, chlist_page)),
+        InlineKeyboardButton::callback(
+            i18n::t(lang, "unsuball_confirm_btn"),
+            format!(
+                "c|unsuball|{}|{}|{}|{}",
+                chat_id, ch_page, page, chlist_page
+            ),
+        ),
+        InlineKeyboardButton::callback(
+            i18n::t(lang, "back"),
+            format!("c|unsubpg|{}|{}|{}|{}", chat_id, page, ch_page, chlist_page),
+        ),
     ]]);
 
     deliver(bot, &target, &text, Some(kb)).await?;
@@ -237,13 +275,23 @@ pub(super) async fn handle_unsub_all_callback(
     let subs = match db::get_subscriptions(&state.db, chat_id).await {
         Ok(s) => s,
         Err(e) => {
-            bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1))).await.ok();
+            bot.answer_callback_query(qid.clone())
+                .text(toast_text(i18n::t(lang, "op_failed").replacen(
+                    "{:#}",
+                    &format!("{:#}", e),
+                    1,
+                )))
+                .await
+                .ok();
             return Ok(());
         }
     };
 
     if subs.is_empty() {
-        bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "unsub_no_subs")).await.ok();
+        bot.answer_callback_query(qid.clone())
+            .text(i18n::t(lang, "unsub_no_subs"))
+            .await
+            .ok();
         return Ok(());
     }
 
@@ -287,7 +335,10 @@ pub(super) async fn handle_unsub_all_callback(
     let target_chat = match q.message.as_ref().map(|m| m.chat().id) {
         Some(t) => t,
         None => {
-            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "unsuball_no_target")).await.ok();
+            bot.answer_callback_query(qid.clone())
+                .text(i18n::t(lang, "unsuball_no_target"))
+                .await
+                .ok();
             return Ok(());
         }
     };
@@ -303,15 +354,33 @@ pub(super) async fn handle_unsub_all_callback(
                 error = format!("{:#}", e),
                 "failed to delete all subscriptions (transaction rolled back)"
             );
-            bot.answer_callback_query(qid.clone()).text(toast_text(i18n::t(lang, "op_failed").replacen("{:#}", &format!("{:#}", e), 1))).await.ok();
+            bot.answer_callback_query(qid.clone())
+                .text(toast_text(i18n::t(lang, "op_failed").replacen(
+                    "{:#}",
+                    &format!("{:#}", e),
+                    1,
+                )))
+                .await
+                .ok();
             // Restore the confirmation page when possible. A failed restore
             // must still leave the user with actionable feedback instead of a
             // silent "Processing…" panel.
-            if let Err(render_err) =
-                render_unsub_all_confirm(bot, PageTarget::Edit(q), chat_id, state, page, ch_page, chlist_page, lang).await
+            if let Err(render_err) = render_unsub_all_confirm(
+                bot,
+                PageTarget::Edit(q),
+                chat_id,
+                state,
+                page,
+                ch_page,
+                chlist_page,
+                lang,
+            )
+            .await
             {
                 warn!(chat_id = chat_id, error = %render_err, "unsuball: failed to restore confirmation page");
-                bot.send_message(target_chat, i18n::t(lang, "op_failed_retry")).await.ok();
+                bot.send_message(target_chat, i18n::t(lang, "op_failed_retry"))
+                    .await
+                    .ok();
             }
             return Ok(());
         }
@@ -320,7 +389,11 @@ pub(super) async fn handle_unsub_all_callback(
     // feed_configs overrides are dropped inside delete_all_subscriptions'
     // transaction, so re-subscribes start from channel defaults.
 
-    info!(chat_id = chat_id, count = count, "all subscriptions removed");
+    info!(
+        chat_id = chat_id,
+        count = count,
+        "all subscriptions removed"
+    );
 
     bot.answer_callback_query(qid.clone()).await.ok();
     // Replace the old OPML file with a plain notice, matching the single
@@ -344,12 +417,10 @@ pub(super) async fn handle_unsub_all_callback(
     // Retire the confirmation panel in place; keep a button back to the
     // channel page. Fall back to a fresh message when editing is impossible.
     if let Some(m) = q.message.as_ref() {
-        let kb = InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback(
-                i18n::t(lang, "unsuball_view"),
-                format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
-            ),
-        ]]);
+        let kb = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+            i18n::t(lang, "unsuball_view"),
+            format!("c|ch|{}|{}|{}", chat_id, ch_page, chlist_page),
+        )]]);
         if let Err(e) = bot
             .edit_message_text(m.chat().id, m.id(), i18n::t(lang, "closed"))
             .reply_markup(kb.clone())

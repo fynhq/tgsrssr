@@ -61,7 +61,11 @@ pub async fn register_fetch_job(
         })?)
         .await?;
 
-    info!(interval_min = interval, tick_min = interval, "fetch job registered");
+    info!(
+        interval_min = interval,
+        tick_min = interval,
+        "fetch job registered"
+    );
     Ok(())
 }
 
@@ -84,14 +88,20 @@ pub async fn register_heal_job(sched: &JobScheduler, state: AppState) -> anyhow:
             Box::pin(async move {
                 match db::reenable_due_auto_disabled(&state.db, AUTO_HEAL_COOLDOWN_HOURS).await {
                     Ok(0) => {}
-                    Ok(n) => info!(count = n, "auto-heal: re-enabled subscriptions after cooldown"),
+                    Ok(n) => info!(
+                        count = n,
+                        "auto-heal: re-enabled subscriptions after cooldown"
+                    ),
                     Err(e) => error!(error = %e, "auto-heal job failed"),
                 }
             })
         })?)
         .await?;
 
-    info!(cooldown_hours = AUTO_HEAL_COOLDOWN_HOURS, "auto-heal job registered");
+    info!(
+        cooldown_hours = AUTO_HEAL_COOLDOWN_HOURS,
+        "auto-heal job registered"
+    );
     Ok(())
 }
 
@@ -295,24 +305,28 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     // into the spawn closure, the source identifier can no longer be obtained
     // at the join site and failure logs would lose their locator info
     // (added in v1.10.7).
-    let mut handles: Vec<(String, tokio::task::JoinHandle<anyhow::Result<FeedStatus>>)> = Vec::new();
+    let mut handles: Vec<(String, tokio::task::JoinHandle<anyhow::Result<FeedStatus>>)> =
+        Vec::new();
     for (idx, (sub, cfg)) in rss_subs.into_iter().enumerate() {
         let state = state.clone();
         let bot = bot.clone();
         let stats = stats.clone();
         let process_sem = process_sem.clone();
         let feed_url = sub.feed_url.clone();
-        handles.push((feed_url, tokio::spawn(async move {
-            // Staggered start: avoid all sources hitting their respective
-            // servers/proxies concurrently at the same instant, forming a
-            // momentary burst (inspired by rsstt's sharded staggered
-            // scheduling, simplified to sequential delays at this scale).
-            if idx > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(600 * idx as u64)).await;
-            }
-            let _permit = process_sem.acquire_owned().await?;
-            process_feed(&state, &bot, sub, cfg, &stats).await
-        })));
+        handles.push((
+            feed_url,
+            tokio::spawn(async move {
+                // Staggered start: avoid all sources hitting their respective
+                // servers/proxies concurrently at the same instant, forming a
+                // momentary burst (inspired by rsstt's sharded staggered
+                // scheduling, simplified to sequential delays at this scale).
+                if idx > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(600 * idx as u64)).await;
+                }
+                let _permit = process_sem.acquire_owned().await?;
+                process_feed(&state, &bot, sub, cfg, &stats).await
+            }),
+        ));
     }
 
     // Platform sources (weibo/X): strictly serial + random 3-8 second wait
@@ -449,7 +463,10 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 // Hysteresis threshold reached and not currently down: report
                 // the anomaly (notify the single admin)
                 if streak >= HYSTERESIS_ROUNDS && !is_down {
-                    let err = last_err.get(&p).map(String::as_str).unwrap_or("unknown error");
+                    let err = last_err
+                        .get(&p)
+                        .map(String::as_str)
+                        .unwrap_or("unknown error");
                     maybe_notify_platform_down(bot, state, p, err).await;
                 }
             }
@@ -459,7 +476,9 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             if let Some(streak) = read_streak(state, &streak_key, p).await {
                 // The success direction counts with negative numbers (-1, -2, ...)
                 let ok_streak = if streak < 0 { streak - 1 } else { -1 };
-                if let Err(e) = db::set_setting(&state.db, &streak_key, &ok_streak.to_string()).await {
+                if let Err(e) =
+                    db::set_setting(&state.db, &streak_key, &ok_streak.to_string()).await
+                {
                     warn!(platform = p, error = %e, "streak write failed");
                 }
 
@@ -618,14 +637,20 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
         );
         match db::auto_disable_subscription(&state.db, sub.id).await {
             Ok(true) => {
-                let name = if feed_title.is_empty() { &cfg.feed_url } else { feed_title };
+                let name = if feed_title.is_empty() {
+                    &cfg.feed_url
+                } else {
+                    feed_title
+                };
                 let msg = i18n::t(lang, "notif_outbox_full")
                     .replacen("{}", &push::escape_html(name), 1)
                     .replacen("{}", &OUTBOX_PER_FEED_LIMIT.to_string(), 1);
                 notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
             }
             Ok(false) => {}
-            Err(err) => warn!(feed = %cfg.feed_url, error = %err, "outbox-full auto-disable failed"),
+            Err(err) => {
+                warn!(feed = %cfg.feed_url, error = %err, "outbox-full auto-disable failed")
+            }
         }
         return Ok(SendFailureAction::DeferBreak);
     }
@@ -806,7 +831,17 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
         let entry_link = fetcher::entry_link(entry).unwrap_or_default();
         if notify_oversized {
             for ov in oversized {
-                notify_oversized_video(bot, lang, owner_id, chat_title, &entry_link, None, false, ov).await;
+                notify_oversized_video(
+                    bot,
+                    lang,
+                    owner_id,
+                    chat_title,
+                    &entry_link,
+                    None,
+                    false,
+                    ov,
+                )
+                .await;
             }
         }
         if has_download_warnings {
@@ -820,7 +855,8 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
                     return Ok(MediaGateAction::DeferContinue);
                 }
             };
-            let step = policy::media_retry_step(true, true, Ok(stored), !notify_warnings.is_empty());
+            let step =
+                policy::media_retry_step(true, true, Ok(stored), !notify_warnings.is_empty());
             match step {
                 policy::MediaRetryStep::Abandon { fail_count } => {
                     warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "MediaOnly download retries exhausted, abandoning");
@@ -828,7 +864,11 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
                         lang,
                         i18n::t(lang, "notif_abandoned"),
                         feed_title,
-                        &i18n::t(lang, "notif_media_dl_fail").replacen("{}", &fail_count.to_string(), 1),
+                        &i18n::t(lang, "notif_media_dl_fail").replacen(
+                            "{}",
+                            &fail_count.to_string(),
+                            1,
+                        ),
                         "label_entry",
                         &entry_link,
                     );
@@ -839,7 +879,9 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
                     db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, eid).await?;
                 }
                 policy::MediaRetryStep::Retry { fail_count, notify } => {
-                    if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
+                    if let Err(e) =
+                        db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await
+                    {
                         warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
                         return Ok(MediaGateAction::DeferContinue);
                     }
@@ -884,7 +926,9 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
         };
         match policy::media_retry_step(false, true, Ok(stored), false) {
             policy::MediaRetryStep::Retry { fail_count, .. } => {
-                if let Err(e) = db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await {
+                if let Err(e) =
+                    db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await
+                {
                     warn!(entry_id = %eid, feed = %cfg.feed_url, error = %e, "media_dl_fail counter write failed, deferring without notice");
                     return Ok(MediaGateAction::DeferContinue);
                 }
@@ -894,8 +938,8 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
             policy::MediaRetryStep::Degrade { fail_count } => {
                 warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "media download retries exhausted, degrading entry");
                 db::delete_setting(&state.db, &retry_key).await.ok();
-                dl_retry_note = i18n::t(lang, "notif_dl_retried")
-                    .replacen("{}", &fail_count.to_string(), 1);
+                dl_retry_note =
+                    i18n::t(lang, "notif_dl_retried").replacen("{}", &fail_count.to_string(), 1);
             }
             _ => {}
         }
@@ -1178,7 +1222,9 @@ async fn process_feed(
             if sub.title_overridden == 0 {
                 if let Some(t) = &fr.feed_title {
                     if Some(t.as_str()) != sub.feed_title.as_deref() {
-                        db::rename_subscription_auto(&state.db, sub.id, t).await.ok();
+                        db::rename_subscription_auto(&state.db, sub.id, t)
+                            .await
+                            .ok();
                     }
                 }
             }
@@ -1223,7 +1269,8 @@ async fn process_feed(
             // treated as "no filter": that would push blocked content and mark
             // it sent, making the blocklist silently lose an entry. Defer the
             // whole feed this round, consistent with the sent/outbox reads.
-            let filter_cfg = match db::get_feed_filter(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+            let filter_cfg = match db::get_feed_filter(&state.db, &cfg.chat_id, &cfg.feed_url).await
+            {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     warn!(feed = %cfg.feed_url, error = %e, "feed filter read failed, deferring feed");
@@ -1248,11 +1295,7 @@ async fn process_feed(
             // (never-pruned) sent history.
             // A read error must fail closed and leave the headers untouched,
             // so the whole feed is retried next round instead of being pushed.
-            let wanted_ids: Vec<String> = fr
-                .entries
-                .iter()
-                .map(fetcher::entry_id)
-                .collect();
+            let wanted_ids: Vec<String> = fr.entries.iter().map(fetcher::entry_id).collect();
             let known_sent = match db::sent_entry_ids_in_window(
                 &state.db,
                 &cfg.chat_id,
@@ -1271,22 +1314,23 @@ async fn process_feed(
                     return Ok(FeedStatus::Failed);
                 }
             };
-            let outbox_ids = match db::outbox_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        feed = %cfg.feed_url,
-                        error = %e,
-                        "outbox batch query failed after fetch, deferring feed"
-                    );
-                    return Ok(FeedStatus::Failed);
-                }
-            };
+            let outbox_ids =
+                match db::outbox_entry_ids(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            feed = %cfg.feed_url,
+                            error = %e,
+                            "outbox batch query failed after fetch, deferring feed"
+                        );
+                        return Ok(FeedStatus::Failed);
+                    }
+                };
             // Cooperative deadline covers filtering too: a 20MB feed can hold
             // tens of thousands of entries, and the old code created the
             // deadline only after the filter loop.
-            let deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_secs(FEED_DEADLINE_SECS);
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(FEED_DEADLINE_SECS);
             // One storage-failure notice per feed per round: a global volume
             // outage would otherwise send one notice per media entry.
             let mut storage_notice_sent = false;
@@ -1394,9 +1438,16 @@ async fn process_feed(
                     deferred = true;
                     if !storage_notice_sent {
                         storage_notice_sent = true;
-                        let name = if feed_title.is_empty() { &cfg.feed_url } else { &feed_title };
-                        let msg = i18n::t(lang, "notif_media_storage")
-                            .replacen("{}", &push::escape_html(name), 1);
+                        let name = if feed_title.is_empty() {
+                            &cfg.feed_url
+                        } else {
+                            &feed_title
+                        };
+                        let msg = i18n::t(lang, "notif_media_storage").replacen(
+                            "{}",
+                            &push::escape_html(name),
+                            1,
+                        );
                         notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
                     }
                     continue;
@@ -1465,7 +1516,16 @@ async fn process_feed(
                     // (H1 fix: it used to be a verbatim duplicate of the outbox
                     // retry path; the poll-resend logic was fixed twice because
                     // of this, v1.9.3/v1.9.6).
-                    push::send_text_only(bot, chat_id, entry, &feed_title, author.as_deref(), opts, meta).await
+                    push::send_text_only(
+                        bot,
+                        chat_id,
+                        entry,
+                        &feed_title,
+                        author.as_deref(),
+                        opts,
+                        meta,
+                    )
+                    .await
                 } else {
                     push::send_entry_with_media(
                         bot,
@@ -1672,7 +1732,10 @@ async fn maybe_notify_platform_down(bot: &Bot, state: &AppState, platform: &str,
         if let Err(e) = db::set_setting(&state.db, &health_key, "ok").await {
             warn!(platform = platform, error = %e, "failed to restore health bit after undelivered alert");
         } else {
-            warn!(platform = platform, "platform-down alert undelivered; will retry next round");
+            warn!(
+                platform = platform,
+                "platform-down alert undelivered; will retry next round"
+            );
         }
     }
 }
@@ -1712,16 +1775,21 @@ async fn maybe_notify_platform_recovered(bot: &Bot, state: &AppState, platform: 
 
     // Clear the cookie-expired flag (the /cookies panel no longer shows
     // "expired")
-    db::set_setting(&state.db, &db::setting_key::cookie_expired_notified(platform), "0")
-        .await
-        .ok();
+    db::set_setting(
+        &state.db,
+        &db::setting_key::cookie_expired_notified(platform),
+        "0",
+    )
+    .await
+    .ok();
 
     let label = crate::platforms::find_platform(platform)
         .map(|p| p.label)
         .unwrap_or(platform);
     notify_admins_html(bot, state, |lang| {
         i18n::t(lang, "notif_platform_recovered").replacen("{}", label, 1)
-    }).await;
+    })
+    .await;
 }
 
 // ===== Outbox retry (persistent retry queue for failed sends) =====
@@ -1735,15 +1803,18 @@ pub async fn register_outbox_retry_job(
     bot: Bot,
 ) -> anyhow::Result<()> {
     sched
-        .add(Job::new_async("0 0,5,10,15,20,25,30,35,40,45,50,55 * * * *", move |_uuid, _l| {
-            let state = state.clone();
-            let bot = bot.clone();
-            Box::pin(async move {
-                if let Err(e) = run_outbox_retry(&state, &bot).await {
-                    error!(error = %e, "outbox retry cycle failed");
-                }
-            })
-        })?)
+        .add(Job::new_async(
+            "0 0,5,10,15,20,25,30,35,40,45,50,55 * * * *",
+            move |_uuid, _l| {
+                let state = state.clone();
+                let bot = bot.clone();
+                Box::pin(async move {
+                    if let Err(e) = run_outbox_retry(&state, &bot).await {
+                        error!(error = %e, "outbox retry cycle failed");
+                    }
+                })
+            },
+        )?)
         .await?;
     Ok(())
 }
@@ -1752,12 +1823,12 @@ pub async fn register_outbox_retry_job(
 /// Index = attempts (0-based after first failure). Capped at 2h.
 fn outbox_backoff_secs(attempts: i64) -> i64 {
     match attempts {
-        0 => 60,       // 1 min
-        1 => 300,      // 5 min
-        2 => 900,      // 15 min
-        3 => 1800,     // 30 min
-        4 => 3600,     // 1 hour
-        _ => 7200,     // 2 hours (cap)
+        0 => 60,   // 1 min
+        1 => 300,  // 5 min
+        2 => 900,  // 15 min
+        3 => 1800, // 30 min
+        4 => 3600, // 1 hour
+        _ => 7200, // 2 hours (cap)
     }
 }
 
@@ -1832,7 +1903,11 @@ async fn record_send_failure(
     let permanent = sendpolicy::is_permanent_chat_error(&err_str);
     match db::auto_disable_subscription(&state.db, sub.id).await {
         Ok(true) => {
-            let name = if feed_title.is_empty() { &cfg.feed_url } else { feed_title };
+            let name = if feed_title.is_empty() {
+                &cfg.feed_url
+            } else {
+                feed_title
+            };
             let msg = i18n::t(lang, "notif_send_failed_disabled")
                 .replacen("{}", &push::escape_html(name), 1)
                 .replacen("{}", &count.to_string(), 1);
@@ -1855,7 +1930,9 @@ async fn record_send_failure(
 }
 
 async fn clear_send_failure(state: &AppState, chat_id: &str, feed_url: &str) {
-    if let Err(e) = db::delete_setting(&state.db, &db::setting_key::send_fail(chat_id, feed_url)).await {
+    if let Err(e) =
+        db::delete_setting(&state.db, &db::setting_key::send_fail(chat_id, feed_url)).await
+    {
         debug!(feed = %feed_url, error = %e, "failed to clear send-failure counter");
     }
 }
@@ -1906,7 +1983,8 @@ async fn abandon_outbox_row(bot: &Bot, state: &AppState, row: &db::OutboxRow, re
         entry_link.as_deref().unwrap_or(""),
     );
     notify_owner_html(bot, state, &row.chat_id, &msg).await;
-    if let Err(e) = db::mark_entry_sent(&state.db, &row.chat_id, &row.feed_url, &row.entry_id).await {
+    if let Err(e) = db::mark_entry_sent(&state.db, &row.chat_id, &row.feed_url, &row.entry_id).await
+    {
         // Keep the row: deleting it without the sent marker would let the
         // next fetch re-push the entry, fail again, and re-enqueue it, turning
         // the abandon path into a periodic notification loop. The next retry
@@ -1959,7 +2037,12 @@ async fn maybe_notify_outbox_media_lost(
         .replacen("{}", &remaining.to_string(), 1)
         .replacen("{}", &push::escape_html(&row.feed_title), 1);
     let entry_link = extract_entry_link_from_json(&row.entry_json);
-    push_line(&mut msg, lang, "label_source", entry_link.as_deref().unwrap_or(""));
+    push_line(
+        &mut msg,
+        lang,
+        "label_source",
+        entry_link.as_deref().unwrap_or(""),
+    );
     notify_owner_html(bot, state, &row.chat_id, &msg).await;
     if let Err(e) = db::set_setting(&state.db, &key, "1").await {
         warn!(entry_id = %row.entry_id, error = %e, "outbox media-lost flag write failed, notice may repeat");
@@ -2074,10 +2157,8 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         };
         let had_media = !all_media.is_empty();
         let original_count = all_media.len();
-        let media_items: Vec<crate::media::MediaItem> = all_media
-            .into_iter()
-            .filter(|m| m.path.exists())
-            .collect();
+        let media_items: Vec<crate::media::MediaItem> =
+            all_media.into_iter().filter(|m| m.path.exists()).collect();
         let media_lost = had_media && media_items.len() < original_count;
 
         // Reconstruct render opts BEFORE the MediaOnly check: content_mode is
@@ -2139,14 +2220,8 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             // visible to the owner. One-shot per outbox row (a retry loop can
             // run for 72h); the flag is removed on success/abandon and swept
             // by cleanup if the row is removed elsewhere.
-            maybe_notify_outbox_media_lost(
-                bot,
-                state,
-                &row,
-                original_count,
-                media_items.len(),
-            )
-            .await;
+            maybe_notify_outbox_media_lost(bot, state, &row, original_count, media_items.len())
+                .await;
         }
         let chat_id: i64 = match row.chat_id.parse() {
             Ok(id) => id,
@@ -2199,7 +2274,16 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             // converged with the main push path into a single function; the
             // poll-resend logic had previously been fixed twice due to dual-path
             // drift, v1.9.3/v1.9.6).
-            push::send_text_only(bot, chat_id, &entry, &row.feed_title, author, opts, meta_ref).await
+            push::send_text_only(
+                bot,
+                chat_id,
+                &entry,
+                &row.feed_title,
+                author,
+                opts,
+                meta_ref,
+            )
+            .await
         } else {
             push::send_entry_with_media(
                 bot,
@@ -2370,12 +2454,7 @@ mod tests {
             now
         ));
         // Legacy row (attempts>0, no first_attempt_at): use created_at.
-        assert!(outbox_abandon_due(
-            now - OUTBOX_ABANDON_SECS,
-            None,
-            1,
-            now
-        ));
+        assert!(outbox_abandon_due(now - OUTBOX_ABANDON_SECS, None, 1, now));
     }
 
     #[test]

@@ -21,7 +21,10 @@ use crate::try_or_reply;
 /// (the Bot API rejects subtag forms like `zh-hans`, so one `zh` list covers
 /// Simplified and Traditional clients alike).
 #[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "RSS subscription bot commands")]
+#[command(
+    rename_rule = "lowercase",
+    description = "RSS subscription bot commands"
+)]
 pub enum Command {
     #[command(description = "Help")]
     Start,
@@ -154,7 +157,9 @@ pub async fn handle_command(
 /// honoured the client language_code while callback panels fell straight to
 /// English for users who had not yet run /start).
 pub async fn user_lang(state: &AppState, user_id: i64, msg: Option<&Message>) -> Lang {
-    let code = msg.and_then(|m| m.from.as_ref()).and_then(|u| u.language_code.as_deref());
+    let code = msg
+        .and_then(|m| m.from.as_ref())
+        .and_then(|u| u.language_code.as_deref());
     crate::langpref::resolve_lang(state, user_id, code).await
 }
 
@@ -173,7 +178,12 @@ fn about_text(lang: Lang) -> String {
     i18n::t(lang, "start_text").replace("{}", &version_link)
 }
 
-async fn handle_start(bot: &Bot, msg: &Message, state: &AppState, user_id: i64) -> ResponseResult<()> {
+async fn handle_start(
+    bot: &Bot,
+    msg: &Message,
+    state: &AppState,
+    user_id: i64,
+) -> ResponseResult<()> {
     // Detect language from Telegram client and persist (first /start only sets it;
     // subsequent /start reads DB preference if already set).
     let code = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
@@ -222,10 +232,16 @@ async fn handle_set(
             user_id,
             0,
             lang,
-        ).await?;
+        )
+        .await?;
     } else {
         // Direct channel page
-        let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, args, user_id, lang).await);
+        let chat_id = try_or_reply!(
+            bot,
+            msg.chat.id,
+            lang,
+            resolve_chat_id(state, args, user_id, lang).await
+        );
         crate::ui::render_channel_page(
             bot,
             crate::ui::PageTarget::Send(msg.chat.id),
@@ -234,14 +250,21 @@ async fn handle_set(
             0,
             0,
             lang,
-        ).await?;
+        )
+        .await?;
     }
     Ok(())
 }
 
 // ===== /list =====
 
-async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang: Lang) -> ResponseResult<()> {
+async fn handle_list(
+    bot: &Bot,
+    msg: &Message,
+    state: &AppState,
+    args: &str,
+    lang: Lang,
+) -> ResponseResult<()> {
     let target = match resolve_target_input(msg, args) {
         Some(t) => t,
         None => {
@@ -252,11 +275,27 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         }
     };
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-    let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, &target, user_id, lang).await);
-    let subs = try_or_reply!(bot, msg.chat.id, lang, db::get_subscriptions(&state.db, &chat_id).await);
+    let chat_id = try_or_reply!(
+        bot,
+        msg.chat.id,
+        lang,
+        resolve_chat_id(state, &target, user_id, lang).await
+    );
+    let subs = try_or_reply!(
+        bot,
+        msg.chat.id,
+        lang,
+        db::get_subscriptions(&state.db, &chat_id).await
+    );
 
-    let chat = try_or_reply!(bot, msg.chat.id, lang, db::get_chat(&state.db, &chat_id).await);
-    let title = crate::ui::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), &chat_id);
+    let chat = try_or_reply!(
+        bot,
+        msg.chat.id,
+        lang,
+        db::get_chat(&state.db, &chat_id).await
+    );
+    let title =
+        crate::ui::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), &chat_id);
 
     if subs.is_empty() {
         let title_html = push::format_chat_title_html(&title, &chat_id);
@@ -323,7 +362,8 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 
     let mut first_msg: Option<teloxide::types::MessageId> = None;
     for (i, chunk) in chunks.iter().enumerate() {
-        let mut req = bot.send_message(msg.chat.id, chunk)
+        let mut req = bot
+            .send_message(msg.chat.id, chunk)
             .parse_mode(ParseMode::Html)
             .link_preview_options(no_preview());
         // All chunks uniformly reply to the first message (flat structure, not chained).
@@ -343,27 +383,43 @@ async fn handle_list(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 
 // ===== /sub =====
 
-async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang: Lang) -> ResponseResult<()> {
+async fn handle_sub(
+    bot: &Bot,
+    msg: &Message,
+    state: &AppState,
+    args: &str,
+    lang: Lang,
+) -> ResponseResult<()> {
     let parts: Vec<&str> = args.split_whitespace().collect();
 
     // Determine target channel + URL list (commands are private-chat only):
     // the first token must be an explicit channel reference (@name or negative
     // ID); everything after it is a URL. A bare URL is not accepted as a
     // channel, and there is no "current chat" fallback.
-    let (channel_input, urls): (String, &[&str]) = if !parts.is_empty() && looks_like_chat_ref(parts[0]) {
-        (parts[0].to_string(), &parts[1..])
-    } else {
-        bot.send_message(
-            msg.chat.id,
-            i18n::t(lang, "sub_usage"),
-        ).parse_mode(ParseMode::Html).await?;
-        return Ok(());
-    };
+    let (channel_input, urls): (String, &[&str]) =
+        if !parts.is_empty() && looks_like_chat_ref(parts[0]) {
+            (parts[0].to_string(), &parts[1..])
+        } else {
+            bot.send_message(msg.chat.id, i18n::t(lang, "sub_usage"))
+                .parse_mode(ParseMode::Html)
+                .await?;
+            return Ok(());
+        };
 
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     let allow_trusted_private = state.config.trusted_private_allowed(user_id);
-    let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, &channel_input, user_id, lang).await);
-    try_or_reply!(bot, msg.chat.id, lang, db::ensure_chat_config(&state.db, &chat_id).await);
+    let chat_id = try_or_reply!(
+        bot,
+        msg.chat.id,
+        lang,
+        resolve_chat_id(state, &channel_input, user_id, lang).await
+    );
+    try_or_reply!(
+        bot,
+        msg.chat.id,
+        lang,
+        db::ensure_chat_config(&state.db, &chat_id).await
+    );
 
     // Normalize + dedupe once: quota checks must count distinct URLs (a URL
     // repeated in one command is a single subscription), and the 10-URL cap
@@ -386,15 +442,22 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
         }
     }
     if normalized.is_empty() {
-        let key = if scheme_rejected { "test_bad_url" } else { "sub_no_valid" };
+        let key = if scheme_rejected {
+            "test_bad_url"
+        } else {
+            "sub_no_valid"
+        };
         bot.send_message(msg.chat.id, i18n::t(lang, key)).await?;
         return Ok(());
     }
     if normalized.len() > crate::limits::MAX_URLS_PER_SUB {
         bot.send_message(
             msg.chat.id,
-            i18n::t(lang, "sub_too_many_urls")
-                .replacen("{}", &crate::limits::MAX_URLS_PER_SUB.to_string(), 1),
+            i18n::t(lang, "sub_too_many_urls").replacen(
+                "{}",
+                &crate::limits::MAX_URLS_PER_SUB.to_string(),
+                1,
+            ),
         )
         .parse_mode(ParseMode::Html)
         .await?;
@@ -407,14 +470,22 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
     let admission = state.user_sub_lock(user_id).await;
     let _admission_guard = admission.lock().await;
 
-    let existing_urls =
-        try_or_reply!(bot, msg.chat.id, lang, db::subscription_urls_for_chat(&state.db, &chat_id).await);
+    let existing_urls = try_or_reply!(
+        bot,
+        msg.chat.id,
+        lang,
+        db::subscription_urls_for_chat(&state.db, &chat_id).await
+    );
     let new_urls: Vec<&String> = normalized
         .iter()
         .filter(|u| !existing_urls.iter().any(|e| e == *u))
         .collect();
-    let chat_count =
-        try_or_reply!(bot, msg.chat.id, lang, db::count_subscriptions_for_chat(&state.db, &chat_id).await);
+    let chat_count = try_or_reply!(
+        bot,
+        msg.chat.id,
+        lang,
+        db::count_subscriptions_for_chat(&state.db, &chat_id).await
+    );
     let chat_cap = state.config.max_subscriptions_per_chat;
     if !new_urls.is_empty()
         && !crate::limits::within_cap(chat_cap, chat_count, new_urls.len() as i64)
@@ -438,11 +509,7 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
         );
         let user_cap = state.config.max_subscriptions_per_user;
         if !new_urls.is_empty()
-            && !crate::limits::within_cap(
-                user_cap,
-                owned_urls.len() as i64,
-                new_urls.len() as i64,
-            )
+            && !crate::limits::within_cap(user_cap, owned_urls.len() as i64, new_urls.len() as i64)
         {
             bot.send_message(
                 msg.chat.id,
@@ -495,16 +562,20 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
         let existing = match db::get_subscription_by_url(&state.db, &chat_id, url_str).await {
             Ok(v) => v,
             Err(e) => {
-                results.push(
-                    i18n::t(lang, "sub_check_failed")
-                        .replacen("{}", &push::escape_html(&format!("{:#}", e)), 1),
-                );
+                results.push(i18n::t(lang, "sub_check_failed").replacen(
+                    "{}",
+                    &push::escape_html(&format!("{:#}", e)),
+                    1,
+                ));
                 continue;
             }
         };
         if let Some(ref sub) = existing {
             if sub.active == 1 {
-                let display_title = sub.feed_title.clone().unwrap_or_else(|| url_str.to_string());
+                let display_title = sub
+                    .feed_title
+                    .clone()
+                    .unwrap_or_else(|| url_str.to_string());
                 let url_attr = push::escape_attr(url_str);
                 let title_html = push::escape_html(&display_title);
                 results.push(i18n::fill(
@@ -548,17 +619,25 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
         // a mark failure deleted it. The transaction makes the rollback
         // implicit and cannot touch pre-existing data.
         let ids: Vec<String> = fr.entries.iter().map(fetcher::entry_id).collect();
-        if let Err(e) = db::add_subscription_with_sent(&state.db, &chat_id, url_str, title.as_deref(), &ids).await {
-            results.push(
-                i18n::t(lang, "sub_add_failed")
-                    .replacen("{}", &push::escape_html(&format!("{:#}", e)), 1)
-            );
+        if let Err(e) =
+            db::add_subscription_with_sent(&state.db, &chat_id, url_str, title.as_deref(), &ids)
+                .await
+        {
+            results.push(i18n::t(lang, "sub_add_failed").replacen(
+                "{}",
+                &push::escape_html(&format!("{:#}", e)),
+                1,
+            ));
             continue;
         }
 
         let display_title = title.unwrap_or_else(|| url_str.to_string());
         added += 1;
-        let suffix = if was_inactive { i18n::t(lang, "sub_reenabled") } else { "" };
+        let suffix = if was_inactive {
+            i18n::t(lang, "sub_reenabled")
+        } else {
+            ""
+        };
         results.push(format!(
             "• <a href=\"{}\">{}</a>{}",
             push::escape_attr(url_str),
@@ -568,12 +647,19 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
     }
 
     if results.is_empty() {
-        bot.send_message(msg.chat.id, i18n::t(lang, "sub_no_valid")).await?;
+        bot.send_message(msg.chat.id, i18n::t(lang, "sub_no_valid"))
+            .await?;
         return Ok(());
     }
 
-    let chat = try_or_reply!(bot, msg.chat.id, lang, db::get_chat(&state.db, &chat_id).await);
-    let title = crate::ui::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), &chat_id);
+    let chat = try_or_reply!(
+        bot,
+        msg.chat.id,
+        lang,
+        db::get_chat(&state.db, &chat_id).await
+    );
+    let title =
+        crate::ui::chat_display_title(chat.as_ref().and_then(|c| c.title.as_deref()), &chat_id);
 
     let title_html = push::escape_html(&title);
     let header = if added > 0 {
@@ -590,7 +676,11 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
     // 4096 limit. Split the accumulated summary instead of failing the whole
     // command after the subscriptions were already written.
     let chunks = crate::htmltext::split_html(&text, 4000);
-    let chunks = if chunks.is_empty() { vec![text] } else { chunks };
+    let chunks = if chunks.is_empty() {
+        vec![text]
+    } else {
+        chunks
+    };
     let mut first_msg: Option<teloxide::types::MessageId> = None;
     for (i, chunk) in chunks.iter().enumerate() {
         let mut req = bot
@@ -617,7 +707,12 @@ async fn handle_sub(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang
 /// edit fails (message too old / flood-limited), fall back to sending a brand
 /// new message so the result is never permanently hidden behind the
 /// "正在抓取…" progress text that would otherwise stay frozen.
-async fn test_report(bot: &Bot, chat: teloxide::types::ChatId, progress_id: teloxide::types::MessageId, text: String) {
+async fn test_report(
+    bot: &Bot,
+    chat: teloxide::types::ChatId,
+    progress_id: teloxide::types::MessageId,
+    text: String,
+) {
     match bot.edit_message_text(chat, progress_id, text.clone()).await {
         Ok(_) => {}
         Err(e) => {
@@ -629,26 +724,37 @@ async fn test_report(bot: &Bot, chat: teloxide::types::ChatId, progress_id: telo
             // flood), so the result is never stuck invisible behind the
             // "fetching…" progress line. link_preview disabled to match the
             // progress message (pure-text result; avoids link-preview spam).
-            if let Err(e) = bot.send_message(chat, text).link_preview_options(no_preview()).await {
+            if let Err(e) = bot
+                .send_message(chat, text)
+                .link_preview_options(no_preview())
+                .await
+            {
                 tracing::warn!(chat_id = chat.0, error = %e, "/test: result fallback send failed");
             }
         }
     }
 }
 
-async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang: Lang) -> ResponseResult<()> {
+async fn handle_test(
+    bot: &Bot,
+    msg: &Message,
+    state: &AppState,
+    args: &str,
+    lang: Lang,
+) -> ResponseResult<()> {
     let parts: Vec<&str> = args.split_whitespace().collect();
 
     // First token must be a channel ref (@name or negative numeric ID);
     // commands are private-chat only, so there is no current-chat fallback.
-    let (channel_input, rest): (String, &[&str]) = if !parts.is_empty() && looks_like_chat_ref(parts[0]) {
-        (parts[0].to_string(), &parts[1..])
-    } else {
-        bot.send_message(msg.chat.id, i18n::t(lang, "test_usage"))
-            .parse_mode(ParseMode::Html)
-            .await?;
-        return Ok(());
-    };
+    let (channel_input, rest): (String, &[&str]) =
+        if !parts.is_empty() && looks_like_chat_ref(parts[0]) {
+            (parts[0].to_string(), &parts[1..])
+        } else {
+            bot.send_message(msg.chat.id, i18n::t(lang, "test_usage"))
+                .parse_mode(ParseMode::Html)
+                .await?;
+            return Ok(());
+        };
 
     if rest.is_empty() {
         bot.send_message(msg.chat.id, i18n::t(lang, "test_usage"))
@@ -659,7 +765,12 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
     let allow_trusted_private = state.config.trusted_private_allowed(user_id);
-    let chat_id = try_or_reply!(bot, msg.chat.id, lang, resolve_chat_id(state, &channel_input, user_id, lang).await);
+    let chat_id = try_or_reply!(
+        bot,
+        msg.chat.id,
+        lang,
+        resolve_chat_id(state, &channel_input, user_id, lang).await
+    );
 
     // Second token is the full feed URL.
     let raw_feed_url = rest[0].to_string();
@@ -667,7 +778,8 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     // scheme later, so HTTPS://... is valid for /sub and must be for /test too.
     let scheme_lower = raw_feed_url.to_ascii_lowercase();
     if !scheme_lower.starts_with("http://") && !scheme_lower.starts_with("https://") {
-        bot.send_message(msg.chat.id, i18n::t(lang, "test_bad_url")).await?;
+        bot.send_message(msg.chat.id, i18n::t(lang, "test_bad_url"))
+            .await?;
         return Ok(());
     }
     // Normalize before any lookup: subscriptions are stored under their
@@ -695,9 +807,12 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         Some(s) => match s.parse::<usize>() {
             Ok(n) => n,
             Err(_) => {
-                bot.send_message(msg.chat.id, i18n::t(lang, "test_bad_index").replacen("{}", &push::escape_html(s), 1))
-                    .parse_mode(ParseMode::Html)
-                    .await?;
+                bot.send_message(
+                    msg.chat.id,
+                    i18n::t(lang, "test_bad_index").replacen("{}", &push::escape_html(s), 1),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
                 return Ok(());
             }
         },
@@ -715,7 +830,11 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 
     // Send a progress message; we'll EDIT it with the final result.
     // #33: the progress message contains the source URL; disable link preview to avoid generating a preview card.
-    let progress_msg = bot.send_message(msg.chat.id, i18n::t(lang, "test_fetching").replacen("{}", &feed_url, 1))
+    let progress_msg = bot
+        .send_message(
+            msg.chat.id,
+            i18n::t(lang, "test_fetching").replacen("{}", &feed_url, 1),
+        )
         .link_preview_options(no_preview())
         .await?;
     let progress_id = progress_msg.id;
@@ -745,7 +864,13 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
             if let fetch::CommandFetchError::FetchFailed(ref err) = e {
                 tracing::warn!(feed_url = %feed_url, error = %err, "/test: fetch failed");
             }
-            test_report(bot, msg.chat.id, progress_id, fetch::test_error_text(lang, e)).await;
+            test_report(
+                bot,
+                msg.chat.id,
+                progress_id,
+                fetch::test_error_text(lang, e),
+            )
+            .await;
             return Ok(());
         }
     };
@@ -771,7 +896,15 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let target_id = match fr.entries.get(entry_index) {
         Some(e) => fetcher::entry_id(e),
         None => {
-            test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_index_oob").replacen("{}", &fr.entries.len().to_string(), 1).replacen("{}", &entry_index.to_string(), 1)).await;
+            test_report(
+                bot,
+                msg.chat.id,
+                progress_id,
+                i18n::t(lang, "test_index_oob")
+                    .replacen("{}", &fr.entries.len().to_string(), 1)
+                    .replacen("{}", &entry_index.to_string(), 1),
+            )
+            .await;
             return Ok(());
         }
     };
@@ -821,15 +954,32 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     {
         Some(e) => e,
         None => {
-            test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_index_oob").replacen("{}", &fr.entries.len().to_string(), 1).replacen("{}", &entry_index.to_string(), 1)).await;
+            test_report(
+                bot,
+                msg.chat.id,
+                progress_id,
+                i18n::t(lang, "test_index_oob")
+                    .replacen("{}", &fr.entries.len().to_string(), 1)
+                    .replacen("{}", &entry_index.to_string(), 1),
+            )
+            .await;
             return Ok(());
         }
     };
 
     // Entry detail log: id, title, content_type, body length, sidecar metadata.
     // Group C: poll/retweet-image/prerendered markers are now carried by EntryMeta; no longer checking in-body markers.
-    let body_len = entry.content.as_ref().and_then(|c| c.body.as_ref()).map(|b| b.len()).unwrap_or(0);
-    let content_type_str = entry.content.as_ref().map(|c| c.content_type.as_str()).unwrap_or("(none)");
+    let body_len = entry
+        .content
+        .as_ref()
+        .and_then(|c| c.body.as_ref())
+        .map(|b| b.len())
+        .unwrap_or(0);
+    let content_type_str = entry
+        .content
+        .as_ref()
+        .map(|c| c.content_type.as_str())
+        .unwrap_or("(none)");
     // Group C sidecar: look up structured metadata by entry_id (populated for platform sources, always empty for RSS feeds).
     // Consistent with the scheduler's main push path, use fetcher::entry_id (guards against drift in the fallback branch when entry.id is empty).
     let meta = fr.metas.get(&fetcher::entry_id(entry));
@@ -875,8 +1025,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
                 "test: failed to read subscriptions; using defaults"
             );
             config_warnings.push(
-                i18n::t(lang, "test_config_read_failed")
-                    .replace("{:#}", &format!("{:#}", e)),
+                i18n::t(lang, "test_config_read_failed").replace("{:#}", &format!("{:#}", e)),
             );
             Vec::new()
         }
@@ -896,8 +1045,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
                 "test: failed to read effective config; using defaults"
             );
             config_warnings.push(
-                i18n::t(lang, "test_config_read_failed")
-                    .replace("{:#}", &format!("{:#}", e)),
+                i18n::t(lang, "test_config_read_failed").replace("{:#}", &format!("{:#}", e)),
             );
             None
         }
@@ -957,7 +1105,13 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let target_chat: i64 = match chat_id.parse() {
         Ok(id) => id,
         Err(_) => {
-            test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_bad_chat").replacen("{}", &chat_id, 1)).await;
+            test_report(
+                bot,
+                msg.chat.id,
+                progress_id,
+                i18n::t(lang, "test_bad_chat").replacen("{}", &chat_id, 1),
+            )
+            .await;
             return Ok(());
         }
     };
@@ -984,7 +1138,8 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     };
 
     tracing::info!(
-        media_items = prepared.items.len(), warnings = prepared.warnings.len(),
+        media_items = prepared.items.len(),
+        warnings = prepared.warnings.len(),
         oversized_videos = prepared.oversized_videos.len(),
         "/test: media prepared"
     );
@@ -1025,7 +1180,11 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     // Media storage could not even be created: do not pretend this entry has
     // no media (that would silently hide the environment failure).
     if prepared.setup_failed {
-        let name = if feed_title.is_empty() { &feed_url } else { &feed_title };
+        let name = if feed_title.is_empty() {
+            &feed_url
+        } else {
+            &feed_title
+        };
         let notice = i18n::t(lang, "notif_media_storage").replacen("{}", name, 1);
         test_report(bot, msg.chat.id, progress_id, notice).await;
         return Ok(());
@@ -1033,7 +1192,13 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 
     // Media-only mode but no media: inform the user explicitly
     if opts.mode == ContentMode::MediaOnly && prepared.items.is_empty() {
-        test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_media_only_empty").to_string()).await;
+        test_report(
+            bot,
+            msg.chat.id,
+            progress_id,
+            i18n::t(lang, "test_media_only_empty").to_string(),
+        )
+        .await;
         return Ok(());
     }
 
@@ -1100,7 +1265,9 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
             if prepared.items.is_empty() {
                 match outcome.delivered_message_id {
                     Some(id) => tracing::info!(msg_id = id, "/test: text sent"),
-                    None => tracing::info!("/test: nothing to send (format_entry_parts returned None)"),
+                    None => {
+                        tracing::info!("/test: nothing to send (format_entry_parts returned None)")
+                    }
                 }
                 if push::extract_poll(meta).is_some() {
                     if outcome.media_failed {
@@ -1147,7 +1314,13 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
                 "/test: send error"
             );
             tracing::warn!(chat_id = target_chat, feed_url = %feed_url, error = %e, "/test: push FAILED");
-            test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_push_failed").replace("{:#}", &format!("{:#}", e))).await;
+            test_report(
+                bot,
+                msg.chat.id,
+                progress_id,
+                i18n::t(lang, "test_push_failed").replace("{:#}", &format!("{:#}", e)),
+            )
+            .await;
         }
     }
     tracing::info!(
@@ -1164,13 +1337,14 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
 /// v1.11.0). Selecting a platform prompts for the new cookie via reply; the
 /// update applies immediately without restart and is persisted across
 /// restarts.
-async fn handle_cookies(bot: &Bot, msg: &Message, state: &AppState, lang: Lang) -> ResponseResult<()> {
-    crate::ui::render_cookies_panel(
-        bot,
-        crate::ui::PageTarget::Send(msg.chat.id),
-        state,
-        lang,
-    ).await?;
+async fn handle_cookies(
+    bot: &Bot,
+    msg: &Message,
+    state: &AppState,
+    lang: Lang,
+) -> ResponseResult<()> {
+    crate::ui::render_cookies_panel(bot, crate::ui::PageTarget::Send(msg.chat.id), state, lang)
+        .await?;
     Ok(())
 }
 
@@ -1179,7 +1353,13 @@ async fn handle_cookies(bot: &Bot, msg: &Message, state: &AppState, lang: Lang) 
 /// Look up the corresponding RSS feed entry from a TG message. Two input modes:
 /// 1. `/find <TG message link>`: parse the t.me link
 /// 2. Forward a channel message directly to the bot (no arguments): read chat + message_id from the forward origin
-pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang: Lang) -> ResponseResult<()> {
+pub async fn handle_find(
+    bot: &Bot,
+    msg: &Message,
+    state: &AppState,
+    args: &str,
+    lang: Lang,
+) -> ResponseResult<()> {
     let link = args.trim();
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
 
@@ -1196,11 +1376,20 @@ pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str,
                     match db::can_manage_chat(&state.db, user_id, &cid).await {
                         Ok(true) => {}
                         Ok(false) => {
-                            bot.send_message(msg.chat.id, i18n::t(lang, "find_not_yours")).await?;
+                            bot.send_message(msg.chat.id, i18n::t(lang, "find_not_yours"))
+                                .await?;
                             return Ok(());
                         }
                         Err(e) => {
-                            bot.send_message(msg.chat.id, i18n::t(lang, "find_query_failed").replacen("{:#}", &format!("{:#}", e), 1)).await?;
+                            bot.send_message(
+                                msg.chat.id,
+                                i18n::t(lang, "find_query_failed").replacen(
+                                    "{:#}",
+                                    &format!("{:#}", e),
+                                    1,
+                                ),
+                            )
+                            .await?;
                             return Ok(());
                         }
                     }
@@ -1212,7 +1401,15 @@ pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str,
                     let chats = match db::list_chats(&state.db, user_id).await {
                         Ok(c) => c,
                         Err(e) => {
-                            bot.send_message(msg.chat.id, i18n::t(lang, "find_query_failed").replacen("{:#}", &format!("{:#}", e), 1)).await?;
+                            bot.send_message(
+                                msg.chat.id,
+                                i18n::t(lang, "find_query_failed").replacen(
+                                    "{:#}",
+                                    &format!("{:#}", e),
+                                    1,
+                                ),
+                            )
+                            .await?;
                             return Ok(());
                         }
                     };
@@ -1225,7 +1422,8 @@ pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str,
                     }) {
                         Some(c) => Some((c.chat_id.clone(), message_id)),
                         None => {
-                            bot.send_message(msg.chat.id, i18n::t(lang, "find_not_registered")).await?;
+                            bot.send_message(msg.chat.id, i18n::t(lang, "find_not_registered"))
+                                .await?;
                             return Ok(());
                         }
                     }
@@ -1241,25 +1439,37 @@ pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str,
     } else {
         // No arguments: check whether this is a message forwarded from a channel/supergroup
         match msg.forward_origin() {
-            Some(teloxide::types::MessageOrigin::Channel { chat, message_id, .. }) => {
+            Some(teloxide::types::MessageOrigin::Channel {
+                chat, message_id, ..
+            }) => {
                 let cid = chat.id.0.to_string();
                 // Ownership check: only channels owned by the caller may be
                 // queried; a DB error is reported as a query failure.
                 match db::can_manage_chat(&state.db, user_id, &cid).await {
                     Ok(true) => {}
                     Ok(false) => {
-                        bot.send_message(msg.chat.id, i18n::t(lang, "find_not_yours")).await?;
+                        bot.send_message(msg.chat.id, i18n::t(lang, "find_not_yours"))
+                            .await?;
                         return Ok(());
                     }
                     Err(e) => {
-                        bot.send_message(msg.chat.id, i18n::t(lang, "find_query_failed").replacen("{:#}", &format!("{:#}", e), 1)).await?;
+                        bot.send_message(
+                            msg.chat.id,
+                            i18n::t(lang, "find_query_failed").replacen(
+                                "{:#}",
+                                &format!("{:#}", e),
+                                1,
+                            ),
+                        )
+                        .await?;
                         return Ok(());
                     }
                 }
                 Some((cid, message_id.0 as i64))
             }
             Some(_) => {
-                bot.send_message(msg.chat.id, i18n::t(lang, "find_not_channel")).await?;
+                bot.send_message(msg.chat.id, i18n::t(lang, "find_not_channel"))
+                    .await?;
                 return Ok(());
             }
             None => {
@@ -1279,14 +1489,23 @@ pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str,
 
     match db::find_sent_message(&state.db, &chat_id, message_id).await {
         Ok(Some(row)) => {
-            let mut text = i18n::t(lang, "find_source").replacen("{}", &push::escape_html(&row.feed_url), 1);
+            let mut text =
+                i18n::t(lang, "find_source").replacen("{}", &push::escape_html(&row.feed_url), 1);
             if let Some(el) = &row.entry_link {
                 let href = push::escape_attr(el);
                 let label = push::escape_html(el);
                 text.push_str(&i18n::fill(i18n::t(lang, "find_entry"), &[&href, &label]));
             }
-            text.push_str(&i18n::t(lang, "find_entry_id").replacen("{}", &push::escape_html(&row.entry_id), 1));
-            text.push_str(&i18n::t(lang, "find_sent_at").replacen("{}", &push::escape_html(&row.created_at), 1));
+            text.push_str(&i18n::t(lang, "find_entry_id").replacen(
+                "{}",
+                &push::escape_html(&row.entry_id),
+                1,
+            ));
+            text.push_str(&i18n::t(lang, "find_sent_at").replacen(
+                "{}",
+                &push::escape_html(&row.created_at),
+                1,
+            ));
             bot.send_message(msg.chat.id, text)
                 .parse_mode(ParseMode::Html)
                 .link_preview_options(no_preview())
@@ -1301,13 +1520,15 @@ pub async fn handle_find(bot: &Bot, msg: &Message, state: &AppState, args: &str,
             // explicit /find link queries still report normally.
             let is_forwarded_group_member = link.is_empty() && msg.media_group_id().is_some();
             if !is_forwarded_group_member {
-                bot.send_message(msg.chat.id, i18n::t(lang, "find_not_found")).await?;
+                bot.send_message(msg.chat.id, i18n::t(lang, "find_not_found"))
+                    .await?;
             }
         }
         Err(e) => {
             // Distinguish DB errors from "not found": transient failures must not mislead the user.
             tracing::warn!(chat_id = %chat_id, message_id = message_id, error = %e, "find_sent_message query failed");
-            bot.send_message(msg.chat.id, i18n::t(lang, "find_db_error")).await?;
+            bot.send_message(msg.chat.id, i18n::t(lang, "find_db_error"))
+                .await?;
         }
     }
     Ok(())
@@ -1362,7 +1583,13 @@ async fn load_sub_owned(
         Ok(Some(s)) => Some(s),
         Ok(None) => None,
         Err(e) => {
-            retire_prompt(bot, chat, prompt_msg_id, &i18n::t(lang, "load_sub_db_err").replace("{:#}", &format!("{:#}", e))).await;
+            retire_prompt(
+                bot,
+                chat,
+                prompt_msg_id,
+                &i18n::t(lang, "load_sub_db_err").replace("{:#}", &format!("{:#}", e)),
+            )
+            .await;
             return None;
         }
     };
@@ -1408,22 +1635,56 @@ pub async fn handle_pending_op(
         crate::state::PendingOp::SetCookie { .. } => "set_cookie",
         crate::state::PendingOp::SetFilterKeywords { .. } => "set_filter_keywords",
     };
-    tracing::debug!(op = op_name, user_id = user_id, empty = text.is_empty(), "consuming pending op");
+    tracing::debug!(
+        op = op_name,
+        user_id = user_id,
+        empty = text.is_empty(),
+        "consuming pending op"
+    );
 
     match op {
-        crate::state::PendingOp::RenameSub { sub_id, prompt_msg_id, panel_msg_id, ch_page, chlist_page, .. } => {
+        crate::state::PendingOp::RenameSub {
+            sub_id,
+            prompt_msg_id,
+            panel_msg_id,
+            ch_page,
+            chlist_page,
+            ..
+        } => {
             if text.is_empty() || text.chars().count() > 100 {
-                retire_prompt(bot, msg.chat.id, prompt_msg_id, i18n::t(lang, "rename_invalid")).await;
+                retire_prompt(
+                    bot,
+                    msg.chat.id,
+                    prompt_msg_id,
+                    i18n::t(lang, "rename_invalid"),
+                )
+                .await;
                 return Ok(());
             }
             // Ownership re-check + fail-closed loading (handled uniformly by load_sub_owned).
-            let Some(_sub) = load_sub_owned(bot, state, user_id, sub_id, msg.chat.id, prompt_msg_id, lang).await else {
+            let Some(_sub) = load_sub_owned(
+                bot,
+                state,
+                user_id,
+                sub_id,
+                msg.chat.id,
+                prompt_msg_id,
+                lang,
+            )
+            .await
+            else {
                 return Ok(());
             };
             match db::rename_subscription(&state.db, sub_id, text).await {
                 Ok(_) => {
                     tracing::info!(sub_id = sub_id, user_id = user_id, "subscription renamed");
-                    retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::t(lang, "rename_ok").replacen("{}", text, 1)).await;
+                    retire_prompt(
+                        bot,
+                        msg.chat.id,
+                        prompt_msg_id,
+                        &i18n::t(lang, "rename_ok").replacen("{}", text, 1),
+                    )
+                    .await;
                     // Refresh the source's feed page panel in place (no new message sent); if the
                     // panel is no longer valid, deliver automatically falls back to sending a new one.
                     crate::ui::render_feed_page(
@@ -1437,14 +1698,26 @@ pub async fn handle_pending_op(
                         ch_page,
                         chlist_page,
                         lang,
-                    ).await?;
+                    )
+                    .await?;
                 }
                 Err(e) => {
-                    retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::t(lang, "rename_failed").replace("{:#}", &format!("{:#}", e))).await;
+                    retire_prompt(
+                        bot,
+                        msg.chat.id,
+                        prompt_msg_id,
+                        &i18n::t(lang, "rename_failed").replace("{:#}", &format!("{:#}", e)),
+                    )
+                    .await;
                 }
             }
         }
-        crate::state::PendingOp::SetCookie { platform, prompt_msg_id, panel_msg_id, .. } => {
+        crate::state::PendingOp::SetCookie {
+            platform,
+            prompt_msg_id,
+            panel_msg_id,
+            ..
+        } => {
             // Admin eligibility re-check: only admins may configure cookies (a reply from an admin
             // who was removed from ADMIN_USER_IDS after starting the flow is not consumed; the prompt is retired).
             if !state.config.is_admin(user_id) {
@@ -1455,18 +1728,36 @@ pub async fn handle_pending_op(
                 .map(|p| p.label)
                 .unwrap_or(&platform);
             if text.is_empty() {
-                retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::t(lang, "cookie_empty").replacen("{}", label, 1)).await;
+                retire_prompt(
+                    bot,
+                    msg.chat.id,
+                    prompt_msg_id,
+                    &i18n::t(lang, "cookie_empty").replacen("{}", label, 1),
+                )
+                .await;
                 return Ok(());
             }
             if text.chars().count() > crate::limits::MAX_COOKIE_CHARS {
                 let limit = crate::limits::MAX_COOKIE_CHARS.to_string();
-                retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::fill(i18n::t(lang, "cookie_too_long"), &[&limit])).await;
+                retire_prompt(
+                    bot,
+                    msg.chat.id,
+                    prompt_msg_id,
+                    &i18n::fill(i18n::t(lang, "cookie_too_long"), &[&limit]),
+                )
+                .await;
                 return Ok(());
             }
             match crate::platforms::update_cookie(state, &platform, text).await {
                 Ok(_) => {
                     tracing::info!(platform = %platform, user_id = user_id, "cookie updated");
-                    retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::t(lang, "cookie_ok").replacen("{}", label, 1)).await;
+                    retire_prompt(
+                        bot,
+                        msg.chat.id,
+                        prompt_msg_id,
+                        &i18n::t(lang, "cookie_ok").replacen("{}", label, 1),
+                    )
+                    .await;
                     // Refresh the /cookies panel in place: only the button
                     // status changes; the header stays untouched because the
                     // retired prompt message already carries the confirmation.
@@ -1478,14 +1769,28 @@ pub async fn handle_pending_op(
                         ),
                         state,
                         lang,
-                    ).await?;
+                    )
+                    .await?;
                 }
                 Err(e) => {
-                    retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::t(lang, "cookie_save_failed").replace("{:#}", &format!("{:#}", e))).await;
+                    retire_prompt(
+                        bot,
+                        msg.chat.id,
+                        prompt_msg_id,
+                        &i18n::t(lang, "cookie_save_failed").replace("{:#}", &format!("{:#}", e)),
+                    )
+                    .await;
                 }
             }
         }
-        crate::state::PendingOp::SetFilterKeywords { sub_id, prompt_msg_id, panel_msg_id, ch_page, chlist_page, .. } => {
+        crate::state::PendingOp::SetFilterKeywords {
+            sub_id,
+            prompt_msg_id,
+            panel_msg_id,
+            ch_page,
+            chlist_page,
+            ..
+        } => {
             // Empty input (including non-text messages with text="") cancels, consistent with
             // RenameSub/SetCookie. Otherwise stickers/voice messages etc. would silently clear
             // the keywords and turn filtering off.
@@ -1494,7 +1799,17 @@ pub async fn handle_pending_op(
                 return Ok(());
             }
             // Ownership re-check + fail-closed loading (handled uniformly by load_sub_owned).
-            let Some(sub) = load_sub_owned(bot, state, user_id, sub_id, msg.chat.id, prompt_msg_id, lang).await else {
+            let Some(sub) = load_sub_owned(
+                bot,
+                state,
+                user_id,
+                sub_id,
+                msg.chat.id,
+                prompt_msg_id,
+                lang,
+            )
+            .await
+            else {
                 return Ok(());
             };
             // "清空"/"clear" removes all keywords (turns filtering off); otherwise save as-is.
@@ -1503,7 +1818,13 @@ pub async fn handle_pending_op(
             } else {
                 if text.chars().count() > crate::limits::MAX_FILTER_KEYWORDS_CHARS {
                     let limit = crate::limits::MAX_FILTER_KEYWORDS_CHARS.to_string();
-                    retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::fill(i18n::t(lang, "fkw_too_long"), &[&limit])).await;
+                    retire_prompt(
+                        bot,
+                        msg.chat.id,
+                        prompt_msg_id,
+                        &i18n::fill(i18n::t(lang, "fkw_too_long"), &[&limit]),
+                    )
+                    .await;
                     return Ok(());
                 }
                 text.to_string()
@@ -1511,11 +1832,17 @@ pub async fn handle_pending_op(
             let save_res = if keywords.is_empty() {
                 db::clear_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await
             } else {
-                db::set_feed_filter_keywords(&state.db, &sub.chat_id, &sub.feed_url, &keywords).await
+                db::set_feed_filter_keywords(&state.db, &sub.chat_id, &sub.feed_url, &keywords)
+                    .await
             };
             match save_res {
                 Ok(_) => {
-                    tracing::info!(sub_id = sub_id, user_id = user_id, cleared = keywords.is_empty(), "filter keywords updated");
+                    tracing::info!(
+                        sub_id = sub_id,
+                        user_id = user_id,
+                        cleared = keywords.is_empty(),
+                        "filter keywords updated"
+                    );
                     let status = if keywords.is_empty() {
                         i18n::t(lang, "fkw_cleared").to_string()
                     } else {
@@ -1534,10 +1861,17 @@ pub async fn handle_pending_op(
                         ch_page,
                         chlist_page,
                         lang,
-                    ).await?;
+                    )
+                    .await?;
                 }
                 Err(e) => {
-                    retire_prompt(bot, msg.chat.id, prompt_msg_id, &i18n::t(lang, "fkw_save_failed").replace("{:#}", &format!("{:#}", e))).await;
+                    retire_prompt(
+                        bot,
+                        msg.chat.id,
+                        prompt_msg_id,
+                        &i18n::t(lang, "fkw_save_failed").replace("{:#}", &format!("{:#}", e)),
+                    )
+                    .await;
                 }
             }
         }
@@ -1566,7 +1900,12 @@ fn resolve_target_input(_msg: &Message, args: &str) -> Option<String> {
 /// Resolve a channel reference (numeric ID or @username) to a chat_id string.
 /// Pure ownership isolation: only channels where added_by == user_id are accessible.
 /// Unregistered numeric IDs are rejected (ownership comes from MyChatMember invitation).
-async fn resolve_chat_id(state: &AppState, input: &str, user_id: i64, lang: Lang) -> anyhow::Result<String> {
+async fn resolve_chat_id(
+    state: &AppState,
+    input: &str,
+    user_id: i64,
+    lang: Lang,
+) -> anyhow::Result<String> {
     let input = input.trim();
 
     // Try as numeric ID: must be registered AND owned by this user.
@@ -1601,7 +1940,10 @@ async fn resolve_chat_id(state: &AppState, input: &str, user_id: i64, lang: Lang
         }
     }
 
-    anyhow::bail!("{}", i18n::t(lang, "resolve_not_found").replacen("{}", input, 1))
+    anyhow::bail!(
+        "{}",
+        i18n::t(lang, "resolve_not_found").replacen("{}", input, 1)
+    )
 }
 
 // ===== /loget =====
@@ -1609,15 +1951,27 @@ async fn resolve_chat_id(state: &AppState, input: &str, user_id: i64, lang: Lang
 /// /loget <YYYY-MM-DD> — send the log file for the specified date.
 /// Log files are rotated daily by tracing-appender: {LOG_DIR}/rss-bot.log.YYYY-MM-DD.
 /// When the file does not exist (invalid date or already cleaned up), report that it doesn't exist.
-async fn handle_loget(bot: &Bot, msg: &Message, state: &AppState, args: &str, lang: Lang) -> ResponseResult<()> {
+async fn handle_loget(
+    bot: &Bot,
+    msg: &Message,
+    state: &AppState,
+    args: &str,
+    lang: Lang,
+) -> ResponseResult<()> {
     use teloxide::requests::Requester;
     use teloxide::types::InputFile;
 
     let date = args.trim();
     // Validate the date format YYYY-MM-DD
-    if date.len() != 10 || !date.chars().enumerate().all(|(i, c)| {
-        if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() }
-    }) {
+    if date.len() != 10
+        || !date.chars().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                c == '-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+    {
         bot.send_message(msg.chat.id, i18n::t(lang, "loget_usage"))
             .parse_mode(ParseMode::Html)
             .await?;
@@ -1628,8 +1982,11 @@ async fn handle_loget(bot: &Bot, msg: &Message, state: &AppState, args: &str, la
     let path = state.config.log_dir.join(&filename);
 
     if !path.exists() {
-        bot.send_message(msg.chat.id, i18n::t(lang, "loget_not_exist").replacen("{}", date, 1))
-            .await?;
+        bot.send_message(
+            msg.chat.id,
+            i18n::t(lang, "loget_not_exist").replacen("{}", date, 1),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -1657,8 +2014,11 @@ async fn handle_loget(bot: &Bot, msg: &Message, state: &AppState, args: &str, la
     drop(file);
 
     if len == 0 {
-        bot.send_message(msg.chat.id, i18n::t(lang, "loget_empty").replacen("{}", date, 1))
-            .await?;
+        bot.send_message(
+            msg.chat.id,
+            i18n::t(lang, "loget_empty").replacen("{}", date, 1),
+        )
+        .await?;
         return Ok(());
     }
     // Official Bot API caps documents at 50MB; a multi-GB log day would fail
@@ -1667,8 +2027,7 @@ async fn handle_loget(bot: &Bot, msg: &Message, state: &AppState, args: &str, la
     if len > MAX_LOG_UPLOAD_BYTES {
         bot.send_message(
             msg.chat.id,
-            i18n::t(lang, "loget_too_large")
-                .replacen("{}", &(len / (1024 * 1024)).to_string(), 1),
+            i18n::t(lang, "loget_too_large").replacen("{}", &(len / (1024 * 1024)).to_string(), 1),
         )
         .await?;
         return Ok(());
@@ -1688,7 +2047,10 @@ mod tests {
         let expected = format!(r#"<a href="{REPO_URL}">v{VERSION}</a>"#);
         for lang in Lang::ALL {
             let text = about_text(lang);
-            assert!(text.contains(&expected), "missing version link for {lang:?}");
+            assert!(
+                text.contains(&expected),
+                "missing version link for {lang:?}"
+            );
             assert!(!text.contains("{}"), "placeholder left in {lang:?} text");
         }
     }
@@ -1699,7 +2061,11 @@ mod tests {
             for c in Command::bot_commands() {
                 let desc = menu_desc(lang, &c.command);
                 if lang == Lang::En {
-                    assert_eq!(desc, None, "English must use the derive text: {}", c.command);
+                    assert_eq!(
+                        desc, None,
+                        "English must use the derive text: {}",
+                        c.command
+                    );
                 } else {
                     assert!(
                         desc.is_some(),

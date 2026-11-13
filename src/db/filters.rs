@@ -3,7 +3,6 @@
 use super::*;
 use sqlx::Row;
 
-
 /// Per-feed content filter config.
 #[derive(Debug, Clone, Default)]
 pub struct FilterConfig {
@@ -51,7 +50,11 @@ impl FilterConfig {
 }
 
 /// Read the content filter config for a feed (defaults when no row exists).
-pub async fn get_feed_filter(db: &Db, chat_id: &str, feed_url: &str) -> anyhow::Result<FilterConfig> {
+pub async fn get_feed_filter(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<FilterConfig> {
     let row = sqlx::query(
         "SELECT filter_enabled, filter_mode, filter_keywords FROM feed_configs WHERE chat_id = ? AND feed_url = ?",
     )
@@ -92,15 +95,37 @@ async fn set_feed_filter_field(
     Ok(())
 }
 
-pub async fn set_feed_filter_enabled(db: &Db, chat_id: &str, feed_url: &str, enabled: bool) -> anyhow::Result<()> {
-    set_feed_filter_field(db, chat_id, feed_url, "filter_enabled", if enabled { "1" } else { "0" }).await
+pub async fn set_feed_filter_enabled(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    set_feed_filter_field(
+        db,
+        chat_id,
+        feed_url,
+        "filter_enabled",
+        if enabled { "1" } else { "0" },
+    )
+    .await
 }
 
-pub async fn set_feed_filter_mode(db: &Db, chat_id: &str, feed_url: &str, mode: &str) -> anyhow::Result<()> {
+pub async fn set_feed_filter_mode(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+    mode: &str,
+) -> anyhow::Result<()> {
     set_feed_filter_field(db, chat_id, feed_url, "filter_mode", mode).await
 }
 
-pub async fn set_feed_filter_keywords(db: &Db, chat_id: &str, feed_url: &str, keywords: &str) -> anyhow::Result<()> {
+pub async fn set_feed_filter_keywords(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+    keywords: &str,
+) -> anyhow::Result<()> {
     set_feed_filter_field(db, chat_id, feed_url, "filter_keywords", keywords).await
 }
 
@@ -120,4 +145,3 @@ pub async fn clear_feed_filter(db: &Db, chat_id: &str, feed_url: &str) -> anyhow
     tx.commit().await?;
     Ok(())
 }
-

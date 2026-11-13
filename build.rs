@@ -22,9 +22,7 @@ fn main() {
     // The value is spliced into a cargo:rustc-env directive; a newline or
     // arbitrary text from a hostile build environment must not be able to
     // inject additional directives.
-    let hash = if (7..=40).contains(&hash.len())
-        && hash.chars().all(|c| c.is_ascii_hexdigit())
-    {
+    let hash = if (7..=40).contains(&hash.len()) && hash.chars().all(|c| c.is_ascii_hexdigit()) {
         hash
     } else {
         String::new()

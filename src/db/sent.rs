@@ -3,8 +3,12 @@
 use super::*;
 use sqlx::Row;
 
-
-pub async fn is_entry_sent(db: &Db, chat_id: &str, feed_url: &str, entry_id: &str) -> anyhow::Result<bool> {
+pub async fn is_entry_sent(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+    entry_id: &str,
+) -> anyhow::Result<bool> {
     let row = sqlx::query(
         "SELECT 1 FROM sent_entries WHERE chat_id = ? AND feed_url = ? AND entry_id = ?",
     )
@@ -16,7 +20,12 @@ pub async fn is_entry_sent(db: &Db, chat_id: &str, feed_url: &str, entry_id: &st
     Ok(row.is_some())
 }
 
-pub async fn mark_entry_sent(db: &Db, chat_id: &str, feed_url: &str, entry_id: &str) -> anyhow::Result<()> {
+pub async fn mark_entry_sent(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+    entry_id: &str,
+) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT OR IGNORE INTO sent_entries (chat_id, feed_url, entry_id) VALUES (?, ?, ?)",
     )
@@ -99,12 +108,10 @@ pub async fn invalidate_cached_file_id(db: &Db, content_hash: &str) -> anyhow::R
 /// Clean up expired cache entries (retention in days); returns the number of
 /// deleted rows.
 pub async fn cleanup_file_id_cache(db: &Db, retention_days: i64) -> anyhow::Result<u64> {
-    let result = sqlx::query(
-        "DELETE FROM file_id_cache WHERE created_at < datetime('now', ?)",
-    )
-    .bind(format!("-{} days", retention_days))
-    .execute(db)
-    .await?;
+    let result = sqlx::query("DELETE FROM file_id_cache WHERE created_at < datetime('now', ?)")
+        .bind(format!("-{} days", retention_days))
+        .execute(db)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -115,7 +122,11 @@ pub async fn cleanup_file_id_cache(db: &Db, retention_days: i64) -> anyhow::Resu
 /// download-success nor the abandon deletion point will ever fire again).
 /// Prefix matching uses instr instead of LIKE (feed_url may contain the % / _
 /// wildcard characters).
-pub async fn cleanup_stale_settings(db: &Db, prefix: &str, retention_days: i64) -> anyhow::Result<u64> {
+pub async fn cleanup_stale_settings(
+    db: &Db,
+    prefix: &str,
+    retention_days: i64,
+) -> anyhow::Result<u64> {
     let result = sqlx::query(
         "DELETE FROM settings WHERE instr(key, ?) = 1 AND updated_at < datetime('now', ?)",
     )
@@ -207,5 +218,3 @@ pub async fn find_sent_message(
         created_at: r.get("created_at"),
     }))
 }
-
-

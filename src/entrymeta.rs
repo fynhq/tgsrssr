@@ -72,7 +72,10 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         let back: EntryMeta = serde_json::from_str(&json).unwrap();
         assert!(back.prerendered_html);
-        assert_eq!(back.poll.as_ref().unwrap().question, "Have you ever moved house?");
+        assert_eq!(
+            back.poll.as_ref().unwrap().question,
+            "Have you ever moved house?"
+        );
         assert_eq!(back.poll.as_ref().unwrap().options.len(), 2);
         assert_eq!(back.retweet_images.len(), 1);
     }
@@ -101,11 +104,24 @@ mod tests {
     #[test]
     fn is_empty_logic() {
         assert!(EntryMeta::default().is_empty());
-        assert!(!EntryMeta { prerendered_html: true, ..Default::default() }.is_empty());
-        assert!(!EntryMeta { retweet_images: vec!["x".to_string()], ..Default::default() }.is_empty());
         assert!(!EntryMeta {
-            poll: Some(PollData { question: "q".into(), options: vec!["a".into(), "b".into()], is_multi_select: false }),
+            prerendered_html: true,
             ..Default::default()
-        }.is_empty());
+        }
+        .is_empty());
+        assert!(!EntryMeta {
+            retweet_images: vec!["x".to_string()],
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!EntryMeta {
+            poll: Some(PollData {
+                question: "q".into(),
+                options: vec!["a".into(), "b".into()],
+                is_multi_select: false
+            }),
+            ..Default::default()
+        }
+        .is_empty());
     }
 }

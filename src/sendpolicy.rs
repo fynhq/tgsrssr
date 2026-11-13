@@ -419,9 +419,7 @@ impl ChatPacer {
                     }
                 }
                 match m.get(&chat_id).copied() {
-                    Some(t) if t + Self::MIN_INTERVAL > now => {
-                        Some(t + Self::MIN_INTERVAL - now)
-                    }
+                    Some(t) if t + Self::MIN_INTERVAL > now => Some(t + Self::MIN_INTERVAL - now),
                     _ => {
                         m.insert(chat_id, now);
                         None
@@ -454,9 +452,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        classify_send_error, flood_retry_secs, is_ambiguous_send_error,
-        is_explicitly_undelivered, is_net_error, is_send_retryable_error, SendFailureClass,
-        SendRetryAction, SendRetryPolicy, SendRetryState,
+        classify_send_error, flood_retry_secs, is_ambiguous_send_error, is_explicitly_undelivered,
+        is_net_error, is_send_retryable_error, SendFailureClass, SendRetryAction, SendRetryPolicy,
+        SendRetryState,
     };
 
     #[test]

@@ -280,7 +280,11 @@ impl AppState {
         // manual hop-by-hop following in httpfollow.rs, per-hop target checks.
         // Media download clients: auto-redirect disabled (SSRF protection, see download_one).
         let media_direct = build_client(None, false, false, true)?;
-        let media = if has_proxy { build_client(proxy, false, false, false)? } else { media_direct.clone() };
+        let media = if has_proxy {
+            build_client(proxy, false, false, false)?
+        } else {
+            media_direct.clone()
+        };
         let media_insecure = build_client(proxy, true, false, !has_proxy)?;
         // Trusted private hosts are always direct: LAN addresses must not be
         // sent through the proxy, and the guard would veto their private DNS
@@ -346,7 +350,12 @@ impl AppState {
     /// - Direct route: local DNS failure is fatal (`dns resolve failed`).
     /// - Proxy route (veto): local DNS private answers are rejected; a local
     ///   DNS lookup failure is logged and the proxy is still attempted.
-    pub async fn check_target(&self, url: &str, allow_trusted: bool, kind: &str) -> anyhow::Result<()> {
+    pub async fn check_target(
+        &self,
+        url: &str,
+        allow_trusted: bool,
+        kind: &str,
+    ) -> anyhow::Result<()> {
         if allow_trusted && self.is_trusted_private_url(url) {
             return Ok(());
         }
@@ -548,7 +557,10 @@ mod tests {
         let second = sem.acquire().await.unwrap();
         assert!(sem.try_acquire().is_err(), "third platform fetch must wait");
         drop(first);
-        assert!(sem.try_acquire().is_ok(), "released permit must be reusable");
+        assert!(
+            sem.try_acquire().is_ok(),
+            "released permit must be reusable"
+        );
         drop(second);
     }
 
@@ -559,9 +571,15 @@ mod tests {
             "rsshub:1200".to_string(),
             "host.docker.internal:1200".to_string(),
         ];
-        assert!(trusted_private_match(&hosts, "http://127.0.0.1:1200/weibo/user/1"));
+        assert!(trusted_private_match(
+            &hosts,
+            "http://127.0.0.1:1200/weibo/user/1"
+        ));
         assert!(trusted_private_match(&hosts, "http://RSSHUB:1200/feed"));
-        assert!(trusted_private_match(&hosts, "https://host.docker.internal:1200/x"));
+        assert!(trusted_private_match(
+            &hosts,
+            "https://host.docker.internal:1200/x"
+        ));
         // Different port / host / scheme must not match.
         assert!(!trusted_private_match(&hosts, "http://127.0.0.1:1201/x"));
         assert!(!trusted_private_match(&hosts, "http://127.0.0.2:1200/x"));
@@ -569,9 +587,18 @@ mod tests {
         // Subdomains do not inherit an allowlist entry.
         assert!(!trusted_private_match(&hosts, "http://sub.rsshub:1200/x"));
         // Default ports are normalized.
-        let default_ports = vec!["example.internal:443".to_string(), "plain.internal:80".to_string()];
-        assert!(trusted_private_match(&default_ports, "https://example.internal/x"));
-        assert!(trusted_private_match(&default_ports, "http://plain.internal/x"));
+        let default_ports = vec![
+            "example.internal:443".to_string(),
+            "plain.internal:80".to_string(),
+        ];
+        assert!(trusted_private_match(
+            &default_ports,
+            "https://example.internal/x"
+        ));
+        assert!(trusted_private_match(
+            &default_ports,
+            "http://plain.internal/x"
+        ));
         // Empty allowlist and unparsable URL.
         assert!(!trusted_private_match(&[], "http://127.0.0.1:1200/x"));
         assert!(!trusted_private_match(&hosts, "not a url"));
@@ -615,7 +642,9 @@ mod tests {
         cap_host_buckets(&mut m, "new-host");
         // All idle buckets gone, all busy buckets kept, room for the new host.
         assert_eq!(m.len(), MAX_HOST_BUCKETS / 2);
-        assert!(m.values().all(|s| s.available_permits() < HOST_DOWNLOAD_CONCURRENCY));
+        assert!(m
+            .values()
+            .all(|s| s.available_permits() < HOST_DOWNLOAD_CONCURRENCY));
         assert!(m.len() < MAX_HOST_BUCKETS);
     }
 
@@ -633,6 +662,10 @@ mod tests {
         let mut m = HashMap::new();
         fill(&mut m, MAX_HOST_BUCKETS, false);
         cap_host_buckets(&mut m, "host-0");
-        assert_eq!(m.len(), MAX_HOST_BUCKETS, "requests to cached hosts must not evict");
+        assert_eq!(
+            m.len(),
+            MAX_HOST_BUCKETS,
+            "requests to cached hosts must not evict"
+        );
     }
 }

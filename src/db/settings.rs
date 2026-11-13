@@ -3,7 +3,6 @@
 use super::*;
 use sqlx::Row;
 
-
 pub async fn get_setting(db: &Db, key: &str) -> anyhow::Result<Option<String>> {
     let row = sqlx::query("SELECT value FROM settings WHERE key = ?")
         .bind(key)
@@ -55,14 +54,18 @@ pub async fn flip_setting_once(db: &Db, key: &str, to: &str) -> anyhow::Result<b
 /// Returns a Result: a transient DB error must not be treated as "no data"
 /// (consistent with the project's fail-closed principle); the caller decides
 /// explicitly (startup cleanup / cookie-loading scenarios log a warn and skip).
-pub async fn get_settings_by_prefix(db: &Db, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
+pub async fn get_settings_by_prefix(
+    db: &Db,
+    prefix: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
     // `instr` instead of LIKE: key prefixes such as `platform_health:` contain
     // `_`, which LIKE treats as a single-character wildcard.
     let rows = sqlx::query("SELECT key, value FROM settings WHERE instr(key, ?) = 1")
         .bind(prefix)
         .fetch_all(db)
         .await?;
-    Ok(rows.iter()
+    Ok(rows
+        .iter()
         .map(|r| (r.get::<String, _>("key"), r.get::<String, _>("value")))
         .collect())
 }
@@ -77,4 +80,3 @@ pub async fn get_chat_owner(db: &Db, chat_id: &str) -> anyhow::Result<Option<i64
         .and_then(|c| c.added_by)
         .and_then(|s| s.parse::<i64>().ok()))
 }
-

@@ -13,14 +13,12 @@ pub static RE_TAG: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"<[^>]+>").unwrap());
 /// Anchor opening tag carrying a non-empty href (the only shape
 /// `html_to_telegram_html` emits; feeds may also provide this form directly).
-static RE_ANCHOR_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?i)^<a\b[^>]*?\bhref\s*=\s*["'][^"']+["']"#).unwrap()
-});
+static RE_ANCHOR_OPEN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"(?i)^<a\b[^>]*?\bhref\s*=\s*["'][^"']+["']"#).unwrap());
 static RE_ANCHOR_CLOSE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)^</a\s*>").unwrap());
-static RE_HREF_VALUE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?i)\bhref\s*=\s*["']([^"']+)["']"#).unwrap()
-});
+static RE_HREF_VALUE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"(?i)\bhref\s*=\s*["']([^"']+)["']"#).unwrap());
 
 /// Protocols Telegram can safely render as a clickable link. Scheme-less and
 /// `javascript:` / `data:` hrefs are dropped by the caller (text is kept).
@@ -40,7 +38,8 @@ fn anchor_href(tag: &str) -> Option<&str> {
 }
 /// HTML entity reference anchored at the start of a slice.
 static RE_ENTITY_REF: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"^&(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#[1-9][0-9]{0,6}|#[xX][0-9a-fA-F]{1,6});").unwrap()
+    regex::Regex::new(r"^&(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#[1-9][0-9]{0,6}|#[xX][0-9a-fA-F]{1,6});")
+        .unwrap()
 });
 /// Blockquote open/close tags used by the splitter. Kept module-level so the
 /// balanced-close scan and the re-wrap branch use the same patterns.
@@ -143,10 +142,7 @@ pub fn truncate_text(s: &str, max_units: usize) -> String {
     if utf16_len(s) <= max_units {
         return s.to_string();
     }
-    format!(
-        "{}…",
-        take_utf16_prefix(s, max_units.saturating_sub(1))
-    )
+    format!("{}…", take_utf16_prefix(s, max_units.saturating_sub(1)))
 }
 
 // ---------------------------------------------------------------------------
@@ -541,8 +537,7 @@ pub fn normalize_blockquote_fold(html: &str) -> String {
         out.push_str(&html[pos..open_start]);
         // Single depth-counting implementation shared with the splitter and
         // the Telegram channel parser.
-        let close_span =
-            find_balanced_close(html, inner_start, &RE_BQ_OPEN_TAG, &RE_BQ_CLOSE_TAG);
+        let close_span = find_balanced_close(html, inner_start, &RE_BQ_OPEN_TAG, &RE_BQ_CLOSE_TAG);
         let Some((close_start, close_end)) = close_span else {
             out.push_str(&html[open_start..]);
             pos = html.len();
@@ -658,9 +653,7 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                         regex::Regex::new(r"(?is)<pre\b[^>]*><code\b[^>]*>").unwrap()
                     });
                 static RE_PRE_BARE: std::sync::LazyLock<regex::Regex> =
-                    std::sync::LazyLock::new(|| {
-                        regex::Regex::new(r"(?is)<pre\b[^>]*>").unwrap()
-                    });
+                    std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<pre\b[^>]*>").unwrap());
                 let code_match = RE_PRE_OPEN.find(para.as_str());
                 let bare_match = RE_PRE_BARE.find(para.as_str());
                 let open_match = code_match.as_ref().or(bare_match.as_ref());
@@ -693,9 +686,8 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                     };
                     stripped.replace(&close_tag, "")
                 };
-                let inner_limit = limit.saturating_sub(
-                    utf16_len(&open_tag) + utf16_len(&close_tag),
-                );
+                let inner_limit =
+                    limit.saturating_sub(utf16_len(&open_tag) + utf16_len(&close_tag));
                 // Split by lines and bin-pack greedily; when a single line
                 // itself exceeds the limit, hard-split it on UTF-16
                 // boundaries (otherwise an oversized line would pass through
@@ -791,9 +783,8 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                 };
                 let prefix = para[..bq_start].trim_end_matches('\n').to_string();
                 let inner = &para[open_end..inner_end];
-                let inner_limit = limit.saturating_sub(
-                    BQ_OPEN.chars().count() + BQ_CLOSE.chars().count(),
-                );
+                let inner_limit =
+                    limit.saturating_sub(BQ_OPEN.chars().count() + BQ_CLOSE.chars().count());
 
                 // Budget available to the quote block: if there is an
                 // original-text prefix, deduct the prefix length (+1 for the
@@ -807,9 +798,7 @@ pub fn split_html(text: &str, limit: usize) -> Vec<String> {
                 } else {
                     inner_limit.saturating_sub(prefix_visible + 1)
                 };
-                let merge_first = !prefix.is_empty()
-                    && prefix_visible <= limit
-                    && budget >= 100;
+                let merge_first = !prefix.is_empty() && prefix_visible <= limit && budget >= 100;
 
                 let subs = if merge_first {
                     split_html(inner, budget)
@@ -1012,7 +1001,10 @@ impl CutCandidate {
 fn tag_name(tag: &str) -> Option<String> {
     let inner = tag.strip_prefix('<')?.strip_suffix('>')?;
     let inner = inner.strip_prefix('/').unwrap_or(inner);
-    let name: String = inner.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+    let name: String = inner
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
     (!name.is_empty()).then(|| name.to_lowercase())
 }
 
@@ -1053,7 +1045,10 @@ fn scan_split_candidates(text: &str, limit: usize) -> SplitScan {
                         *slot = None;
                     }
                 }
-                return SplitScan { best, end_stack: stack };
+                return SplitScan {
+                    best,
+                    end_stack: stack,
+                };
             };
             let tag = &rest[..gt + 1];
             let end = i + gt + 1;
@@ -1385,7 +1380,9 @@ mod tests {
     #[test]
     fn plain_fallback_keeps_anchor_destinations() {
         assert_eq!(
-            strip_html_keep_links(r#"before <a href="https://example.com/a?x=1&amp;y=2">link</a> after"#),
+            strip_html_keep_links(
+                r#"before <a href="https://example.com/a?x=1&amp;y=2">link</a> after"#
+            ),
             "before https://example.com/a?x=1&y=2 link after"
         );
     }
@@ -1439,20 +1436,34 @@ mod tests {
         );
         assert_eq!(decode_entities("x&nbsp;y &copy;"), "x y ©");
         // HTML5-only names and multi-codepoint replacements.
-        assert_eq!(decode_entities("&check; &NotEqualTilde;"), "✓ \u{2242}\u{338}");
+        assert_eq!(
+            decode_entities("&check; &NotEqualTilde;"),
+            "✓ \u{2242}\u{338}"
+        );
         assert_eq!(decode_entities("a&NewLine;b"), "a\nb");
-        assert_eq!(decode_entities("&amp;lt;"), "&lt;", "entity must decode exactly once");
+        assert_eq!(
+            decode_entities("&amp;lt;"),
+            "&lt;",
+            "entity must decode exactly once"
+        );
     }
 
     #[test]
     fn decodes_numeric_entities_and_keeps_whitespace_controls() {
         assert_eq!(decode_entities("a&#10;b&#9;c"), "a\nb\tc");
         assert_eq!(decode_entities("a&#x4E2D;b"), "a中b");
-        assert_eq!(decode_entities("a&#160;b"), "a b", "numeric nbsp becomes a plain space");
+        assert_eq!(
+            decode_entities("a&#160;b"),
+            "a b",
+            "numeric nbsp becomes a plain space"
+        );
         // NUL and other non-whitespace controls are dropped.
         assert_eq!(decode_entities("a&#0;b&#7;c"), "abc");
         // Invalid references stay literal.
-        assert_eq!(decode_entities("&unknown; &#x110000;"), "&unknown; &#x110000;");
+        assert_eq!(
+            decode_entities("&unknown; &#x110000;"),
+            "&unknown; &#x110000;"
+        );
     }
 
     #[test]
@@ -1508,7 +1519,11 @@ mod tests {
         // 2 paragraphs.
         let text = ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"].join("\n\n");
         let out = split_html(&text, 25);
-        assert!(out.len() >= 2, "expected multiple chunks, got {}", out.len());
+        assert!(
+            out.len() >= 2,
+            "expected multiple chunks, got {}",
+            out.len()
+        );
         for c in &out {
             assert!(visible_len(c) <= 25, "chunk exceeds limit: {:?}", c);
         }
@@ -1522,7 +1537,11 @@ mod tests {
         // All visible content should appear in some chunk (lossless at the
         // paragraph level).
         for p in &paras {
-            assert!(out.iter().any(|c| c.contains(p)), "missing paragraph: {}", p);
+            assert!(
+                out.iter().any(|c| c.contains(p)),
+                "missing paragraph: {}",
+                p
+            );
         }
     }
 
@@ -1536,10 +1555,19 @@ mod tests {
         let out = split_html(&text, 100);
         // Exactly one chunk contains the blockquote, with both lines inside.
         let holders: Vec<_> = out.iter().filter(|c| c.contains("<blockquote")).collect();
-        assert_eq!(holders.len(), 1, "blockquote spread across chunks: {:?}", out);
+        assert_eq!(
+            holders.len(),
+            1,
+            "blockquote spread across chunks: {:?}",
+            out
+        );
         assert!(holders[0].contains("引用第一行"), "chunk: {:?}", holders[0]);
         assert!(holders[0].contains("引用第二行"), "chunk: {:?}", holders[0]);
-        assert!(holders[0].contains("</blockquote>"), "chunk: {:?}", holders[0]);
+        assert!(
+            holders[0].contains("</blockquote>"),
+            "chunk: {:?}",
+            holders[0]
+        );
     }
 
     #[test]
@@ -1555,7 +1583,12 @@ mod tests {
         let bq = format!("<blockquote>{}\n\n{}</blockquote>", para1, para2);
         let out = split_html(&bq, 78);
         // Should be split into 2 chunks (each paragraph wrapped on its own).
-        assert!(out.len() >= 2, "expected >=2 chunks, got {}: {:?}", out.len(), out);
+        assert!(
+            out.len() >= 2,
+            "expected >=2 chunks, got {}: {:?}",
+            out.len(),
+            out
+        );
         // No chunk should contain only half a blockquote (well-formedness).
         for c in &out {
             let has_open = c.contains("<blockquote");
@@ -1577,7 +1610,12 @@ mod tests {
         let text = format!("前置段落\n\n{}\n\n后置段落", pre);
         let out = split_html(&text, 100);
         let holders: Vec<_> = out.iter().filter(|c| c.contains("<pre>")).collect();
-        assert_eq!(holders.len(), 1, "pre block spread across chunks: {:?}", out);
+        assert_eq!(
+            holders.len(),
+            1,
+            "pre block spread across chunks: {:?}",
+            out
+        );
         assert!(holders[0].contains("line1"), "chunk: {:?}", holders[0]);
         assert!(holders[0].contains("line2"), "chunk: {:?}", holders[0]);
         assert!(holders[0].contains("</pre>"), "chunk: {:?}", holders[0]);
@@ -1594,10 +1632,18 @@ mod tests {
         let line1 = "A".repeat(20);
         let line2 = "B".repeat(20);
         let line3 = "C".repeat(20);
-        let pre = format!("<pre><code>{}\n\n{}\n\n{}</code></pre>", line1, line2, line3);
+        let pre = format!(
+            "<pre><code>{}\n\n{}\n\n{}</code></pre>",
+            line1, line2, line3
+        );
         let out = split_html(&pre, 50);
         // Should be split into multiple chunks.
-        assert!(out.len() >= 2, "expected >=2 chunks, got {}: {:?}", out.len(), out);
+        assert!(
+            out.len() >= 2,
+            "expected >=2 chunks, got {}: {:?}",
+            out.len(),
+            out
+        );
         for c in &out {
             let has_open = c.contains("<pre>");
             let has_close = c.contains("</pre>");
@@ -1616,8 +1662,15 @@ mod tests {
         let out = split_html(&text, 80);
         let tail = out.last().expect("at least one chunk");
         assert!(tail.contains("AFTER"), "suffix lost: {:?}", out);
-        assert!(!tail.contains("<blockquote"), "suffix wrapped into quote: {tail:?}");
-        assert!(out.iter().any(|c| c.contains("引")), "quote content lost: {:?}", out);
+        assert!(
+            !tail.contains("<blockquote"),
+            "suffix wrapped into quote: {tail:?}"
+        );
+        assert!(
+            out.iter().any(|c| c.contains("引")),
+            "quote content lost: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -1628,7 +1681,11 @@ mod tests {
         let tail = out.last().expect("at least one chunk");
         assert!(tail.contains("AFTER"), "suffix lost: {:?}", out);
         assert!(!tail.contains("<pre"), "suffix wrapped into pre: {tail:?}");
-        assert!(out.iter().any(|c| c.contains("line")), "code content lost: {:?}", out);
+        assert!(
+            out.iter().any(|c| c.contains("line")),
+            "code content lost: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -1662,11 +1719,23 @@ mod tests {
         let long_line = "x".repeat(9000); // Oversized single line with no newline
         let html = format!("<pre><code>{}</code></pre>", long_line);
         let chunks = split_html(&html, 4096);
-        assert!(chunks.len() > 1, "oversized single line must be split, got {} chunk(s)", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "oversized single line must be split, got {} chunk(s)",
+            chunks.len()
+        );
         for c in &chunks {
-            assert!(utf16_len(c) <= 4096, "chunk exceeds limit: len={}", utf16_len(c));
+            assert!(
+                utf16_len(c) <= 4096,
+                "chunk exceeds limit: len={}",
+                utf16_len(c)
+            );
             // Every chunk must be re-wrapped as valid pre/code
-            assert!(c.contains("<pre"), "chunk missing pre open: {}", &c[..c.len().min(60)]);
+            assert!(
+                c.contains("<pre"),
+                "chunk missing pre open: {}",
+                &c[..c.len().min(60)]
+            );
             assert!(c.contains("</pre>"), "chunk missing pre close");
         }
     }
@@ -1701,7 +1770,11 @@ mod tests {
         let header = "头".repeat(51);
         let input = format!("<blockquote>{}\n\n正文</blockquote>", header);
         let out = normalize_blockquote_fold(&input);
-        assert!(out.contains("\n\n"), "long header should keep paragraph gap: {}", out);
+        assert!(
+            out.contains("\n\n"),
+            "long header should keep paragraph gap: {}",
+            out
+        );
     }
 
     #[test]
@@ -1723,7 +1796,9 @@ mod tests {
         // Nested blockquote: the positional scan must locate the outermost
         // closing tag and must not truncate at the first inner
         // </blockquote>, leaving an orphan closing tag (M10 regression test).
-        let out = normalize_blockquote_fold("<blockquote>外层 <blockquote>内层</blockquote> 结尾</blockquote>");
+        let out = normalize_blockquote_fold(
+            "<blockquote>外层 <blockquote>内层</blockquote> 结尾</blockquote>",
+        );
         let opens = out.matches("<blockquote").count();
         let closes = out.matches("</blockquote>").count();
         assert_eq!(opens, closes, "orphan close tag: {}", out);
@@ -1735,7 +1810,8 @@ mod tests {
     fn fold_adjacent_blockquotes_both_processed() {
         // Both adjacent blockquotes must be processed (the positional scan
         // loop must advance pos correctly).
-        let out = normalize_blockquote_fold("<blockquote>甲</blockquote><blockquote>乙</blockquote>");
+        let out =
+            normalize_blockquote_fold("<blockquote>甲</blockquote><blockquote>乙</blockquote>");
         assert_eq!(out.matches("</blockquote>").count(), 2, "got: {}", out);
         assert!(out.contains("甲") && out.contains("乙"), "got: {}", out);
     }
@@ -1764,7 +1840,10 @@ mod tests {
         }
         // Content is preserved across the balanced re-wrapped fragments (the
         // inner text is contiguous per chunk, not across chunk boundaries).
-        assert_eq!(out.iter().map(|c| c.matches('字').count()).sum::<usize>(), 100);
+        assert_eq!(
+            out.iter().map(|c| c.matches('字').count()).sum::<usize>(),
+            100
+        );
     }
 
     #[test]
@@ -1796,7 +1875,10 @@ mod tests {
                 );
             }
             assert_eq!(
-                chunks.iter().map(|c| c.matches('中').count()).sum::<usize>(),
+                chunks
+                    .iter()
+                    .map(|c| c.matches('中').count())
+                    .sum::<usize>(),
                 n,
                 "content lost at limit {limit}"
             );
@@ -1891,12 +1973,13 @@ second paragraph</a> tail"#;
         assert!(out.len() >= 2);
         for c in &out {
             let scan = scan_split_candidates(c, usize::MAX);
-            assert!(
-                scan.end_stack.is_empty(),
-                "unclosed tags in chunk: {c}"
-            );
+            assert!(scan.end_stack.is_empty(), "unclosed tags in chunk: {c}");
             assert!(visible_len(c) <= 25, "chunk exceeds limit: {c}");
-            assert_eq!(c.matches("<a ").count(), c.matches("</a>").count(), "unbalanced anchor: {c}");
+            assert_eq!(
+                c.matches("<a ").count(),
+                c.matches("</a>").count(),
+                "unbalanced anchor: {c}"
+            );
         }
     }
 
@@ -1905,7 +1988,8 @@ second paragraph</a> tail"#;
         // Nested blockquotes: pre-segmentation stops at the inner close, so
         // the outer open tag can end up unclosed in a chunk. Rebalancing must
         // make every chunk well-formed.
-        let html = "<blockquote>outer <blockquote>inner</blockquote> text\n\nmore</blockquote> tail";
+        let html =
+            "<blockquote>outer <blockquote>inner</blockquote> text\n\nmore</blockquote> tail";
         let out = split_html(html, 20);
         assert!(out.len() >= 2);
         for c in &out {

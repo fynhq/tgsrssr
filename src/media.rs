@@ -21,22 +21,27 @@ use crate::state::AppState;
 /// Attribute-level extractors stay here (media-only concerns).
 static RE_SOURCE_SRC: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"<source\b[^>]*?src\s*=\s*["']([^"']+)["']"#).unwrap());
-static RE_VIDEO_SRC: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?is)<video\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#).unwrap());
+static RE_VIDEO_SRC: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)<video\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#).unwrap()
+});
 /// Extract poster attribute from <video> tags (cover image URL for fallback).
-static RE_VIDEO_POSTER: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"<video\b[^>]*?\bposter\s*=\s*["']([^"']+)["']"#).unwrap());
+static RE_VIDEO_POSTER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"<video\b[^>]*?\bposter\s*=\s*["']([^"']+)["']"#).unwrap()
+});
 /// Owning Weibo status id embedded by the native fetcher. Used to query the
 /// correct playback_list for HD video (main post vs retweeted post).
 static RE_VIDEO_OWNER_MID: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?is)<video\b[^>]*?\bdata-weibo-mid\s*=\s*["']([^"']+)["']"#).unwrap()
 });
-static RE_ANCHOR_BLOCK: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?is)<a\b[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>.*?</a>"#).unwrap());
-static RE_URL_ICON_SPAN: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?is)<span\s[^>]*class\s*=\s*["']?url-icon["']?[^>]*>.*?</span>"#).unwrap());
-static RE_IMG_SRC: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"<img\b[^>]*?(?:src|data-src)\s*=\s*["']([^"']+)["']"#).unwrap());
+static RE_ANCHOR_BLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)<a\b[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>.*?</a>"#).unwrap()
+});
+static RE_URL_ICON_SPAN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)<span\s[^>]*class\s*=\s*["']?url-icon["']?[^>]*>.*?</span>"#).unwrap()
+});
+static RE_IMG_SRC: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"<img\b[^>]*?(?:src|data-src)\s*=\s*["']([^"']+)["']"#).unwrap()
+});
 
 /// A downloaded media file ready to be sent.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -160,15 +165,11 @@ impl MediaBudget {
             return None;
         }
         let _guard = self.refresh_lock.lock().await;
-        let need_refresh = !self
-            .initialized
-            .load(std::sync::atomic::Ordering::Acquire)
+        let need_refresh = !self.initialized.load(std::sync::atomic::Ordering::Acquire)
             || self
                 .used
                 .load(std::sync::atomic::Ordering::Acquire)
-                .saturating_add(
-                    self.reserved.load(std::sync::atomic::Ordering::Acquire),
-                )
+                .saturating_add(self.reserved.load(std::sync::atomic::Ordering::Acquire))
                 .saturating_add(want)
                 > cap;
         if need_refresh {
@@ -178,15 +179,10 @@ impl MediaBudget {
                 .unwrap_or_else(|p| p.into_inner())
                 .map(|t| t.elapsed() >= MEDIA_BUDGET_REFRESH)
                 .unwrap_or(true);
-            if stale
-                || !self
-                    .initialized
-                    .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if stale || !self.initialized.load(std::sync::atomic::Ordering::Acquire) {
                 match crate::fsutil::dir_size(media_dir).await {
                     Ok(size) => {
-                        self.used
-                            .store(size, std::sync::atomic::Ordering::Release);
+                        self.used.store(size, std::sync::atomic::Ordering::Release);
                         self.scan_failed
                             .store(false, std::sync::atomic::Ordering::Release);
                     }
@@ -215,7 +211,10 @@ impl MediaBudget {
         let reserved = self.reserved.load(std::sync::atomic::Ordering::Acquire);
         let free = cap.saturating_sub(used.saturating_add(reserved));
         if free < MIN_MEDIA_FREE_BYTES {
-            debug!(used, reserved, cap, "media budget exhausted, skipping download");
+            debug!(
+                used,
+                reserved, cap, "media budget exhausted, skipping download"
+            );
             return None;
         }
         let granted = want.min(free);
@@ -340,8 +339,8 @@ impl MediaKind {
         let lower = url.to_lowercase();
         let path_part = lower.split('?').next().unwrap_or(&lower);
         const IMG: [&str; 12] = [
-            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".avif",
-            ".heic", ".heif", ".tif", ".tiff",
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".avif", ".heic", ".heif",
+            ".tif", ".tiff",
         ];
         const VID: [&str; 6] = [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"];
         if IMG.iter().any(|e| path_part.ends_with(e)) {
@@ -461,7 +460,10 @@ fn upgrade_weibo_size(url: &str) -> String {
     if !is_weibo_host(&host) {
         return url.to_string();
     }
-    let segs: Vec<String> = u.path_segments().map(|s| s.map(str::to_string).collect()).unwrap_or_default();
+    let segs: Vec<String> = u
+        .path_segments()
+        .map(|s| s.map(str::to_string).collect())
+        .unwrap_or_default();
     if segs.is_empty() {
         return url.to_string();
     }
@@ -478,7 +480,15 @@ fn upgrade_weibo_size(url: &str) -> String {
 /// True for Weibo/Sina path size segments: thumbnail/square/bmiddle/small/
 /// orj360/orj480/large, plus numeric forms mw2000/bmw690/orj960 etc.
 fn is_weibo_size_seg(seg: &str) -> bool {
-    const NAMED: [&str; 7] = ["thumbnail", "square", "bmiddle", "small", "orj360", "orj480", "large"];
+    const NAMED: [&str; 7] = [
+        "thumbnail",
+        "square",
+        "bmiddle",
+        "small",
+        "orj360",
+        "orj480",
+        "large",
+    ];
     if NAMED.contains(&seg) {
         return true;
     }
@@ -493,11 +503,7 @@ fn is_weibo_size_seg(seg: &str) -> bool {
 /// stream; the HD stream lives in the m.weibo.cn status API under
 /// page_info.urls (hd / ultra / high keys). Best effort: query the API and
 /// replace the video URL; on any failure keep the original.
-async fn upgrade_weibo_video_hd(
-    state: &AppState,
-    owner_mid: Option<&str>,
-    url: &str,
-) -> String {
+async fn upgrade_weibo_video_hd(state: &AppState, owner_mid: Option<&str>, url: &str) -> String {
     // Only for weibo video hosts / weibo status links.
     let host = url::Url::parse(url)
         .ok()
@@ -512,7 +518,8 @@ async fn upgrade_weibo_video_hd(
     // with the main id can be replaced by the main post's video. The native
     // fetcher embeds data-weibo-mid on each <video>; legacy bodies without it
     // keep the original (low-quality) stream instead of risking a wrong swap.
-    let Some(mid) = owner_mid.filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_digit())) else {
+    let Some(mid) = owner_mid.filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_digit()))
+    else {
         return url.to_string();
     };
     let mid = mid.to_string();
@@ -574,7 +581,9 @@ async fn upgrade_weibo_video_hd(
         return url.to_string();
     };
 
-    let urls = json.pointer("/data/page_info/urls").and_then(|v| v.as_object());
+    let urls = json
+        .pointer("/data/page_info/urls")
+        .and_then(|v| v.as_object());
     let Some(urls) = urls else {
         return url.to_string();
     };
@@ -582,8 +591,16 @@ async fn upgrade_weibo_video_hd(
     // mp4_hd_mp4 / mp4_ld_mp4, plus the legacy ultra/hd/high/medium. Try
     // from highest to lowest quality.
     for key in [
-        "ultra", "hd", "high", "medium",
-        "mp4_4k_mp4", "mp4_1080p_mp4", "mp4_720p_mp4", "hevc_mp4_hd", "mp4_hd_mp4", "mp4_ld_mp4",
+        "ultra",
+        "hd",
+        "high",
+        "medium",
+        "mp4_4k_mp4",
+        "mp4_1080p_mp4",
+        "mp4_720p_mp4",
+        "hevc_mp4_hd",
+        "mp4_hd_mp4",
+        "mp4_ld_mp4",
     ] {
         if let Some(v) = urls.get(key).and_then(|v| v.as_str()) {
             if !v.is_empty() {
@@ -620,7 +637,11 @@ pub(crate) async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
         if let Some((cookie, ts)) = guard.as_ref() {
             let ttl = if cookie.is_empty() { NEGATIVE_TTL } else { TTL };
             if ts.elapsed() < ttl {
-                return if cookie.is_empty() { None } else { Some(cookie.clone()) };
+                return if cookie.is_empty() {
+                    None
+                } else {
+                    Some(cookie.clone())
+                };
             }
         }
     }
@@ -635,7 +656,11 @@ pub(crate) async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
         if let Some((cookie, ts)) = guard.as_ref() {
             let ttl = if cookie.is_empty() { NEGATIVE_TTL } else { TTL };
             if ts.elapsed() < ttl {
-                return if cookie.is_empty() { None } else { Some(cookie.clone()) };
+                return if cookie.is_empty() {
+                    None
+                } else {
+                    Some(cookie.clone())
+                };
             }
         }
     }
@@ -643,7 +668,10 @@ pub(crate) async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
     {
         // Record the outcome for the TTL window (empty string = negative).
         let mut guard = state.weibo_visitor_cookie.lock().await;
-        *guard = Some((cookie.clone().unwrap_or_default(), std::time::Instant::now()));
+        *guard = Some((
+            cookie.clone().unwrap_or_default(),
+            std::time::Instant::now(),
+        ));
     }
     cookie
 }
@@ -674,7 +702,9 @@ async fn fetch_visitor_cookie(state: &AppState) -> Option<String> {
     // The response is a tiny JSONP body, but it still comes from an external
     // endpoint: use the shared 20MB capped reader instead of an unbounded
     // .text() buffering path.
-    let body = crate::fetcher::read_body_capped(resp, "weibo visitor genvisitor").await.ok()?;
+    let body = crate::fetcher::read_body_capped(resp, "weibo visitor genvisitor")
+        .await
+        .ok()?;
     let text = String::from_utf8_lossy(&body).into_owned();
 
     // The response is JSONP: gen_callback({...}); strip the wrapper to get
@@ -682,11 +712,20 @@ async fn fetch_visitor_cookie(state: &AppState) -> Option<String> {
     let json_str = text
         .strip_prefix("gen_callback(")
         .and_then(|s| s.strip_suffix(");"))
-        .or_else(|| text.strip_prefix("gen_callback(").and_then(|s| s.strip_suffix(")")))?;
+        .or_else(|| {
+            text.strip_prefix("gen_callback(")
+                .and_then(|s| s.strip_suffix(")"))
+        })?;
     let data: serde_json::Value = serde_json::from_str(json_str).ok()?;
     let tid = data.pointer("/data/tid").and_then(|v| v.as_str())?;
-    let new_tid = data.pointer("/data/new_tid").and_then(|v| v.as_bool()).unwrap_or(false);
-    let confidence = data.pointer("/data/confidence").and_then(|v| v.as_i64()).unwrap_or(100);
+    let new_tid = data
+        .pointer("/data/new_tid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let confidence = data
+        .pointer("/data/confidence")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(100);
 
     // Step 2: incarnate — exchange the tid for guest SUB/SUBP cookies
     let w = if new_tid { 3 } else { 2 };
@@ -784,15 +823,18 @@ fn detect_image_ext(head: &[u8]) -> Option<&'static str> {
     if head.len() >= 12 && &head[4..8] == b"ftyp" {
         return match &head[8..12] {
             b"avif" | b"avis" => Some("avif"),
-            b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"hevm"
-            | b"hevs" | b"mif1" | b"msf1" => Some("heic"),
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"hevm" | b"hevs"
+            | b"mif1" | b"msf1" => Some("heic"),
             _ => None,
         };
     }
     if head.starts_with(b"II*\0") || head.starts_with(b"MM\0*") {
         return Some("tiff");
     }
-    let start = head.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(head.len());
+    let start = head
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(head.len());
     let trimmed = &head[start..];
     if trimmed.starts_with(b"<svg") {
         return Some("svg");
@@ -805,7 +847,10 @@ fn detect_image_ext(head: &[u8]) -> Option<&'static str> {
         let decl_end = find_subslice(trimmed, b"?>")?;
         let mut rest = &trimmed[decl_end + 2..];
         loop {
-            let skip = rest.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(rest.len());
+            let skip = rest
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .unwrap_or(rest.len());
             rest = &rest[skip..];
             if rest.starts_with(b"<!--") {
                 let end = find_subslice(rest, b"-->")?;
@@ -843,8 +888,18 @@ fn detect_video_container(head: &[u8]) -> Option<&'static str> {
                 let brand = &head[8..12];
                 let image_brand = matches!(
                     brand,
-                    b"avif" | b"avis" | b"heic" | b"heix" | b"hevc" | b"hevx"
-                        | b"heim" | b"heis" | b"hevm" | b"hevs" | b"mif1" | b"msf1"
+                    b"avif"
+                        | b"avis"
+                        | b"heic"
+                        | b"heix"
+                        | b"hevc"
+                        | b"hevx"
+                        | b"heim"
+                        | b"heis"
+                        | b"hevm"
+                        | b"hevs"
+                        | b"mif1"
+                        | b"msf1"
                 );
                 if image_brand {
                     return None;
@@ -983,7 +1038,10 @@ fn urlencoding(s: &str) -> String {
 fn same_origin(a: &str, b: &str) -> bool {
     let key = |s: &str| {
         let u = url::Url::parse(s).ok()?;
-        Some((u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()))
+        Some((
+            u.host_str()?.to_ascii_lowercase(),
+            u.port_or_known_default(),
+        ))
     };
     matches!((key(a), key(b)), (Some(a), Some(b)) if a == b)
 }
@@ -1025,7 +1083,9 @@ async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -
     // pipeline and the other platform JSON reads). `.ok()?` keeps the previous
     // silent-None-on-any-failure semantics; the only change is that an
     // oversized/malformed API response can no longer buffer unbounded.
-    let json = crate::fetcher::read_json_capped(resp, "weibo HD playback API").await.ok()?;
+    let json = crate::fetcher::read_json_capped(resp, "weibo HD playback API")
+        .await
+        .ok()?;
 
     let list = json
         .pointer("/page_info/media_info/playback_list")
@@ -1037,7 +1097,9 @@ async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -
     for item in list {
         // An item missing play_info (e.g. ad/preview item) is just skipped;
         // don't give up on the whole list
-        let Some(pi) = item.get("play_info") else { continue };
+        let Some(pi) = item.get("play_info") else {
+            continue;
+        };
         let vurl = pi.get("url").and_then(|v| v.as_str()).unwrap_or("");
         if vurl.is_empty() {
             continue;
@@ -1090,11 +1152,17 @@ pub struct MediaWarning {
 
 impl MediaWarning {
     fn plain(text: String) -> Self {
-        Self { text, oversized_skip: false }
+        Self {
+            text,
+            oversized_skip: false,
+        }
     }
 
     fn oversized(text: String) -> Self {
-        Self { text, oversized_skip: true }
+        Self {
+            text,
+            oversized_skip: true,
+        }
     }
 }
 
@@ -1162,7 +1230,9 @@ fn ensure_outbound_dir(media_dir: &std::path::Path) -> std::io::Result<PathBuf> 
 enum DownloadOutcome {
     Item(MediaItem),
     /// Exceeded the size cap (video cap or global cap).
-    Oversized { size: Option<u64> },
+    Oversized {
+        size: Option<u64>,
+    },
     /// Zero-byte response.
     Empty,
     /// Bytes do not match the claimed image/video container (e.g. an HTML
@@ -1178,8 +1248,14 @@ enum DownloadOutcome {
 enum RawOutcome {
     /// Download complete: temp file path + byte count + content hash
     /// (computed incrementally).
-    File { path: PathBuf, size: u64, content_hash: String },
-    Oversized { size: Option<u64> },
+    File {
+        path: PathBuf,
+        size: u64,
+        content_hash: String,
+    },
+    Oversized {
+        size: Option<u64>,
+    },
     /// The shared budget granted less than the requested per-file cap and the
     /// file fits the requested cap but not the grant. This is a quota skip,
     /// not an oversized file.
@@ -1265,9 +1341,7 @@ pub fn extract_media_urls(
         //    <video src="..."> tag instead of using <source> children.
         for caps in RE_VIDEO_BLOCK.captures_iter(body) {
             let block = caps.get(0).unwrap().as_str();
-            let owner_mid = RE_VIDEO_OWNER_MID
-                .captures(block)
-                .map(|c| c[1].to_string());
+            let owner_mid = RE_VIDEO_OWNER_MID.captures(block).map(|c| c[1].to_string());
             if let Some(src_caps) = RE_SOURCE_SRC.captures(block) {
                 let url = crate::htmltext::unescape_html(&src_caps[1]);
                 push(url, "video/unknown".to_string(), false, owner_mid.clone());
@@ -1287,14 +1361,16 @@ pub fn extract_media_urls(
         //    entirely. Audio/file anchors are kept too (their icons/links may
         //    be real content); the text renderer drops image-anchor text when
         //    the media is sent separately.
-        remaining = RE_ANCHOR_BLOCK.replace_all(&remaining, |caps: &regex::Captures| {
-            let href = crate::htmltext::unescape_html(&caps[1]);
-            if fetcher::is_video_href(&href) {
-                String::new()
-            } else {
-                caps.get(0).unwrap().as_str().to_string()
-            }
-        }).to_string();
+        remaining = RE_ANCHOR_BLOCK
+            .replace_all(&remaining, |caps: &regex::Captures| {
+                let href = crate::htmltext::unescape_html(&caps[1]);
+                if fetcher::is_video_href(&href) {
+                    String::new()
+                } else {
+                    caps.get(0).unwrap().as_str().to_string()
+                }
+            })
+            .to_string();
 
         // 2.5) Remove all <span class="url-icon">…</span> blocks. These are
         //      small icon images (article cards, live cards, link previews,
@@ -1307,7 +1383,9 @@ pub fn extract_media_urls(
         //    below (the former data-rt detection has been removed).
         for caps in RE_IMG_TAG.captures_iter(&remaining) {
             let tag = caps.get(0).unwrap().as_str();
-            let Some(src_caps) = RE_IMG_SRC.captures(tag) else { continue };
+            let Some(src_caps) = RE_IMG_SRC.captures(tag) else {
+                continue;
+            };
             let url = crate::htmltext::unescape_html(&src_caps[1]);
             push(url, "image/unknown".to_string(), false, None);
         }
@@ -1470,9 +1548,8 @@ pub async fn prepare_entry_media(
     }
 
     // Build video→poster mapping for cover image fallback on oversized/failed videos.
-    let poster_map: std::collections::HashMap<String, String> = extract_video_posters(entry)
-        .into_iter()
-        .collect();
+    let poster_map: std::collections::HashMap<String, String> =
+        extract_video_posters(entry).into_iter().collect();
 
     // All runtime date semantics use UTC explicitly (not Local): log
     // rotation and timestamps are fixed to UTC by tracing-appender /
@@ -1509,7 +1586,9 @@ pub async fn prepare_entry_media(
         let entry_remaining = MAX_MEDIA_BYTES_PER_ENTRY.saturating_sub(entry_bytes);
         if entry_remaining < MIN_MEDIA_FREE_BYTES {
             warn!(entry_id = %fetcher::entry_id(entry), "per-entry media byte cap reached, skipping remaining candidates");
-            out.warnings.push(MediaWarning::plain(crate::i18n::t(lang, "media_entry_cap_skip").to_string()));
+            out.warnings.push(MediaWarning::plain(
+                crate::i18n::t(lang, "media_entry_cap_skip").to_string(),
+            ));
             break;
         }
         let download_cap = base_cap.min(entry_remaining);
@@ -1542,14 +1621,35 @@ pub async fn prepare_entry_media(
         // (previously the relay/direct result handling was duplicated
         // verbatim and the cover-fallback call was copied in 4 places —
         // high risk of fixing one and missing another).
-        let (result, relay_err) = match download_one(state, &url, &kind, &mime, &outbound, allow_trusted_private, Some(feed_url), download_cap).await {
+        let (result, relay_err) = match download_one(
+            state,
+            &url,
+            &kind,
+            &mime,
+            &outbound,
+            allow_trusted_private,
+            Some(feed_url),
+            download_cap,
+        )
+        .await
+        {
             // A relay 200 with an empty body is a relay failure, not evidence
             // that the origin has no media. The direct URL may still work;
             // previously only Err triggered the fallback and the media was
             // dropped with a misleading "empty response" warning.
             Ok(DownloadOutcome::Empty) if via_relay => {
                 warn!(relay_url = %url, direct_url = %direct_url, "relay returned an empty response, retrying direct");
-                let r = download_one(state, &direct_url, &kind, &mime, &outbound, allow_trusted_private, Some(feed_url), download_cap).await;
+                let r = download_one(
+                    state,
+                    &direct_url,
+                    &kind,
+                    &mime,
+                    &outbound,
+                    allow_trusted_private,
+                    Some(feed_url),
+                    download_cap,
+                )
+                .await;
                 (r, Some("relay returned an empty response".to_string()))
             }
             Err(e) if via_relay => {
@@ -1563,7 +1663,17 @@ pub async fn prepare_entry_media(
                 // root cause (Worker 502 / connect / SOCKS layer) is visible,
                 // not just the outer "error sending request for url (...)" wrapper.
                 warn!(relay_url = %url, direct_url = %direct_url, error = format!("{:#}", e), "relay download failed, retrying direct");
-                let r = download_one(state, &direct_url, &kind, &mime, &outbound, allow_trusted_private, Some(feed_url), download_cap).await;
+                let r = download_one(
+                    state,
+                    &direct_url,
+                    &kind,
+                    &mime,
+                    &outbound,
+                    allow_trusted_private,
+                    Some(feed_url),
+                    download_cap,
+                )
+                .await;
                 (r, Some(format!("{:#}", e)))
             }
             other => (other, None),
@@ -1610,13 +1720,21 @@ pub async fn prepare_entry_media(
                     video_needs_cover = true;
                 } else {
                     out.warnings.push(MediaWarning::oversized(
-                        crate::i18n::t(lang, "media_oversized_skip").replacen("{}", kind_label(lang, &kind), 1),
+                        crate::i18n::t(lang, "media_oversized_skip").replacen(
+                            "{}",
+                            kind_label(lang, &kind),
+                            1,
+                        ),
                     ));
                     debug!(url = %url, "media skipped (size limit)");
                 }
             }
             Ok(DownloadOutcome::Empty) => {
-                let msg = crate::i18n::t(lang, "media_dl_empty").replacen("{}", kind_label(lang, &kind), 1);
+                let msg = crate::i18n::t(lang, "media_dl_empty").replacen(
+                    "{}",
+                    kind_label(lang, &kind),
+                    1,
+                );
                 debug!(url = %url, "media skipped (empty response)");
                 out.warnings.push(MediaWarning::plain(msg));
                 // A 200 with an empty body is often a transient CDN hiccup
@@ -1629,8 +1747,11 @@ pub async fn prepare_entry_media(
                 }
             }
             Ok(DownloadOutcome::InvalidContent) => {
-                let msg = crate::i18n::t(lang, "media_invalid_content")
-                    .replacen("{}", kind_label(lang, &kind), 1);
+                let msg = crate::i18n::t(lang, "media_invalid_content").replacen(
+                    "{}",
+                    kind_label(lang, &kind),
+                    1,
+                );
                 out.warnings.push(MediaWarning::plain(msg));
                 // A soft-404/challenge page can be transient; retry the entry
                 // like other download failures instead of silently dropping
@@ -1642,11 +1763,17 @@ pub async fn prepare_entry_media(
             }
             Ok(DownloadOutcome::QuotaSkipped) => {
                 warn!(entry_id = %fetcher::entry_id(entry), "media byte budget exhausted, skipping media");
-                out.warnings.push(MediaWarning::plain(crate::i18n::t(lang, "media_quota_skip").to_string()));
+                out.warnings.push(MediaWarning::plain(
+                    crate::i18n::t(lang, "media_quota_skip").to_string(),
+                ));
                 break;
             }
             Err(e) => {
-                let msg = crate::i18n::t(lang, "media_dl_failed").replacen("{}", kind_label(lang, &kind), 1);
+                let msg = crate::i18n::t(lang, "media_dl_failed").replacen(
+                    "{}",
+                    kind_label(lang, &kind),
+                    1,
+                );
                 if let Some(re) = &relay_err {
                     warn!(entry_id = %fetcher::entry_id(entry), url = %direct_url, relay_error = %re, direct_error = format!("{:#}", e), "media download failed (relay + direct)");
                 } else {
@@ -1737,8 +1864,12 @@ pub async fn prepare_entry_media(
             item.duration_secs = dur;
         } else if item.kind == MediaKind::Image
             && !item.is_gif
-            && (image_goes_to_doc(item.size, item.width, item.height, crate::config::LONG_IMAGE_ASPECT_RATIO)
-                || !photo_format_compatible(&item.path))
+            && (image_goes_to_doc(
+                item.size,
+                item.width,
+                item.height,
+                crate::config::LONG_IMAGE_ASPECT_RATIO,
+            ) || !photo_format_compatible(&item.path))
         {
             // Long/oversized images and formats that must go through
             // sendDocument (AVIF/SVG/HEIC/TIFF) both need a preview thumbnail.
@@ -1796,7 +1927,11 @@ async fn download_one(
     // entry byte budget; the shared budget may grant less than requested.
     let mut reservation = match state
         .media_budget
-        .reserve(&state.config.media_dir, state.config.media_max_bytes(), download_cap)
+        .reserve(
+            &state.config.media_dir,
+            state.config.media_max_bytes(),
+            download_cap,
+        )
         .await
     {
         Some(r) => r,
@@ -1815,8 +1950,7 @@ async fn download_one(
     // transient network errors get up to 3 attempts, so an image is not lost
     // due to a sporadic fault.
     const ATTEMPTS: u32 = 3;
-    let mut result: anyhow::Result<RawOutcome> =
-        Err(anyhow::anyhow!("download not attempted"));
+    let mut result: anyhow::Result<RawOutcome> = Err(anyhow::anyhow!("download not attempted"));
     for attempt in 0..ATTEMPTS {
         // The temp file path is created outside the async block so it can be
         // cleaned up on failure.
@@ -1896,7 +2030,11 @@ async fn download_one(
                 .iter()
                 .map(|b| format!("{:02x}", b))
                 .collect::<String>();
-            Ok(RawOutcome::File { path: tmp, size: written, content_hash })
+            Ok(RawOutcome::File {
+                path: tmp,
+                size: written,
+                content_hash,
+            })
         }
         .await;
 
@@ -1923,9 +2061,7 @@ async fn download_one(
                 let typed_transient = e
                     .chain()
                     .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
-                    .map(|re| {
-                        re.is_timeout() || re.is_connect() || re.is_body() || re.is_decode()
-                    })
+                    .map(|re| re.is_timeout() || re.is_connect() || re.is_body() || re.is_decode())
                     .unwrap_or(false);
                 // SSRF pre-check DNS blip: transient, retry instead of
                 // classifying the media as permanently blocked. The text comes
@@ -1944,7 +2080,11 @@ async fn download_one(
         }
     }
     let (tmp_path, size, content_hash) = match result? {
-        RawOutcome::File { path, size, content_hash } => (path, size, content_hash),
+        RawOutcome::File {
+            path,
+            size,
+            content_hash,
+        } => (path, size, content_hash),
         RawOutcome::Oversized { size } => return Ok(DownloadOutcome::Oversized { size }),
         RawOutcome::QuotaSkipped => return Ok(DownloadOutcome::QuotaSkipped),
         RawOutcome::Empty => return Ok(DownloadOutcome::Empty),
@@ -1982,7 +2122,13 @@ async fn download_one(
     }
     // Keep the original extension and append the storage-only suffix, e.g.
     // `123456_uuid.jpg.tgsr`. path_input() strips it when uploading.
-    let name = format!("{}_{}.{}{}", chrono::Utc::now().format("%H%M%S%f"), uuid::Uuid::new_v4(), ext, STORAGE_SUFFIX);
+    let name = format!(
+        "{}_{}.{}{}",
+        chrono::Utc::now().format("%H%M%S%f"),
+        uuid::Uuid::new_v4(),
+        ext,
+        STORAGE_SUFFIX
+    );
     let path = outbound.join(&name);
     if let Err(e) = std::fs::rename(&tmp_path, &path) {
         let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -2029,8 +2175,13 @@ async fn download_one(
 /// that already ended in `.tgsr` (stored as `.tgsr.tgsr`) is restored to its
 /// original name.
 pub fn logical_file_name(path: &Path) -> String {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    name.strip_suffix(STORAGE_SUFFIX).unwrap_or(name).to_string()
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    name.strip_suffix(STORAGE_SUFFIX)
+        .unwrap_or(name)
+        .to_string()
 }
 
 /// Original extension of a local media file, ignoring the storage suffix.
@@ -2080,9 +2231,7 @@ pub const MAX_THUMB_PIXELS: u64 = 40_000_000;
 /// Unknown dimensions (0) are rejected: imagesize could not parse the header,
 /// so the decoder's memory use is unpredictable.
 pub fn thumb_pixels_allowed(width: u32, height: u32) -> bool {
-    width > 0
-        && height > 0
-        && (width as u64).saturating_mul(height as u64) <= MAX_THUMB_PIXELS
+    width > 0 && height > 0 && (width as u64).saturating_mul(height as u64) <= MAX_THUMB_PIXELS
 }
 
 pub fn image_goes_to_doc(size: u64, width: u32, height: u32, aspect_threshold: f64) -> bool {
@@ -2137,11 +2286,8 @@ async fn run_tool_with_stdin_timeout(
         tokio::io::copy(&mut file, &mut stdin).await?;
         Ok::<(), std::io::Error>(())
     });
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        child.wait_with_output(),
-    )
-    .await;
+    let result =
+        tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output()).await;
     let _ = writer.await;
     match result {
         Ok(Ok(o)) => Some(o),
@@ -2162,7 +2308,10 @@ async fn run_tool_with_stdin_timeout(
 /// storage suffix, so old outbox rows keep sending correctly.
 fn stored_thumb_path(path: &Path) -> PathBuf {
     let thumb = path.with_extension("thumb.jpg");
-    let mut name = thumb.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = thumb
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(STORAGE_SUFFIX);
     thumb.with_file_name(name)
 }
@@ -2243,7 +2392,10 @@ async fn make_image_thumb(path: &std::path::Path, allow_thumb: bool) -> Option<P
 /// make a JPEG thumbnail (width ≤320; Telegram requires thumbnails ≤200KB).
 /// If either step fails, silently degrade to None — the video is sent as
 /// usual, just without a preview (same behavior as before this change).
-async fn probe_video_meta(path: &std::path::Path, allow_thumb: bool) -> (Option<PathBuf>, Option<u32>) {
+async fn probe_video_meta(
+    path: &std::path::Path,
+    allow_thumb: bool,
+) -> (Option<PathBuf>, Option<u32>) {
     // The demuxer is pinned to the sniffed container and input comes through
     // stdin, so ffmpeg/ffprobe never gets the `file` protocol.
     let Some(input_format) = sniff_video_container(path) else {
@@ -2311,7 +2463,12 @@ mod tests {
         let body = r#"正文<img src="https://tvax1.sinaimg.cn/large/abc.jpg" referrerpolicy="no-referrer"><a href="https://card.weibo.com/article/m/show/id/12345"><span class="url-icon"><img src="https://h5.sinaimg.cn/upload/article_icon.png"></span><span class="surl-text">文章标题</span></a>"#;
         let entry = entry_with_body(body);
         let urls = extract_media_urls(&entry, None);
-        assert_eq!(urls.len(), 1, "expected only the real photo, got: {:?}", urls);
+        assert_eq!(
+            urls.len(),
+            1,
+            "expected only the real photo, got: {:?}",
+            urls
+        );
         assert!(urls[0].0.contains("tvax1.sinaimg.cn"));
     }
 
@@ -2321,7 +2478,12 @@ mod tests {
         let body = r#"文字<a href="https://video.weibo.com/show?fid=1034:1"><span class="url-icon"><img src="https://h5.sinaimg.cn/video_icon.png"></span><span class="surl-text">微博视频</span></a><img src="https://tvax2.sinaimg.cn/large/real.jpg">"#;
         let entry = entry_with_body(body);
         let urls = extract_media_urls(&entry, None);
-        assert_eq!(urls.len(), 1, "expected only the real photo, got: {:?}", urls);
+        assert_eq!(
+            urls.len(),
+            1,
+            "expected only the real photo, got: {:?}",
+            urls
+        );
         assert!(urls[0].0.contains("tvax2.sinaimg.cn"));
     }
 
@@ -2332,7 +2494,12 @@ mod tests {
         let body = r#"<a href="https://cdn.example.com/full.jpg"><img src="https://cdn.example.com/thumb.jpg"></a>"#;
         let entry = entry_with_body(body);
         let urls = extract_media_urls(&entry, None);
-        assert_eq!(urls.len(), 1, "expected the thumbnail image, got: {:?}", urls);
+        assert_eq!(
+            urls.len(),
+            1,
+            "expected the thumbnail image, got: {:?}",
+            urls
+        );
         assert_eq!(urls[0].0, "https://cdn.example.com/thumb.jpg");
     }
 
@@ -2351,7 +2518,12 @@ mod tests {
         let body = r#"<a href="https://cdn.example.com/full.jpg"><img src="https://cdn.example.com/pic.jpg"></a><img src="https://cdn.example.com/pic.jpg">"#;
         let entry = entry_with_body(body);
         let urls = extract_media_urls(&entry, None);
-        assert_eq!(urls.len(), 1, "same URL must be extracted once, got: {:?}", urls);
+        assert_eq!(
+            urls.len(),
+            1,
+            "same URL must be extracted once, got: {:?}",
+            urls
+        );
     }
 
     #[test]
@@ -2422,19 +2594,31 @@ mod tests {
         assert!(photo_format_compatible(std::path::Path::new("a.webp.tgsr")));
         assert!(photo_format_compatible(std::path::Path::new("a.bmp.tgsr")));
         assert!(!photo_format_compatible(std::path::Path::new("a.gif.tgsr")));
-        assert!(!photo_format_compatible(std::path::Path::new("a.avif.tgsr")));
-        assert!(!photo_format_compatible(std::path::Path::new("a.heic.tgsr")));
-        assert!(!photo_format_compatible(std::path::Path::new("a.tiff.tgsr")));
+        assert!(!photo_format_compatible(std::path::Path::new(
+            "a.avif.tgsr"
+        )));
+        assert!(!photo_format_compatible(std::path::Path::new(
+            "a.heic.tgsr"
+        )));
+        assert!(!photo_format_compatible(std::path::Path::new(
+            "a.tiff.tgsr"
+        )));
     }
 
     #[test]
     fn logical_file_name_strips_storage_suffix_once() {
-        assert_eq!(logical_file_name(std::path::Path::new("a.jpg.tgsr")), "a.jpg");
+        assert_eq!(
+            logical_file_name(std::path::Path::new("a.jpg.tgsr")),
+            "a.jpg"
+        );
         // Old files downloaded before the suffix existed are unchanged.
         assert_eq!(logical_file_name(std::path::Path::new("a.jpg")), "a.jpg");
         // A source file that already ended in `.tgsr` gets a second suffix
         // on disk; stripping exactly one restores the original name.
-        assert_eq!(logical_file_name(std::path::Path::new("a.tgsr.tgsr")), "a.tgsr");
+        assert_eq!(
+            logical_file_name(std::path::Path::new("a.tgsr.tgsr")),
+            "a.tgsr"
+        );
         assert_eq!(logical_file_name(std::path::Path::new("a")), "a");
     }
 
@@ -2455,16 +2639,17 @@ mod tests {
         // Minimal 1x1 PNG. Dimension detection is content-based, so the
         // `.tgsr` suffix must not affect the long/oversized image rules.
         const PNG_1X1: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
-            0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04,
-            0x00, 0x00, 0x00, 0xB5, 0x1C, 0x0C, 0x02, 0x00, 0x00, 0x00, 0x0B, 0x49, 0x44,
-            0x41, 0x54, 0x78, 0xDA, 0x63, 0xFC, 0xFF, 0x1F, 0x00, 0x02, 0xEB, 0x01, 0xF5,
-            0x8F, 0x59, 0x97, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
-            0x42, 0x60, 0x82,
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xB5, 0x1C, 0x0C, 0x02, 0x00, 0x00, 0x00, 0x0B, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xDA, 0x63, 0xFC, 0xFF, 0x1F, 0x00, 0x02, 0xEB, 0x01, 0xF5, 0x8F, 0x59, 0x97, 0x5B,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
-        let path = std::env::temp_dir().join(format!("tgsrssr_size_{}.png.tgsr", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("tgsrssr_size_{}.png.tgsr", uuid::Uuid::new_v4()));
         std::fs::write(&path, PNG_1X1).unwrap();
-        let size = imagesize::size(&path).expect("imagesize should read content regardless of suffix");
+        let size =
+            imagesize::size(&path).expect("imagesize should read content regardless of suffix");
         assert_eq!((size.width, size.height), (1, 1));
         std::fs::remove_file(&path).ok();
     }
@@ -2498,9 +2683,17 @@ mod tests {
         let urls = extract_media_urls(&entry, Some(&meta));
         assert_eq!(urls.len(), 2);
         // Normal images inside the body are not flagged
-        assert!(!urls.iter().any(|(u, _, _, rt, _)| u.contains("tvax1") && *rt), "normal image should not be flagged");
+        assert!(
+            !urls
+                .iter()
+                .any(|(u, _, _, rt, _)| u.contains("tvax1") && *rt),
+            "normal image should not be flagged"
+        );
         // Retweet images from meta are flagged
-        assert!(urls.iter().any(|(u, _, _, rt, _)| u.contains("wx2") && *rt), "retweet image should be flagged");
+        assert!(
+            urls.iter().any(|(u, _, _, rt, _)| u.contains("wx2") && *rt),
+            "retweet image should be flagged"
+        );
     }
 
     #[test]
@@ -2515,7 +2708,12 @@ mod tests {
             retweet_images: vec!["https://wx2.sinaimg.cn/large/abc.jpg".to_string()],
         };
         let urls = extract_media_urls(&entry, Some(&meta));
-        assert_eq!(urls.len(), 1, "same URL in body and meta should dedup, got: {:?}", urls);
+        assert_eq!(
+            urls.len(),
+            1,
+            "same URL in body and meta should dedup, got: {:?}",
+            urls
+        );
     }
 
     // ── image_goes_to_doc classification tests ──
@@ -2588,12 +2786,28 @@ mod tests {
     #[test]
     fn single_mode_skips_other_and_detectable_gif() {
         // Audio/documents are never sent in single-media mode.
-        assert!(single_mode_skips(&MediaKind::Other, "audio/mpeg", "https://cdn.example.com/a.mp3"));
-        assert!(single_mode_skips(&MediaKind::Other, "", "https://cdn.example.com/doc.pdf"));
+        assert!(single_mode_skips(
+            &MediaKind::Other,
+            "audio/mpeg",
+            "https://cdn.example.com/a.mp3"
+        ));
+        assert!(single_mode_skips(
+            &MediaKind::Other,
+            "",
+            "https://cdn.example.com/doc.pdf"
+        ));
         // GIFs detectable before download (mime hint or .gif path suffix)
         // are skipped so they are never fetched or warned about.
-        assert!(single_mode_skips(&MediaKind::Image, "image/gif", "https://cdn.example.com/x"));
-        assert!(single_mode_skips(&MediaKind::Image, "image/unknown", "https://cdn.example.com/x.gif"));
+        assert!(single_mode_skips(
+            &MediaKind::Image,
+            "image/gif",
+            "https://cdn.example.com/x"
+        ));
+        assert!(single_mode_skips(
+            &MediaKind::Image,
+            "image/unknown",
+            "https://cdn.example.com/x.gif"
+        ));
         // Query string must not hide the extension.
         assert!(single_mode_skips(
             &MediaKind::Image,
@@ -2601,11 +2815,23 @@ mod tests {
             "https://cdn.example.com/x.gif?width=800"
         ));
         // Plain images and videos pass through.
-        assert!(!single_mode_skips(&MediaKind::Image, "image/unknown", "https://cdn.example.com/x.png"));
-        assert!(!single_mode_skips(&MediaKind::Video, "video/mp4", "https://cdn.example.com/v.mp4"));
+        assert!(!single_mode_skips(
+            &MediaKind::Image,
+            "image/unknown",
+            "https://cdn.example.com/x.png"
+        ));
+        assert!(!single_mode_skips(
+            &MediaKind::Video,
+            "video/mp4",
+            "https://cdn.example.com/v.mp4"
+        ));
         // Suffix-free GIF served under an unknown mime: slips the cheap check
         // (caught after download via sniff_gif instead).
-        assert!(!single_mode_skips(&MediaKind::Image, "image/unknown", "https://cdn.example.com/img/abcdef"));
+        assert!(!single_mode_skips(
+            &MediaKind::Image,
+            "image/unknown",
+            "https://cdn.example.com/img/abcdef"
+        ));
     }
 
     #[test]
@@ -2636,7 +2862,11 @@ mod tests {
     fn ensure_outbound_dir_creates_utc_date_dir() {
         let base = std::env::temp_dir().join(format!("tgsrssr_media_ok_{}", uuid::Uuid::new_v4()));
         let dir = ensure_outbound_dir(&base).expect("temp media dir should be creatable");
-        assert!(dir.is_dir(), "outbound date dir was not created: {}", dir.display());
+        assert!(
+            dir.is_dir(),
+            "outbound date dir was not created: {}",
+            dir.display()
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -2691,14 +2921,8 @@ mod tests {
             detect_video_container(b"\0\0\0\x18ftypisom\0\0\0\0"),
             Some("mp4")
         );
-        assert_eq!(
-            detect_video_container(b"\x1a\x45\xdf\xa3rest"),
-            Some("mkv")
-        );
-        assert_eq!(
-            detect_video_container(b"RIFF\0\0\0\0AVI LIST"),
-            Some("avi")
-        );
+        assert_eq!(detect_video_container(b"\x1a\x45\xdf\xa3rest"), Some("mkv"));
+        assert_eq!(detect_video_container(b"RIFF\0\0\0\0AVI LIST"), Some("avi"));
         assert_eq!(detect_video_container(b"FLV\x01rest"), Some("flv"));
         assert_eq!(
             detect_video_container(b"\x00\x00\x01\xBArest"),
@@ -2719,10 +2943,7 @@ mod tests {
 
     #[tokio::test]
     async fn media_budget_reserves_and_commits_against_scanned_usage() {
-        let dir = std::env::temp_dir().join(format!(
-            "tgsrssr_budget_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("tgsrssr_budget_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         const MB: u64 = 1024 * 1024;
         std::fs::write(dir.join("existing.bin"), vec![0u8; MB as usize]).unwrap();
@@ -2766,11 +2987,18 @@ mod tests {
     #[test]
     fn oversized_warning_filter_only_drops_size_limit_skips() {
         let mut prepared = PreparedMedia::empty();
-        prepared.warnings.push(MediaWarning::oversized("size skip".to_string()));
-        prepared.warnings.push(MediaWarning::plain("download failed".to_string()));
+        prepared
+            .warnings
+            .push(MediaWarning::oversized("size skip".to_string()));
+        prepared
+            .warnings
+            .push(MediaWarning::plain("download failed".to_string()));
 
         let all = prepared.notify_warnings(true);
-        assert_eq!(all, vec!["size skip".to_string(), "download failed".to_string()]);
+        assert_eq!(
+            all,
+            vec!["size skip".to_string(), "download failed".to_string()]
+        );
         let filtered = prepared.notify_warnings(false);
         assert_eq!(filtered, vec!["download failed".to_string()]);
         assert_eq!(
@@ -2789,7 +3017,8 @@ mod tests {
         let feed = feed_rs::parser::parse(xml.as_bytes()).expect("feed should parse");
         let urls = extract_media_urls(&feed.entries[0], None);
         assert!(
-            urls.iter().any(|(u, _, _, _, _)| u == "https://example.com/a.jpg"),
+            urls.iter()
+                .any(|(u, _, _, _, _)| u == "https://example.com/a.jpg"),
             "urls: {urls:?}"
         );
     }

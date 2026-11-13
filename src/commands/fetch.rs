@@ -109,8 +109,9 @@ pub(super) fn sub_error_text(lang: Lang, err: CommandFetchError) -> String {
             &crate::htmltext::escape_html(&format!("{:#}", e)),
             1,
         ),
-        CommandFetchError::Busy => i18n::t(lang, "sub_fetch_failed")
-            .replacen("{}", i18n::t(lang, "platform_busy"), 1),
+        CommandFetchError::Busy => {
+            i18n::t(lang, "sub_fetch_failed").replacen("{}", i18n::t(lang, "platform_busy"), 1)
+        }
         CommandFetchError::FetchFailed(e) => i18n::t(lang, "sub_fetch_failed").replacen(
             "{}",
             &crate::htmltext::escape_html(&format!("{:#}", e)),

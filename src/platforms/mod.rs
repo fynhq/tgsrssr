@@ -57,7 +57,9 @@ pub fn make_entry(
             // Defensive parsing: all current call sites pass "text/html", so
             // this cannot fail; if an invalid MIME string is passed in the
             // future, fall back to text/html instead of panicking.
-            content_type: content_type.parse().unwrap_or_else(|_| "text/html".parse().unwrap()),
+            content_type: content_type
+                .parse()
+                .unwrap_or_else(|_| "text/html".parse().unwrap()),
             length: None,
             src: None,
         }),
@@ -105,10 +107,18 @@ impl std::fmt::Display for PlatformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PlatformError::AuthExpired { platform, detail } => {
-                write!(f, "{} cookie expired: {}; please update via /cookies", platform, detail)
+                write!(
+                    f,
+                    "{} cookie expired: {}; please update via /cookies",
+                    platform, detail
+                )
             }
             PlatformError::RateLimited { platform, status } => {
-                write!(f, "{} rate limited (HTTP {}); will retry later", platform, status)
+                write!(
+                    f,
+                    "{} rate limited (HTTP {}); will retry later",
+                    platform, status
+                )
             }
         }
     }
@@ -138,7 +148,9 @@ pub type PlatformFetchFn = for<'a> fn(
     &'a AppState,
     String,
     &'a crate::fetcher::FetchOptions<'a>,
-) -> Pin<Box<dyn Future<Output = anyhow::Result<crate::fetcher::FetchResult>> + Send + 'a>>;
+) -> Pin<
+    Box<dyn Future<Output = anyhow::Result<crate::fetcher::FetchResult>> + Send + 'a>,
+>;
 
 /// Platform descriptor: identity (cookie panel) + routing (URL match,
 /// canonicalization, fetch). Single source of truth for platform knowledge —
@@ -169,7 +181,9 @@ pub const PLATFORMS: &[PlatformDef] = &[
         label: "Weibo",
         needs_cookie: true,
         match_url: weibo::is_weibo_url,
-        canonical_url: |url| weibo::parse_uid(url).map(|uid| format!("https://weibo.com/u/{}", uid)),
+        canonical_url: |url| {
+            weibo::parse_uid(url).map(|uid| format!("https://weibo.com/u/{}", uid))
+        },
         fetch: |state, url, opts| Box::pin(weibo::fetch_by_url(state, url, opts)),
     },
     PlatformDef {
@@ -437,12 +451,18 @@ pub async fn migrate_legacy_cookies(state: &AppState) {
         // legacy per-user health/streak/expired keys (three-segment form). Fall
         // through to the unconditional cleanup below so those orphans are
         // removed too — do NOT early-return here.
-        tracing::debug!("migrate_legacy_cookies: no legacy cookies, running orphan-key cleanup only");
+        tracing::debug!(
+            "migrate_legacy_cookies: no legacy cookies, running orphan-key cleanup only"
+        );
     } else {
-        tracing::info!(count = legacy.len(), "migrating legacy per-user cookies to global format");
+        tracing::info!(
+            count = legacy.len(),
+            "migrating legacy per-user cookies to global format"
+        );
 
         // Group by platform; prefer admin's cookie
-        let mut best: std::collections::HashMap<String, (i64, String)> = std::collections::HashMap::new();
+        let mut best: std::collections::HashMap<String, (i64, String)> =
+            std::collections::HashMap::new();
         for (uid, platform, value) in &legacy {
             let is_admin = state.config.is_admin(*uid);
             let entry = best.entry(platform.clone());
@@ -467,7 +487,10 @@ pub async fn migrate_legacy_cookies(state: &AppState) {
         let mut migrated: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (platform, (_uid, value)) in &best {
             let global_key = cookie_setting_key(platform);
-            let existing = crate::db::get_setting(&state.db, &global_key).await.ok().flatten();
+            let existing = crate::db::get_setting(&state.db, &global_key)
+                .await
+                .ok()
+                .flatten();
             if existing.is_some() {
                 // Global value already present: the legacy key is redundant.
                 migrated.insert(platform.clone());
@@ -525,7 +548,11 @@ pub async fn migrate_legacy_cookies(state: &AppState) {
     // Clean up legacy per-user health/streak/expired keys. Runs unconditionally
     // (even when there were no legacy cookies), so a DB that only has per-user
     // health keys still gets them removed instead of leaking forever.
-    for prefix in ["platform_health:", "platform_streak:", "cookie_expired_notified:"] {
+    for prefix in [
+        "platform_health:",
+        "platform_streak:",
+        "cookie_expired_notified:",
+    ] {
         if let Ok(hrows) = crate::db::get_settings_by_prefix(&state.db, prefix).await {
             for (key, _) in &hrows {
                 let rest = &key[prefix.len()..];
@@ -551,7 +578,13 @@ pub async fn update_cookie(state: &AppState, platform: &str, value: &str) -> any
     crate::db::set_setting(&state.db, &cookie_setting_key(platform), value).await?;
     state.set_cookie(platform, value).await;
     // Clear the expiry-notification flag (set by the scheduler on failure).
-    crate::db::set_setting(&state.db, &crate::db::setting_key::cookie_expired_notified(platform), "0").await.ok();
+    crate::db::set_setting(
+        &state.db,
+        &crate::db::setting_key::cookie_expired_notified(platform),
+        "0",
+    )
+    .await
+    .ok();
     Ok(())
 }
 
@@ -582,7 +615,13 @@ mod tests {
 
     #[test]
     fn sensitive_headers_are_case_insensitive() {
-        for name in ["Cookie", "cookie", "Authorization", "X-CSRF-Token", "x-csrf-token"] {
+        for name in [
+            "Cookie",
+            "cookie",
+            "Authorization",
+            "X-CSRF-Token",
+            "x-csrf-token",
+        ] {
             assert!(is_sensitive_header(name), "{name}");
         }
         for name in ["Accept", "Referer", "User-Agent", "x-twitter-auth-type"] {

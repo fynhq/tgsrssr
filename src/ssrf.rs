@@ -81,14 +81,18 @@ fn classify_addrs(addrs: &[SocketAddr]) -> SsrfOutcome {
 
 /// Three-state SSRF verdict. See SsrfOutcome.
 pub async fn ssrf_check(url: &str) -> SsrfOutcome {
-    let Ok(u) = url::Url::parse(url) else { return SsrfOutcome::InvalidUrl };
+    let Ok(u) = url::Url::parse(url) else {
+        return SsrfOutcome::InvalidUrl;
+    };
     // Only http/https allowed; other schemes (file, ftp, ws…) blocked. Check
     // the scheme before host_str: file URLs parse without a host and would
     // otherwise be reported as an invalid URL instead of a blocked scheme.
     if u.scheme() != "http" && u.scheme() != "https" {
         return SsrfOutcome::Private;
     }
-    let Some(host) = u.host_str() else { return SsrfOutcome::InvalidUrl };
+    let Some(host) = u.host_str() else {
+        return SsrfOutcome::InvalidUrl;
+    };
     // Literal IP: check directly.
     if let Ok(ip) = host.parse::<IpAddr>() {
         return if is_private_ip(&ip) {
@@ -114,11 +118,15 @@ pub async fn ssrf_check(url: &str) -> SsrfOutcome {
 /// or `http://192.168.x.x` directly, which the pre-existing blanket proxy
 /// exemption let through.
 pub fn ssrf_check_literal(url: &str) -> SsrfOutcome {
-    let Ok(u) = url::Url::parse(url) else { return SsrfOutcome::InvalidUrl };
+    let Ok(u) = url::Url::parse(url) else {
+        return SsrfOutcome::InvalidUrl;
+    };
     if u.scheme() != "http" && u.scheme() != "https" {
         return SsrfOutcome::Private;
     }
-    let Some(raw_host) = u.host_str() else { return SsrfOutcome::InvalidUrl };
+    let Some(raw_host) = u.host_str() else {
+        return SsrfOutcome::InvalidUrl;
+    };
     // url::Url::host_str() includes brackets for IPv6 literals.
     let host = raw_host.trim_start_matches('[').trim_end_matches(']');
     let host_no_dot = host.trim_end_matches('.');
@@ -151,11 +159,7 @@ pub fn proxy_host_denied(host: &str) -> bool {
     if !host.contains('.') {
         return true;
     }
-    const EXACT: &[&str] = &[
-        "metadata.google.internal",
-        "metadata.goog",
-        "instance-data",
-    ];
+    const EXACT: &[&str] = &["metadata.google.internal", "metadata.goog", "instance-data"];
     if EXACT.contains(&host.as_str()) {
         return true;
     }
@@ -239,7 +243,7 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
                 || (o[0] == 198 && o[1] == 51 && o[2] == 100)
                 || (o[0] == 203 && o[1] == 0 && o[2] == 113)
                 || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 192.88.99/24 6to4 relay anycast
-                || o[0] >= 224                   // 224/4 multicast + 240/4 reserved + broadcast
+                || o[0] >= 224 // 224/4 multicast + 240/4 reserved + broadcast
         }
         std::net::IpAddr::V6(v6) => {
             // IPv4-mapped (::ffff:x.x.x.x) and IPv4-compatible (::x.x.x.x):
@@ -287,14 +291,26 @@ mod tests {
 
     #[test]
     fn classify_all_public_allowed() {
-        assert_eq!(classify_addrs(&[sa("93.184.216.34", 0), sa("2606:2800:220:1:248:1893:25c8:1946", 0)]), SsrfOutcome::Allowed);
+        assert_eq!(
+            classify_addrs(&[
+                sa("93.184.216.34", 0),
+                sa("2606:2800:220:1:248:1893:25c8:1946", 0)
+            ]),
+            SsrfOutcome::Allowed
+        );
     }
 
     #[test]
     fn classify_any_private_vetoes() {
         // Rebinding shape: a mixed answer must fail closed, not pick the public entry.
-        assert_eq!(classify_addrs(&[sa("93.184.216.34", 0), sa("127.0.0.1", 0)]), SsrfOutcome::Private);
-        assert_eq!(classify_addrs(&[sa("169.254.169.254", 0)]), SsrfOutcome::Private);
+        assert_eq!(
+            classify_addrs(&[sa("93.184.216.34", 0), sa("127.0.0.1", 0)]),
+            SsrfOutcome::Private
+        );
+        assert_eq!(
+            classify_addrs(&[sa("169.254.169.254", 0)]),
+            SsrfOutcome::Private
+        );
         assert_eq!(classify_addrs(&[sa("::1", 0)]), SsrfOutcome::Private);
     }
 
@@ -304,7 +320,7 @@ mod tests {
         assert!(is_private_ip(&"64:ff9b::a9fe:a9fe".parse().unwrap())); // 169.254.169.254
         assert!(is_private_ip(&"64:ff9b::7f00:1".parse().unwrap())); // 127.0.0.1
         assert!(!is_private_ip(&"64:ff9b::808:808".parse().unwrap())); // 8.8.8.8 public
-        // Local-use NAT64 prefix has no fixed embedding: blocked wholesale.
+                                                                       // Local-use NAT64 prefix has no fixed embedding: blocked wholesale.
         assert!(is_private_ip(&"64:ff9b:1::1".parse().unwrap()));
         // IPv6 multicast.
         assert!(is_private_ip(&"ff02::1".parse().unwrap()));
@@ -314,7 +330,9 @@ mod tests {
     async fn resolver_rejects_loopback_hostname() {
         // localhost always resolves to loopback on any host. (No expect_err:
         // the Ok payload Addrs has no Debug impl.)
-        let res = GuardedResolver.resolve(Name::from_str("localhost").unwrap()).await;
+        let res = GuardedResolver
+            .resolve(Name::from_str("localhost").unwrap())
+            .await;
         let err = res.err().expect("loopback answer must be rejected");
         assert!(
             err.to_string().contains("dns resolve failed"),
@@ -326,7 +344,9 @@ mod tests {
     async fn resolver_rejects_private_literal_ip() {
         // Literal IPs skip DNS in hyper-util's connector, but a hostname that
         // is an IP string still goes through lookup_host → private → veto.
-        let res = GuardedResolver.resolve(Name::from_str("10.0.0.1").unwrap()).await;
+        let res = GuardedResolver
+            .resolve(Name::from_str("10.0.0.1").unwrap())
+            .await;
         let err = res.err().expect("private literal must be rejected");
         assert!(err.to_string().contains("dns resolve failed"));
     }
@@ -336,7 +356,10 @@ mod tests {
         // Fail-closed invariant. A `.invalid` lookup normally errors (rejected);
         // on DNS-hijacking resolvers it may answer with a wildcard IP, in which
         // case the guard must pass only public addresses, never a private one.
-        match GuardedResolver.resolve(Name::from_str("no-such-host.invalid").unwrap()).await {
+        match GuardedResolver
+            .resolve(Name::from_str("no-such-host.invalid").unwrap())
+            .await
+        {
             Err(err) => assert!(err.to_string().contains("dns resolve failed")),
             Ok(mut addrs) => assert!(addrs.all(|a| !is_private_ip(&a.ip()))),
         }
@@ -346,20 +369,47 @@ mod tests {
     fn literal_proxy_check_blocks_private_ips_and_localhost() {
         // Proxy routes cannot use local DNS, but literal targets need no DNS
         // and must still be rejected.
-        assert_eq!(ssrf_check_literal("http://127.0.0.1:8081/"), SsrfOutcome::Private);
+        assert_eq!(
+            ssrf_check_literal("http://127.0.0.1:8081/"),
+            SsrfOutcome::Private
+        );
         assert_eq!(ssrf_check_literal("http://10.0.0.5/"), SsrfOutcome::Private);
-        assert_eq!(ssrf_check_literal("http://169.254.169.254/latest"), SsrfOutcome::Private);
+        assert_eq!(
+            ssrf_check_literal("http://169.254.169.254/latest"),
+            SsrfOutcome::Private
+        );
         // WHATWG URL parsing normalizes short/hex IPv4 forms to dotted decimal.
         assert_eq!(ssrf_check_literal("http://127.1/"), SsrfOutcome::Private);
-        assert_eq!(ssrf_check_literal("http://2130706433/"), SsrfOutcome::Private);
+        assert_eq!(
+            ssrf_check_literal("http://2130706433/"),
+            SsrfOutcome::Private
+        );
         assert_eq!(ssrf_check_literal("http://[::1]/"), SsrfOutcome::Private);
-        assert_eq!(ssrf_check_literal("http://[fe80::1]/"), SsrfOutcome::Private);
-        assert_eq!(ssrf_check_literal("http://localhost/"), SsrfOutcome::Private);
-        assert_eq!(ssrf_check_literal("http://foo.localhost./"), SsrfOutcome::Private);
-        assert_eq!(ssrf_check_literal("https://example.com/feed"), SsrfOutcome::Allowed);
+        assert_eq!(
+            ssrf_check_literal("http://[fe80::1]/"),
+            SsrfOutcome::Private
+        );
+        assert_eq!(
+            ssrf_check_literal("http://localhost/"),
+            SsrfOutcome::Private
+        );
+        assert_eq!(
+            ssrf_check_literal("http://foo.localhost./"),
+            SsrfOutcome::Private
+        );
+        assert_eq!(
+            ssrf_check_literal("https://example.com/feed"),
+            SsrfOutcome::Allowed
+        );
         // Public IPv6 literal passes (DNS guard is not involved).
-        assert_eq!(ssrf_check_literal("https://[2606:4700::1111]/"), SsrfOutcome::Allowed);
-        assert_eq!(ssrf_check_literal("file:///etc/passwd"), SsrfOutcome::Private);
+        assert_eq!(
+            ssrf_check_literal("https://[2606:4700::1111]/"),
+            SsrfOutcome::Allowed
+        );
+        assert_eq!(
+            ssrf_check_literal("file:///etc/passwd"),
+            SsrfOutcome::Private
+        );
     }
 
     #[test]
@@ -393,7 +443,10 @@ mod tests {
             "203.0.113.9",
             "192.88.99.1",
         ] {
-            assert!(is_private_ip(&ip.parse().unwrap()), "{ip} should be blocked");
+            assert!(
+                is_private_ip(&ip.parse().unwrap()),
+                "{ip} should be blocked"
+            );
         }
         assert!(!is_private_ip(&"8.8.8.8".parse().unwrap()));
     }
@@ -408,13 +461,18 @@ mod tests {
     fn ssrf_check_rejects_non_http_scheme() {
         // Blocking decision is synchronous scheme parsing; safe to test without DNS.
         // (async fn needs a runtime; use a minimal one inline)
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         rt.block_on(async {
             assert_eq!(ssrf_check("file:///etc/passwd").await, SsrfOutcome::Private);
             assert_eq!(ssrf_check("ws://example.com").await, SsrfOutcome::Private);
             // Some non-special schemes fail Url::parse outright (reported as
             // InvalidUrl): either way they must never be Allowed.
-            assert_ne!(ssrf_check("gopher://example.com").await, SsrfOutcome::Allowed);
+            assert_ne!(
+                ssrf_check("gopher://example.com").await,
+                SsrfOutcome::Allowed
+            );
             assert_eq!(ssrf_check("not a url").await, SsrfOutcome::InvalidUrl);
         });
     }

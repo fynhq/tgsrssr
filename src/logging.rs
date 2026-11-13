@@ -20,8 +20,7 @@ pub fn init_logging(log_dir: &Path) -> anyhow::Result<WorkerGuard> {
         .buffered_lines_limit(LOG_BUFFER_LINES)
         .finish(file_appender);
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(env_filter)

@@ -26,8 +26,8 @@ pub(super) struct SendSuccessCtx<'a> {
 }
 
 fn uncertain_msg(lang: Lang, chat_title: &str, entry_link: Option<&str>) -> String {
-    let mut msg = i18n::t(lang, "notif_send_uncertain")
-        .replacen("{}", &push::escape_html(chat_title), 1);
+    let mut msg =
+        i18n::t(lang, "notif_send_uncertain").replacen("{}", &push::escape_html(chat_title), 1);
     if let Some(el) = entry_link {
         push_line(&mut msg, lang, "label_entry", el);
     }
@@ -40,8 +40,8 @@ fn text_partial_msg(
     delivered_tg_link: Option<&str>,
     entry_link: Option<&str>,
 ) -> String {
-    let mut msg = i18n::t(lang, "notif_text_partial")
-        .replacen("{}", &push::escape_html(chat_title), 1);
+    let mut msg =
+        i18n::t(lang, "notif_text_partial").replacen("{}", &push::escape_html(chat_title), 1);
     if let Some(tg) = delivered_tg_link {
         push_line(&mut msg, lang, "label_message", tg);
     }
@@ -57,8 +57,8 @@ fn media_failed_msg(
     delivered_tg_link: Option<&str>,
     entry_link: Option<&str>,
 ) -> String {
-    let mut msg = i18n::t(lang, "notif_media_failed")
-        .replacen("{}", &push::escape_html(chat_title), 1);
+    let mut msg =
+        i18n::t(lang, "notif_media_failed").replacen("{}", &push::escape_html(chat_title), 1);
     if let Some(tg) = delivered_tg_link {
         push_line(&mut msg, lang, "label_message", tg);
     }
@@ -130,13 +130,8 @@ impl SendSuccessCtx<'_> {
             .await
             .ok();
         }
-        if let Err(e) = db::mark_entry_sent(
-            &self.state.db,
-            self.chat_id,
-            self.feed_url,
-            self.entry_id,
-        )
-        .await
+        if let Err(e) =
+            db::mark_entry_sent(&self.state.db, self.chat_id, self.feed_url, self.entry_id).await
         {
             warn!(feed = %self.feed_url, entry_id = %self.entry_id, error = %e, "{}", mark_log);
         }
@@ -149,11 +144,7 @@ mod tests {
 
     #[test]
     fn uncertain_msg_carries_channel_and_entry_link() {
-        let msg = uncertain_msg(
-            Lang::En,
-            "My Channel",
-            Some("https://example.com/post"),
-        );
+        let msg = uncertain_msg(Lang::En, "My Channel", Some("https://example.com/post"));
         assert!(msg.contains("Rich message delivery is uncertain"));
         assert!(msg.contains("My Channel"));
         assert!(msg.contains("\nEntry: https://example.com/post"));

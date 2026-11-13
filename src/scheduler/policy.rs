@@ -141,7 +141,9 @@ mod tests {
         // Saturating add keeps an absurd stored value bounded.
         assert_eq!(
             media_retry_step(true, true, Ok(i64::MAX), true),
-            MediaRetryStep::Abandon { fail_count: i64::MAX }
+            MediaRetryStep::Abandon {
+                fail_count: i64::MAX
+            }
         );
     }
 
@@ -193,28 +195,37 @@ mod tests {
 
     #[test]
     fn platform_round_requires_every_active_source() {
-        assert_eq!(platform_round_verdict(1, 2, true, false), PlatformRound::Skip);
-        assert_eq!(platform_round_verdict(2, 2, true, true), PlatformRound::Mixed);
+        assert_eq!(
+            platform_round_verdict(1, 2, true, false),
+            PlatformRound::Skip
+        );
+        assert_eq!(
+            platform_round_verdict(2, 2, true, true),
+            PlatformRound::Mixed
+        );
     }
 
     #[test]
     fn platform_round_classifies_all_ok_and_all_failed() {
-        assert_eq!(platform_round_verdict(2, 2, true, false), PlatformRound::AllOk);
-        assert_eq!(platform_round_verdict(2, 2, false, true), PlatformRound::AllFailed);
+        assert_eq!(
+            platform_round_verdict(2, 2, true, false),
+            PlatformRound::AllOk
+        );
+        assert_eq!(
+            platform_round_verdict(2, 2, false, true),
+            PlatformRound::AllFailed
+        );
         // No valid signal is a mixed round: reset the streak.
-        assert_eq!(platform_round_verdict(2, 2, false, false), PlatformRound::Mixed);
+        assert_eq!(
+            platform_round_verdict(2, 2, false, false),
+            PlatformRound::Mixed
+        );
     }
 
     #[test]
     fn effective_title_prefers_fetched_value_unless_overridden() {
-        assert_eq!(
-            effective_feed_title(false, Some("new"), Some("old")),
-            "new"
-        );
-        assert_eq!(
-            effective_feed_title(true, Some("new"), Some("old")),
-            "old"
-        );
+        assert_eq!(effective_feed_title(false, Some("new"), Some("old")), "new");
+        assert_eq!(effective_feed_title(true, Some("new"), Some("old")), "old");
         // Missing or blank fetched title falls back to the stored title.
         assert_eq!(effective_feed_title(false, None, Some("old")), "old");
         assert_eq!(effective_feed_title(false, Some("  "), Some("old")), "old");

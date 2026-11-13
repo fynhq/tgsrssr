@@ -83,8 +83,9 @@ static RE_MD_OL: LazyLock<regex::Regex> =
 /// Note: [^)]+ assumes the u parameter value contains no unencoded literal
 /// `)` — in practice the sinaurl u value is always fully percent-encoded, so
 /// this premise holds; if an unencoded `)` ever appears, the URL is truncated.
-static RE_SINAURL_MD: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\((https://weibo\.cn/sinaurl\?u=[^)]+)\)").unwrap());
+static RE_SINAURL_MD: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\[([^\]]+)\]\((https://weibo\.cn/sinaurl\?u=[^)]+)\)").unwrap()
+});
 /// HTML form of <a href="sinaurl">…label…</a> inside weibo post bodies. The
 /// label is not fixed ("View image" / "Comment image" etc.), so the anchor text is
 /// no longer constrained; only sinaurl?u= is used as the identifier.
@@ -94,8 +95,12 @@ static RE_SINAURL_MD: LazyLock<regex::Regex> =
 /// inner tags and captures them so the label can be extracted.
 /// Note: [^"']+ assumes the href value contains no quotes — percent-encoding
 /// guarantees this premise holds.
-static RE_SINAURL_HTML: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["'](https://weibo\.cn/sinaurl\?u=[^"']+)["'][^>]*>(.*?)</a>"#).unwrap());
+static RE_SINAURL_HTML: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?is)<a\b[^>]*href\s*=\s*["'](https://weibo\.cn/sinaurl\?u=[^"']+)["'][^>]*>(.*?)</a>"#,
+    )
+    .unwrap()
+});
 /// True when the feed URL is a weibo user homepage that should be fetched
 /// natively: https://weibo.com/u/<uid> (also m.weibo.cn / www variants).
 pub fn is_weibo_url(url: &str) -> bool {
@@ -121,10 +126,7 @@ pub fn parse_uid(url: &str) -> Option<String> {
     // /u/<uid>
     if segs.len() >= 2 && segs[0] == "u" {
         let uid = segs[1];
-        if !uid.is_empty()
-            && uid.len() <= 32
-            && uid.chars().all(|c| c.is_ascii_alphanumeric())
-        {
+        if !uid.is_empty() && uid.len() <= 32 && uid.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Some(uid.to_string());
         }
     }
@@ -153,9 +155,7 @@ fn should_skip_detail(
     mblog_id: &str,
 ) -> bool {
     match enrichment {
-        crate::fetcher::Enrichment::Full => {
-            known_sent.is_some_and(|s| s.contains(mblog_id))
-        }
+        crate::fetcher::Enrichment::Full => known_sent.is_some_and(|s| s.contains(mblog_id)),
         crate::fetcher::Enrichment::None => true,
         crate::fetcher::Enrichment::Target(_) => !enrichment.allows(mblog_id),
     }
@@ -170,7 +170,9 @@ pub async fn fetch_weibo_user(
     let lang = opts.lang;
     let cookies = match state.get_cookie("weibo").await {
         Some(c) if !c.trim().is_empty() => c,
-        _ => anyhow::bail!("weibo feeds require an admin-configured login cookie (/cookies command)"),
+        _ => {
+            anyhow::bail!("weibo feeds require an admin-configured login cookie (/cookies command)")
+        }
     };
 
     let api = format!(
@@ -226,7 +228,10 @@ pub async fn fetch_weibo_user(
             .await
             .unwrap_or_default();
         let text = String::from_utf8_lossy(&body);
-        if text.contains("登录") || text.contains("验证") || text.to_ascii_lowercase().contains("login") {
+        if text.contains("登录")
+            || text.contains("验证")
+            || text.to_ascii_lowercase().contains("login")
+        {
             return Err(crate::platforms::auth_expired(
                 "Weibo",
                 format!("HTTP 403: {}", text.chars().take(200).collect::<String>()),
@@ -243,7 +248,10 @@ pub async fn fetch_weibo_user(
 
     let json: Value = crate::fetcher::read_json_capped(resp, "weibo getIndex").await?;
     if json.get("ok").and_then(|v| v.as_i64()) != Some(1) {
-        let msg = json.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let msg = json
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         // When the cookie expires, the weibo API returns ok!=1 (common msg
         // values contain the Chinese words for "login" / "verify"). The error
         // string must contain the "cookie" substring — the scheduler uses it
@@ -378,14 +386,23 @@ pub async fn fetch_weibo_user(
         // details (question/options/multi-select) must be fetched via the
         // desktop ajax/statuses/show endpoint. A failure does not block the
         // entry push (it degrades to plain text).
-        let vote_obj = if !skip_detail && detail_budget > 0 && mblog["is_vote"].as_i64() == Some(1) {
+        let vote_obj = if !skip_detail && detail_budget > 0 && mblog["is_vote"].as_i64() == Some(1)
+        {
             detail_budget -= 1;
             fetch_vote_object(state, &cookies, &mblog_id).await
         } else {
             None
         };
 
-        match mblog_to_entry(&mblog, uid, &screen_name, full_text.as_deref(), rt_full_text.as_deref(), vote_obj.as_ref(), lang) {
+        match mblog_to_entry(
+            &mblog,
+            uid,
+            &screen_name,
+            full_text.as_deref(),
+            rt_full_text.as_deref(),
+            vote_obj.as_ref(),
+            lang,
+        ) {
             Some((e, meta)) => {
                 if !meta.is_empty() {
                     metas.insert(e.id.clone(), meta);
@@ -457,7 +474,10 @@ fn status_needs_detail(mblog: &Value) -> bool {
         return false;
     }
     let pic_num = mblog["pic_num"].as_u64().unwrap_or(0);
-    let pics_len = mblog["pics"].as_array().map(|a| a.len() as u64).unwrap_or(0);
+    let pics_len = mblog["pics"]
+        .as_array()
+        .map(|a| a.len() as u64)
+        .unwrap_or(0);
     pic_num > pics_len
 }
 
@@ -593,12 +613,20 @@ async fn fetch_vote_object(state: &AppState, cookies: &str, mid: &str) -> Option
             continue;
         }
         // At least a question and 2 valid options are needed to justify converting to a poll
-        let has_question = vo["content"].as_str().map(|s| !s.is_empty()).unwrap_or(false);
+        let has_question = vo["content"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
         let option_count = vo["vote_list"]
             .as_array()
             .map(|a| {
                 a.iter()
-                    .filter(|v| v["content"].as_str().map(|s| !s.is_empty()).unwrap_or(false))
+                    .filter(|v| {
+                        v["content"]
+                            .as_str()
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false)
+                    })
                     .count()
             })
             .unwrap_or(0);
@@ -775,8 +803,16 @@ fn extract_inline_images(text: &str, lang: Lang) -> (String, Vec<String>) {
             // Keep the original link as a clickable hyperlink.
             // Extract visible label from inner content (strip tags).
             let label = crate::fetcher::html_to_plain(&caps[2]);
-            let label = if label.trim().is_empty() { i18n::t(lang, "weibo_image_label").to_string() } else { label.trim().to_string() };
-            format!("<a href=\"{}\">{}</a>", crate::htmltext::escape_attr(sinaurl), crate::htmltext::escape_html(&label))
+            let label = if label.trim().is_empty() {
+                i18n::t(lang, "weibo_image_label").to_string()
+            } else {
+                label.trim().to_string()
+            };
+            format!(
+                "<a href=\"{}\">{}</a>",
+                crate::htmltext::escape_attr(sinaurl),
+                crate::htmltext::escape_html(&label)
+            )
         })
         .to_string();
 
@@ -788,7 +824,11 @@ fn extract_inline_images(text: &str, lang: Lang) -> (String, Vec<String>) {
             if let Some(real) = decode_sinaurl(sinaurl) {
                 urls.push(real);
             }
-            format!("<a href=\"{}\">{}</a>", crate::htmltext::escape_attr(sinaurl), crate::htmltext::escape_html(&caps[1]))
+            format!(
+                "<a href=\"{}\">{}</a>",
+                crate::htmltext::escape_attr(sinaurl),
+                crate::htmltext::escape_html(&caps[1])
+            )
         })
         .to_string();
 
@@ -800,7 +840,10 @@ fn extract_inline_images(text: &str, lang: Lang) -> (String, Vec<String>) {
 /// escaped here (attribute context). Extracted because this exact template
 /// was repeated verbatim at every append_weibo_media push site.
 fn img_tag(url: &str) -> String {
-    format!("<img src=\"{}\" referrerpolicy=\"no-referrer\">", crate::htmltext::escape_attr(url))
+    format!(
+        "<img src=\"{}\" referrerpolicy=\"no-referrer\">",
+        crate::htmltext::escape_attr(url)
+    )
 }
 
 /// Append a status's media to the HTML body: pics[].large.url images
@@ -870,8 +913,16 @@ fn append_weibo_media(body: &mut String, mblog: &Value, owner_mid: &str) {
             .map(|s| s.to_string())
             .or_else(|| {
                 const URL_KEYS: &[&str] = &[
-                    "mp4_4k_mp4", "mp4_1080p_mp4", "mp4_720p_mp4", "hevc_mp4_hd",
-                    "mp4_hd_mp4", "ultra", "hd", "high", "mp4_ld_mp4", "medium",
+                    "mp4_4k_mp4",
+                    "mp4_1080p_mp4",
+                    "mp4_720p_mp4",
+                    "hevc_mp4_hd",
+                    "mp4_hd_mp4",
+                    "ultra",
+                    "hd",
+                    "high",
+                    "mp4_ld_mp4",
+                    "medium",
                 ];
                 let urls = &page_info["urls"];
                 URL_KEYS
@@ -888,7 +939,10 @@ fn append_weibo_media(body: &mut String, mblog: &Value, owner_mid: &str) {
             let owner_attr = if owner_mid.is_empty() {
                 String::new()
             } else {
-                format!(" data-weibo-mid=\"{}\"", crate::htmltext::escape_attr(owner_mid))
+                format!(
+                    " data-weibo-mid=\"{}\"",
+                    crate::htmltext::escape_attr(owner_mid)
+                )
             };
             if !page_pic_url.is_empty() {
                 body.push_str(&format!(
@@ -963,9 +1017,8 @@ fn mblog_to_entry(
     // Text body (HTML with <a>, <br/> etc.). Long weibos use the full text
     // fetched from statuses/show; the list text ends with a "full text" link.
     // Absolutize relative hrefs so @user / hashtag / status links survive.
-    let text = absolutize_hrefs(
-        full_text.unwrap_or_else(|| mblog["text"].as_str().unwrap_or_default()),
-    );
+    let text =
+        absolutize_hrefs(full_text.unwrap_or_else(|| mblog["text"].as_str().unwrap_or_default()));
     // Strip UI icon <img> tags (card thumbnails, emoji icons without alt).
     // These are decorative and must not be extracted as media — Telegram
     // rejects them with PHOTO_INVALID_DIMENSIONS.
@@ -1014,7 +1067,9 @@ fn mblog_to_entry(
     let rt = &mblog["retweeted_status"];
     if !rt.is_null() {
         let rt_mid = status_id_str(rt).unwrap_or_default();
-        let rt_user = rt["user"]["screen_name"].as_str().unwrap_or_else(|| i18n::t(lang, "weibo_deleted_user"));
+        let rt_user = rt["user"]["screen_name"]
+            .as_str()
+            .unwrap_or_else(|| i18n::t(lang, "weibo_deleted_user"));
         // Hyperlink the retweeted user's name to the original weibo itself
         // (https://weibo.com/<uid>/<bid>); fall back to the user homepage
         // when bid is missing, and to plain text when uid is missing too.
@@ -1156,7 +1211,18 @@ fn mblog_to_entry(
         retweet_images: rt_images,
     };
 
-    Some((crate::platforms::make_entry(id, title, screen_name.to_string(), body, content_mime, link, published), meta))
+    Some((
+        crate::platforms::make_entry(
+            id,
+            title,
+            screen_name.to_string(),
+            body,
+            content_mime,
+            link,
+            published,
+        ),
+        meta,
+    ))
 }
 
 /// Parse weibo created_at. Handles absolute format and relative forms.
@@ -1406,41 +1472,45 @@ fn render_weibo_markdown(text: &str) -> String {
     // being split into separate paragraphs).
     // The language tag is preserved as class="language-xxx" (Telegram client
     // syntax highlighting).
-    let flush_code = |out: &mut Vec<String>, code: &mut Vec<String>, lang: &str, pres: &mut Vec<String>| {
-        if code.is_empty() && lang.is_empty() {
-            return;
-        }
-        if out.last().map(|s| !s.is_empty()).unwrap_or(false) {
+    let flush_code =
+        |out: &mut Vec<String>, code: &mut Vec<String>, lang: &str, pres: &mut Vec<String>| {
+            if code.is_empty() && lang.is_empty() {
+                return;
+            }
+            if out.last().map(|s| !s.is_empty()).unwrap_or(false) {
+                out.push(String::new());
+            }
+            // Remove trailing blank lines (leading blank lines are kept, faithful
+            // to the original)
+            while code.last().map(|l| l.is_empty()).unwrap_or(false) {
+                code.pop();
+            }
+            let content = code.join("\n");
+            let open_tag = if lang.is_empty() {
+                "<pre><code>".to_string()
+            } else {
+                format!(
+                    "<pre><code class=\"language-{}\">",
+                    crate::htmltext::escape_attr(lang)
+                )
+            };
+            let html = format!(
+                "{}{}</code></pre>",
+                open_tag,
+                // Same decode-once-escape-once rule as render_md_inline (P1-2):
+                // fenced content comes from the same pre-escaped editor storage,
+                // so `&amp;` inside a code block must not become `&amp;amp;`.
+                crate::htmltext::escape_html(&crate::htmltext::decode_entities(&content))
+            );
+            // Store as a placeholder to prevent the trailing RE_BLANK_LINES
+            // (fetcher::RE_BLANK_LINES, applied at the end of rendering) from
+            // collapsing blank lines inside the code
+            let idx = pres.len();
+            pres.push(html);
+            out.push(format!("\u{FFFE}PB{}\u{FFFE}", idx));
             out.push(String::new());
-        }
-        // Remove trailing blank lines (leading blank lines are kept, faithful
-        // to the original)
-        while code.last().map(|l| l.is_empty()).unwrap_or(false) {
-            code.pop();
-        }
-        let content = code.join("\n");
-        let open_tag = if lang.is_empty() {
-            "<pre><code>".to_string()
-        } else {
-            format!("<pre><code class=\"language-{}\">", crate::htmltext::escape_attr(lang))
+            code.clear();
         };
-        let html = format!(
-            "{}{}</code></pre>",
-            open_tag,
-            // Same decode-once-escape-once rule as render_md_inline (P1-2):
-            // fenced content comes from the same pre-escaped editor storage,
-            // so `&amp;` inside a code block must not become `&amp;amp;`.
-            crate::htmltext::escape_html(&crate::htmltext::decode_entities(&content))
-        );
-        // Store as a placeholder to prevent the trailing RE_BLANK_LINES
-        // (fetcher::RE_BLANK_LINES, applied at the end of rendering) from
-        // collapsing blank lines inside the code
-        let idx = pres.len();
-        pres.push(html);
-        out.push(format!("\u{FFFE}PB{}\u{FFFE}", idx));
-        out.push(String::new());
-        code.clear();
-    };
 
     for line in text.split('\n') {
         let trimmed = line.trim();
@@ -1479,7 +1549,8 @@ fn render_weibo_markdown(text: &str) -> String {
 
         if trimmed.is_empty() {
             out_lines.push(String::new());
-        } else if let Some(content) = trimmed.strip_prefix("###### ")
+        } else if let Some(content) = trimmed
+            .strip_prefix("###### ")
             .or_else(|| trimmed.strip_prefix("##### "))
             .or_else(|| trimmed.strip_prefix("#### "))
             .or_else(|| trimmed.strip_prefix("### "))
@@ -1495,7 +1566,10 @@ fn render_weibo_markdown(text: &str) -> String {
         } else if trimmed == "---" || trimmed == "***" || trimmed == "___" {
             // Horizontal rule
             out_lines.push("———————————".to_string());
-        } else if let Some(content) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        } else if let Some(content) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
             // Unordered list
             out_lines.push(format!("• {}", render_md_inline(content)));
         } else if RE_MD_OL.is_match(trimmed) {
@@ -1525,7 +1599,9 @@ fn render_weibo_markdown(text: &str) -> String {
     // 5) Collapse excess blank lines (3+ → 2) + trim leading/trailing
     //    whitespace. pre blocks are protected by placeholders, so their
     //    internal blank lines are unaffected.
-    let result = crate::fetcher::RE_BLANK_LINES.replace_all(&result, "\n\n").to_string();
+    let result = crate::fetcher::RE_BLANK_LINES
+        .replace_all(&result, "\n\n")
+        .to_string();
 
     // 6) Restore the pre code block placeholders
     let mut result = result;
@@ -1549,7 +1625,9 @@ fn render_weibo_markdown(text: &str) -> String {
 /// - <img> without alt → removed entirely (card thumbnails, decorative icons)
 fn strip_ui_icons(html: &str) -> String {
     // 1) Imgs WITH alt text → keep the alt text (emoji icons).
-    let s = crate::fetcher::RE_IMG_ALT.replace_all(html, "$1").to_string();
+    let s = crate::fetcher::RE_IMG_ALT
+        .replace_all(html, "$1")
+        .to_string();
 
     // 2) Any remaining <img> tags (no alt) → remove entirely.
     let s = crate::fetcher::RE_IMG.replace_all(&s, "").to_string();
@@ -1778,15 +1856,24 @@ mod tests {
 
     #[test]
     fn parse_uid_valid() {
-        assert_eq!(parse_uid("https://weibo.com/u/1234567890"), Some("1234567890".into()));
+        assert_eq!(
+            parse_uid("https://weibo.com/u/1234567890"),
+            Some("1234567890".into())
+        );
         assert_eq!(parse_uid("https://www.weibo.com/u/123"), Some("123".into()));
-        assert_eq!(parse_uid("https://m.weibo.cn/u/456?tab=2"), Some("456".into()));
+        assert_eq!(
+            parse_uid("https://m.weibo.cn/u/456?tab=2"),
+            Some("456".into())
+        );
     }
 
     #[test]
     fn cover_only_page_types_do_not_trigger_detail_or_warn() {
         for t in ["video", "live", "article"] {
-            assert!(is_non_photo_page(Some(t)), "{t} counts a cover, not a pics entry");
+            assert!(
+                is_non_photo_page(Some(t)),
+                "{t} counts a cover, not a pics entry"
+            );
         }
         assert!(!is_non_photo_page(Some("normal")));
         assert!(!is_non_photo_page(None));
@@ -1795,7 +1882,10 @@ mod tests {
             "pics": [],
             "page_info": { "type": "article" }
         });
-        assert!(!status_needs_detail(&mblog), "article cover must not cause a detail fetch");
+        assert!(
+            !status_needs_detail(&mblog),
+            "article cover must not cause a detail fetch"
+        );
     }
 
     #[test]
@@ -1811,9 +1901,23 @@ mod tests {
         // @user link (single quotes), hashtag search link, status link.
         let html = "回复<a href='/n/某人'>@某人</a>:<a href=\"/search?containerid=100103type%3D1%26q%3D%23话题%23\">#话题#</a><a href=\"/status/123\">全文</a>";
         let out = absolutize_hrefs(html);
-        assert!(out.contains("href='https://m.weibo.cn/n/某人'"), "out: {}", out);
-        assert!(out.contains("href=\"https://m.weibo.cn/search?containerid=100103type%3D1%26q%3D%23话题%23\""), "out: {}", out);
-        assert!(out.contains("href=\"https://m.weibo.cn/status/123\""), "out: {}", out);
+        assert!(
+            out.contains("href='https://m.weibo.cn/n/某人'"),
+            "out: {}",
+            out
+        );
+        assert!(
+            out.contains(
+                "href=\"https://m.weibo.cn/search?containerid=100103type%3D1%26q%3D%23话题%23\""
+            ),
+            "out: {}",
+            out
+        );
+        assert!(
+            out.contains("href=\"https://m.weibo.cn/status/123\""),
+            "out: {}",
+            out
+        );
         // Absolute URLs must be left untouched.
         let abs = "<a href=\"https://weibo.com/n/x\">@x</a>";
         assert_eq!(absolutize_hrefs(abs), abs);
@@ -1824,12 +1928,10 @@ mod tests {
         // Normal absolute format (weekday consistent with the date). Assert down
         // to the exact instant: 2026-09-25 20:09:08 +0800 = 12:09:08 UTC.
         let t = parse_weibo_time("Fri Sep 25 20:09:08 +0800 2026");
-        let expected = chrono::DateTime::parse_from_str(
-            "2026-09-25 12:09:08 +0000",
-            "%Y-%m-%d %H:%M:%S %z",
-        )
-        .unwrap()
-        .with_timezone(&Utc);
+        let expected =
+            chrono::DateTime::parse_from_str("2026-09-25 12:09:08 +0000", "%Y-%m-%d %H:%M:%S %z")
+                .unwrap()
+                .with_timezone(&Utc);
         assert_eq!(t, Some(expected));
         // Key fault tolerance: weibo's weekday field is not guaranteed to
         // match the date. Here the weekday is deliberately wrong (Sep 25 2026
@@ -1851,7 +1953,9 @@ mod tests {
         );
         // "10分钟前" (10 minutes ago) ≈ now - 10min: assert the offset, not just is_some.
         let t = parse_weibo_time("10分钟前").expect("10-minutes-ago form should parse");
-        let delta = (t - (now - chrono::Duration::minutes(10))).num_seconds().abs();
+        let delta = (t - (now - chrono::Duration::minutes(10)))
+            .num_seconds()
+            .abs();
         assert!(delta <= 2, "10-minutes-ago offset wrong by {}s", delta);
         // "3小时前" (3 hours ago) ≈ now - 3h.
         let t = parse_weibo_time("3小时前").expect("3-hours-ago form should parse");
@@ -1969,7 +2073,10 @@ mod tests {
     #[test]
     fn strip_tags_works() {
         // A line break must not concatenate words in a title/label.
-        assert_eq!(crate::fetcher::html_to_plain("<a href=\"x\">hello</a><br/>world"), "hello world");
+        assert_eq!(
+            crate::fetcher::html_to_plain("<a href=\"x\">hello</a><br/>world"),
+            "hello world"
+        );
     }
 
     #[test]
@@ -2027,7 +2134,10 @@ mod tests {
         // The label is not fixed: "View image" (2026-10-06) / "Comment image" (2026-10-13).
         let html = r#"就是抖包袱！ <a  href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2F53899d01ly1ihrm04xdknj219a19a1ky.jpg" data-hide=""><span class='url-icon'></span><span class="surl-text">查看图片</span></a>"#;
         let (text, urls) = extract_inline_images(html, Lang::Zh);
-        assert_eq!(urls, vec!["https://wx2.sinaimg.cn/large/53899d01ly1ihrm04xdknj219a19a1ky.jpg"]);
+        assert_eq!(
+            urls,
+            vec!["https://wx2.sinaimg.cn/large/53899d01ly1ihrm04xdknj219a19a1ky.jpg"]
+        );
         assert!(text.starts_with("就是抖包袱！ "), "text: {}", text);
         assert!(text.contains("查看图片</a>"), "text: {}", text);
         // The span shells must be gone from the preserved link.
@@ -2036,7 +2146,10 @@ mod tests {
         // "Comment image" label: same structure, different surl-text.
         let html2 = r#"转发下？ <a  href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx4.sinaimg.cn%2Flarge%2Fbaf3936fgy1ii0h79kjtej20u02run9s.jpg" data-hide=""><span class='url-icon'></span><span class="surl-text">评论配图</span></a>"#;
         let (text2, urls2) = extract_inline_images(html2, Lang::Zh);
-        assert_eq!(urls2, vec!["https://wx4.sinaimg.cn/large/baf3936fgy1ii0h79kjtej20u02run9s.jpg"]);
+        assert_eq!(
+            urls2,
+            vec!["https://wx4.sinaimg.cn/large/baf3936fgy1ii0h79kjtej20u02run9s.jpg"]
+        );
         assert!(text2.contains("评论配图</a>"), "text: {}", text2);
         assert!(!text2.contains("url-icon"), "text: {}", text2);
     }
@@ -2064,7 +2177,11 @@ mod tests {
         // still preserved as a clickable hyperlink.
         let html = r#"正文<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fwww.peopleapp.com%2Farticle%2F12345">网页链接</a>结尾"#;
         let (text, urls) = extract_inline_images(html, Lang::Zh);
-        assert!(urls.is_empty(), "non-image URL must be filtered, got: {:?}", urls);
+        assert!(
+            urls.is_empty(),
+            "non-image URL must be filtered, got: {:?}",
+            urls
+        );
         // The hyperlink is still preserved in the text.
         assert!(text.contains("网页链接</a>"), "text: {}", text);
     }
@@ -2090,7 +2207,8 @@ mod tests {
     #[test]
     fn extract_inline_images_non_sinaimg_no_ext_filtered() {
         // Non-sinaimg hosts without an image extension are filtered.
-        let html = r#"<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fexample.com%2Fpage">网页链接</a>"#;
+        let html =
+            r#"<a href="https://weibo.cn/sinaurl?u=https%3A%2F%2Fexample.com%2Fpage">网页链接</a>"#;
         let (_text, urls) = extract_inline_images(html, Lang::Zh);
         assert!(urls.is_empty(), "urls: {:?}", urls);
     }
@@ -2098,11 +2216,19 @@ mod tests {
     #[test]
     fn sinaurl_requires_https_and_weibo_host() {
         assert_eq!(
-            decode_sinaurl("https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2Fabc.jpg"),
+            decode_sinaurl(
+                "https://weibo.cn/sinaurl?u=https%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2Fabc.jpg"
+            ),
             Some("https://wx2.sinaimg.cn/large/abc.jpg".to_string())
         );
-        assert!(decode_sinaurl("https://weibo.cn/sinaurl?u=http%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2Fabc.jpg").is_none());
-        assert!(decode_sinaurl("https://weibo.cn/sinaurl?u=https%3A%2F%2Fevil.example%2Fa.jpg").is_none());
+        assert!(decode_sinaurl(
+            "https://weibo.cn/sinaurl?u=http%3A%2F%2Fwx2.sinaimg.cn%2Flarge%2Fabc.jpg"
+        )
+        .is_none());
+        assert!(
+            decode_sinaurl("https://weibo.cn/sinaurl?u=https%3A%2F%2Fevil.example%2Fa.jpg")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2141,8 +2267,14 @@ mod tests {
         });
         let mut body = String::new();
         append_weibo_media(&mut body, &mblog, "123");
-        assert!(body.contains("<img src=\"https://wx1.sinaimg.cn/large/cover.jpg\""), "body: {body}");
-        assert!(!body.contains("<video"), "must not emit an empty video tag: {body}");
+        assert!(
+            body.contains("<img src=\"https://wx1.sinaimg.cn/large/cover.jpg\""),
+            "body: {body}"
+        );
+        assert!(
+            !body.contains("<video"),
+            "must not emit an empty video tag: {body}"
+        );
     }
 
     #[test]
@@ -2181,7 +2313,11 @@ mod tests {
     fn md_links_become_anchors() {
         let input = "看[这里](https://example.com)了解";
         let out = render_weibo_markdown(input);
-        assert!(out.contains(r#"<a href="https://example.com">这里</a>"#), "out: {}", out);
+        assert!(
+            out.contains(r#"<a href="https://example.com">这里</a>"#),
+            "out: {}",
+            out
+        );
     }
 
     #[test]
@@ -2190,8 +2326,14 @@ mod tests {
         // backticks would become a real anchor and the literal code text
         // would be lost.
         let out = render_weibo_markdown("`[x](https://example.com)`");
-        assert!(out.contains("<code>[x](https://example.com)</code>"), "out: {out}");
-        assert!(!out.contains("<a href=\"https://example.com\">"), "link inside code: {out}");
+        assert!(
+            out.contains("<code>[x](https://example.com)</code>"),
+            "out: {out}"
+        );
+        assert!(
+            !out.contains("<a href=\"https://example.com\">"),
+            "link inside code: {out}"
+        );
     }
 
     #[test]
@@ -2199,7 +2341,11 @@ mod tests {
         // Output of absolutize_hrefs must be preserved verbatim, not escaped
         let input = "前文<a href=\"https://m.weibo.cn/n/某人\">@某人</a>后文";
         let out = render_weibo_markdown(input);
-        assert!(out.contains(r#"<a href="https://m.weibo.cn/n/某人">@某人</a>"#), "out: {}", out);
+        assert!(
+            out.contains(r#"<a href="https://m.weibo.cn/n/某人">@某人</a>"#),
+            "out: {}",
+            out
+        );
     }
 
     #[test]
@@ -2224,7 +2370,11 @@ mod tests {
         // upstream; render_weibo_markdown only handles the raw > form.
         let input = "引用如下<br />> 被引用的话<br />引用结束";
         let out = render_weibo_markdown(input);
-        assert!(out.contains("<blockquote>被引用的话</blockquote>"), "out: {}", out);
+        assert!(
+            out.contains("<blockquote>被引用的话</blockquote>"),
+            "out: {}",
+            out
+        );
         assert!(out.contains("引用如下"), "out: {}", out);
         assert!(out.contains("引用结束"), "out: {}", out);
     }
@@ -2269,10 +2419,22 @@ mod tests {
         // Simulate the structure of a real md_render_mark=1 post
         let input = "# 节后A股有望\u{201c}量价齐升\u{201d}<br /><br />来源：证券时报<br /><br />## 广发证券：节后A股市场有望\u{201c}量价齐升\u{201d}<br /><br />本轮科技产业周期大概率处于加速上行。";
         let out = render_weibo_markdown(input);
-        assert!(out.contains("<b>节后A股有望\u{201c}量价齐升\u{201d}</b>"), "out: {}", out);
-        assert!(out.contains("<b>广发证券：节后A股市场有望\u{201c}量价齐升\u{201d}</b>"), "out: {}", out);
+        assert!(
+            out.contains("<b>节后A股有望\u{201c}量价齐升\u{201d}</b>"),
+            "out: {}",
+            out
+        );
+        assert!(
+            out.contains("<b>广发证券：节后A股市场有望\u{201c}量价齐升\u{201d}</b>"),
+            "out: {}",
+            out
+        );
         assert!(out.contains("来源：证券时报"), "out: {}", out);
-        assert!(out.contains("本轮科技产业周期大概率处于加速上行。"), "out: {}", out);
+        assert!(
+            out.contains("本轮科技产业周期大概率处于加速上行。"),
+            "out: {}",
+            out
+        );
         // Paragraphs are separated by blank lines
         assert!(out.contains("\n\n"), "out: {}", out);
     }
@@ -2304,7 +2466,11 @@ mod tests {
         // No class attribute when there is no language tag
         let input = "```<br />x = 1<br />```";
         let out = render_weibo_markdown(input);
-        assert!(out.contains("<pre><code>x = 1</code></pre>"), "out: {}", out);
+        assert!(
+            out.contains("<pre><code>x = 1</code></pre>"),
+            "out: {}",
+            out
+        );
         assert!(!out.contains("class="), "out: {}", out);
     }
 
@@ -2340,7 +2506,11 @@ mod tests {
         // Unclosed fence: fault-tolerantly output the accumulated content
         let input = "```<br />orphan code";
         let out = render_weibo_markdown(input);
-        assert!(out.contains("<pre><code>orphan code</code></pre>"), "out: {}", out);
+        assert!(
+            out.contains("<pre><code>orphan code</code></pre>"),
+            "out: {}",
+            out
+        );
     }
 
     #[test]
@@ -2351,5 +2521,4 @@ mod tests {
         assert!(out.contains("# comment"), "out: {}", out);
         assert!(!out.contains("<b>comment</b>"), "out: {}", out);
     }
-
 }

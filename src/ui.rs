@@ -45,13 +45,20 @@ pub(crate) fn paginate(len: usize, page: usize) -> (usize, usize, usize, usize) 
 /// re-typing the button construction. `close_kb` (empty-state pages) uses it
 /// to build a single-row Markup.
 pub(crate) fn close_row(lang: Lang) -> Vec<InlineKeyboardButton> {
-    vec![InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop")]
+    vec![InlineKeyboardButton::callback(
+        i18n::t(lang, "close"),
+        "c|cancelop",
+    )]
 }
 
 /// Build a `[back, close]` row. Panels that repeat this pair (with a
 /// domain-specific back label key + callback data) use this helper instead
 /// of hand-writing the two-button vector at every site.
-pub(crate) fn back_close_row(lang: Lang, back_key: &'static str, back_cb: String) -> Vec<InlineKeyboardButton> {
+pub(crate) fn back_close_row(
+    lang: Lang,
+    back_key: &'static str,
+    back_cb: String,
+) -> Vec<InlineKeyboardButton> {
     vec![
         InlineKeyboardButton::callback(i18n::t(lang, back_key), back_cb),
         InlineKeyboardButton::callback(i18n::t(lang, "close"), "c|cancelop"),
@@ -61,20 +68,31 @@ pub(crate) fn back_close_row(lang: Lang, back_key: &'static str, back_cb: String
 /// Build the pagination nav row (prev / indicator / next). M6 fix: three
 /// call sites duplicated this exact logic; only the callback URL differs,
 /// supplied via `mk_url`. Returns None when there is only one page.
-pub(crate) fn nav_row(page: usize, total_pages: usize, lang: Lang, mk_url: impl Fn(usize) -> String) -> Option<Vec<InlineKeyboardButton>> {
+pub(crate) fn nav_row(
+    page: usize,
+    total_pages: usize,
+    lang: Lang,
+    mk_url: impl Fn(usize) -> String,
+) -> Option<Vec<InlineKeyboardButton>> {
     if total_pages <= 1 {
         return None;
     }
     let mut nav: Vec<InlineKeyboardButton> = Vec::new();
     if page > 0 {
-        nav.push(InlineKeyboardButton::callback(i18n::t(lang, "prev_page"), mk_url(page - 1)));
+        nav.push(InlineKeyboardButton::callback(
+            i18n::t(lang, "prev_page"),
+            mk_url(page - 1),
+        ));
     }
     nav.push(InlineKeyboardButton::callback(
         format!("{} / {}", page + 1, total_pages),
         "c|page",
     ));
     if page + 1 < total_pages {
-        nav.push(InlineKeyboardButton::callback(i18n::t(lang, "next_page"), mk_url(page + 1)));
+        nav.push(InlineKeyboardButton::callback(
+            i18n::t(lang, "next_page"),
+            mk_url(page + 1),
+        ));
     }
     Some(nav)
 }
@@ -135,7 +153,12 @@ pub(crate) async fn deliver(
 /// Render a generic error page (escaped message + close button).
 /// `err_display` is the already-formatted error text (callers may use
 /// `{:#}` for anyhow error chains); escaping happens here.
-pub(crate) async fn deliver_error_page(bot: &Bot, target: &PageTarget<'_>, lang: Lang, err_display: &str) -> ResponseResult<()> {
+pub(crate) async fn deliver_error_page(
+    bot: &Bot,
+    target: &PageTarget<'_>,
+    lang: Lang,
+    err_display: &str,
+) -> ResponseResult<()> {
     deliver(
         bot,
         target,
@@ -232,7 +255,11 @@ pub(crate) async fn render_cookies_panel(
                 .flatten()
                 .map(|v| v == "1")
                 .unwrap_or(false);
-            if expired { i18n::t(lang, "ck_expired") } else { i18n::t(lang, "ck_configured") }
+            if expired {
+                i18n::t(lang, "ck_expired")
+            } else {
+                i18n::t(lang, "ck_configured")
+            }
         };
         buttons.push(vec![InlineKeyboardButton::callback(
             format!("{}（{}）", p.label, status),
@@ -271,7 +298,13 @@ pub(crate) async fn render_channel_list(
     };
 
     if chats.is_empty() {
-        deliver(bot, &target, i18n::t(lang, "chlist_empty"), Some(close_kb(lang))).await?;
+        deliver(
+            bot,
+            &target,
+            i18n::t(lang, "chlist_empty"),
+            Some(close_kb(lang)),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -295,13 +328,14 @@ pub(crate) async fn render_channel_list(
     // explicit "?" placeholder per chat in that case. Missing keys in a
     // successful result legitimately mean 0 (GROUP BY only returns chats with
     // at least one subscription).
-    let sub_counts: Option<std::collections::HashMap<String, i64>> = match db::count_subscriptions_per_chat(&state.db).await {
-        Ok(m) => Some(m),
-        Err(e) => {
-            tracing::warn!(error = %e, "count_subscriptions_per_chat failed; channel list will show ? for feed counts");
-            None
-        }
-    };
+    let sub_counts: Option<std::collections::HashMap<String, i64>> =
+        match db::count_subscriptions_per_chat(&state.db).await {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!(error = %e, "count_subscriptions_per_chat failed; channel list will show ? for feed counts");
+                None
+            }
+        };
 
     let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     let mut row: Vec<InlineKeyboardButton> = Vec::new();
@@ -315,7 +349,11 @@ pub(crate) async fn render_channel_list(
         // The 4th segment passes through the channel-list page number so the channel page's
         // "back to channel list" button can restore the original page.
         row.push(InlineKeyboardButton::callback(
-            format!("{}（{}）", crate::htmltext::truncate_text(&title, 32), cnt_label),
+            format!(
+                "{}（{}）",
+                crate::htmltext::truncate_text(&title, 32),
+                cnt_label
+            ),
             format!("c|ch|{}|0|{}", chat.chat_id, page),
         ));
         if row.len() >= 2 {
@@ -404,7 +442,10 @@ pub(crate) async fn render_channel_page(
     } else if total_pages > 1 {
         let page_s = (page + 1).to_string();
         let pages_s = total_pages.to_string();
-        text.push_str(&i18n::fill(i18n::t(lang, "chpage_multi"), &[&page_s, &pages_s]));
+        text.push_str(&i18n::fill(
+            i18n::t(lang, "chpage_multi"),
+            &[&page_s, &pages_s],
+        ));
     } else {
         text.push_str(i18n::t(lang, "chpage_single"));
     }
@@ -421,12 +462,19 @@ pub(crate) async fn render_channel_page(
         let name = sub.feed_title.as_deref().unwrap_or(&sub.feed_url);
         let flag = if sub.active == 0 { " ⏸" } else { "" };
         buttons.push(vec![InlineKeyboardButton::callback(
-            format!("{}. {}{}", start + offset + 1, crate::htmltext::truncate_text(name, 36), flag),
+            format!(
+                "{}. {}{}",
+                start + offset + 1,
+                crate::htmltext::truncate_text(name, 36),
+                flag
+            ),
             format!("c|src|{}|{}|{}", sub.id, page, chlist_page),
         )]);
     }
 
-    if let Some(nav) = nav_row(page, total_pages, lang, |p| format!("c|ch|{}|{}|{}", chat_id, p, chlist_page)) {
+    if let Some(nav) = nav_row(page, total_pages, lang, |p| {
+        format!("c|ch|{}|{}|{}", chat_id, p, chlist_page)
+    }) {
         buttons.push(nav);
     }
 
@@ -435,7 +483,10 @@ pub(crate) async fn render_channel_page(
             i18n::t(lang, "chpage_settings"),
             format!("c|cfg|{}|{}|{}", chat_id, page, chlist_page),
         ),
-        InlineKeyboardButton::callback(i18n::t(lang, "chpage_unsub"), format!("c|unsubpg|{}|0|{}|{}", chat_id, page, chlist_page)),
+        InlineKeyboardButton::callback(
+            i18n::t(lang, "chpage_unsub"),
+            format!("c|unsubpg|{}|0|{}|{}", chat_id, page, chlist_page),
+        ),
     ]);
     // When paused sources exist, offer a one-click enable-all (reset error counts and resume fetching immediately)
     // Layout: c|resumeall|<chat_id>|<chlist_page>|<ch_page> — ch_page preserves the source-list page
@@ -446,7 +497,11 @@ pub(crate) async fn render_channel_page(
             format!("c|resumeall|{}|{}|{}", chat_id, chlist_page, page),
         )]);
     }
-    buttons.push(back_close_row(lang, "chpage_back", format!("c|chlist|{}", chlist_page)));
+    buttons.push(back_close_row(
+        lang,
+        "chpage_back",
+        format!("c|chlist|{}", chlist_page),
+    ));
 
     let kb = InlineKeyboardMarkup::new(buttons);
 
@@ -468,7 +523,13 @@ pub(crate) async fn load_sub_or_deliver(
     match db::get_subscription_by_id(db, sub_id).await {
         Ok(Some(s)) => Ok(Some(s)),
         Ok(None) => {
-            deliver(bot, target, i18n::t(lang, "sub_not_found"), Some(close_kb(lang))).await?;
+            deliver(
+                bot,
+                target,
+                i18n::t(lang, "sub_not_found"),
+                Some(close_kb(lang)),
+            )
+            .await?;
             Ok(None)
         }
         Err(e) => {
@@ -520,19 +581,30 @@ async fn render_feed_page_impl(
     };
 
     let name = sub.feed_title.as_deref().unwrap_or(&sub.feed_url);
-    let status = if sub.active == 1 { i18n::t(lang, "feed_active") } else { i18n::t(lang, "feed_paused") };
+    let status = if sub.active == 1 {
+        i18n::t(lang, "feed_active")
+    } else {
+        i18n::t(lang, "feed_paused")
+    };
 
     let url_attr = crate::push::escape_attr(&sub.feed_url);
     // Panels are sent/edited as one message; an unbounded feed title or long
     // URL would make both edit and send fail with "message is too long",
     // leaving the source page permanently unreachable.
     let name_html = crate::push::escape_html(&crate::htmltext::truncate_text(name, 200));
-    let mut text = i18n::fill(i18n::t(lang, "feed_header"), &[&url_attr, &name_html, status]);
+    let mut text = i18n::fill(
+        i18n::t(lang, "feed_header"),
+        &[&url_attr, &name_html, status],
+    );
     // Show original title when manually renamed
     if sub.title_overridden == 1 {
         if let Some(orig) = &sub.original_title {
             let orig = crate::htmltext::truncate_text(orig, 200);
-            text.push_str(&i18n::t(lang, "feed_orig_name").replacen("{}", &crate::push::escape_html(&orig), 1));
+            text.push_str(&i18n::t(lang, "feed_orig_name").replacen(
+                "{}",
+                &crate::push::escape_html(&orig),
+                1,
+            ));
         }
     }
 
@@ -545,8 +617,16 @@ async fn render_feed_page_impl(
         let iv_label = fmt_interval(lang, c.interval_minutes);
         let cm_label = fmt_content_mode(lang, &c.content_mode);
         let sd_label = fmt_source_display(lang, &c.source_display);
-        let cp_label = if c.caption_above_media { i18n::t(lang, "on") } else { i18n::t(lang, "off") };
-        let lp_label = if c.link_preview { i18n::t(lang, "on") } else { i18n::t(lang, "off") };
+        let cp_label = if c.caption_above_media {
+            i18n::t(lang, "on")
+        } else {
+            i18n::t(lang, "off")
+        };
+        let lp_label = if c.link_preview {
+            i18n::t(lang, "on")
+        } else {
+            i18n::t(lang, "off")
+        };
         text.push_str(&i18n::fill(
             i18n::t(lang, "feed_config"),
             &[
@@ -572,9 +652,10 @@ async fn render_feed_page_impl(
     }
 
     // Rename / reset name
-    buttons.push(vec![
-        InlineKeyboardButton::callback(i18n::t(lang, "feed_rename"), format!("c|srcrename|{}|{}|{}", sub_id, ch_page, chlist_page)),
-    ]);
+    buttons.push(vec![InlineKeyboardButton::callback(
+        i18n::t(lang, "feed_rename"),
+        format!("c|srcrename|{}|{}|{}", sub_id, ch_page, chlist_page),
+    )]);
 
     // Feed-level overrides: interval/mode/source open second-level pages;
     // caption/link preview toggle in place (mirrors the channel settings
@@ -582,7 +663,11 @@ async fn render_feed_page_impl(
     // summary above.
     if let Some(c) = &cfg {
         buttons.push(vec![InlineKeyboardButton::callback(
-            i18n::t(lang, "feed_interval").replacen("{}", &fmt_interval(lang, c.interval_minutes), 1),
+            i18n::t(lang, "feed_interval").replacen(
+                "{}",
+                &fmt_interval(lang, c.interval_minutes),
+                1,
+            ),
             format!("c|srcfip|{}|{}|{}", sub_id, ch_page, chlist_page),
         )]);
         buttons.push(vec![InlineKeyboardButton::callback(
@@ -590,15 +675,35 @@ async fn render_feed_page_impl(
             format!("c|srcfmp|{}|{}|{}", sub_id, ch_page, chlist_page),
         )]);
         buttons.push(vec![InlineKeyboardButton::callback(
-            i18n::t(lang, "feed_source").replacen("{}", fmt_source_display(lang, &c.source_display), 1),
+            i18n::t(lang, "feed_source").replacen(
+                "{}",
+                fmt_source_display(lang, &c.source_display),
+                1,
+            ),
             format!("c|srcfsp|{}|{}|{}", sub_id, ch_page, chlist_page),
         )]);
         buttons.push(vec![InlineKeyboardButton::callback(
-            i18n::t(lang, "settings_caption").replacen("{}", if c.caption_above_media { i18n::t(lang, "on") } else { i18n::t(lang, "off") }, 1),
+            i18n::t(lang, "settings_caption").replacen(
+                "{}",
+                if c.caption_above_media {
+                    i18n::t(lang, "on")
+                } else {
+                    i18n::t(lang, "off")
+                },
+                1,
+            ),
             format!("c|srcfcp|{}|{}|{}", sub_id, ch_page, chlist_page),
         )]);
         buttons.push(vec![InlineKeyboardButton::callback(
-            i18n::t(lang, "settings_lp").replacen("{}", if c.link_preview { i18n::t(lang, "on") } else { i18n::t(lang, "off") }, 1),
+            i18n::t(lang, "settings_lp").replacen(
+                "{}",
+                if c.link_preview {
+                    i18n::t(lang, "on")
+                } else {
+                    i18n::t(lang, "off")
+                },
+                1,
+            ),
             format!("c|srcflp|{}|{}|{}", sub_id, ch_page, chlist_page),
         )]);
         // Note: under Approach A, picking a value identical to the channel automatically clears
@@ -616,9 +721,16 @@ async fn render_feed_page_impl(
             }
         };
         let label = if fc.is_active() {
-            let mode_label = if fc.mode == "whitelist" { i18n::t(lang, "whitelist") } else { i18n::t(lang, "blacklist") };
+            let mode_label = if fc.mode == "whitelist" {
+                i18n::t(lang, "whitelist")
+            } else {
+                i18n::t(lang, "blacklist")
+            };
             let kw_count = fc.keyword_list().len().to_string();
-            i18n::fill(i18n::t(lang, "feed_filter_active"), &[mode_label, &kw_count])
+            i18n::fill(
+                i18n::t(lang, "feed_filter_active"),
+                &[mode_label, &kw_count],
+            )
         } else {
             i18n::t(lang, "feed_filter").to_string()
         };
@@ -628,7 +740,11 @@ async fn render_feed_page_impl(
         )]);
     }
 
-    buttons.push(back_close_row(lang, "unsub_back", format!("c|ch|{}|{}|{}", sub.chat_id, ch_page, chlist_page)));
+    buttons.push(back_close_row(
+        lang,
+        "unsub_back",
+        format!("c|ch|{}|{}|{}", sub.chat_id, ch_page, chlist_page),
+    ));
 
     let kb = InlineKeyboardMarkup::new(buttons);
     deliver(bot, &target, &text, Some(kb)).await?;
@@ -712,23 +828,51 @@ async fn render_feed_filter_impl(
     } else {
         i18n::t(lang, "filter_off")
     };
-    let mode_label = if fc.mode == "whitelist" { i18n::t(lang, "filter_wl_desc") } else { i18n::t(lang, "filter_bl_desc") };
+    let mode_label = if fc.mode == "whitelist" {
+        i18n::t(lang, "filter_wl_desc")
+    } else {
+        i18n::t(lang, "filter_bl_desc")
+    };
     let kw_display = if fc.keywords.is_empty() {
         i18n::t(lang, "none").to_string()
     } else {
         format!("<code>{}</code>", crate::push::escape_html(&fc.keywords))
     };
 
-    let text = i18n::fill(i18n::t(lang, "filter_panel"), &[status, mode_label, &kw_display]);
+    let text = i18n::fill(
+        i18n::t(lang, "filter_panel"),
+        &[status, mode_label, &kw_display],
+    );
 
-    let toggle_label = if fc.enabled { i18n::t(lang, "filter_disable") } else { i18n::t(lang, "filter_enable") };
-    let mode_btn_label = if fc.mode == "whitelist" { i18n::t(lang, "filter_to_bl") } else { i18n::t(lang, "filter_to_wl") };
+    let toggle_label = if fc.enabled {
+        i18n::t(lang, "filter_disable")
+    } else {
+        i18n::t(lang, "filter_enable")
+    };
+    let mode_btn_label = if fc.mode == "whitelist" {
+        i18n::t(lang, "filter_to_bl")
+    } else {
+        i18n::t(lang, "filter_to_wl")
+    };
 
     let buttons = vec![
-        vec![InlineKeyboardButton::callback(toggle_label, format!("c|srcftoggle|{}|{}|{}", sub_id, ch_page, chlist_page))],
-        vec![InlineKeyboardButton::callback(mode_btn_label, format!("c|srcfmode|{}|{}|{}", sub_id, ch_page, chlist_page))],
-        vec![InlineKeyboardButton::callback(i18n::t(lang, "filter_set_kw"), format!("c|srcfkw|{}|{}|{}", sub_id, ch_page, chlist_page))],
-        back_close_row(lang, "back", format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page)),
+        vec![InlineKeyboardButton::callback(
+            toggle_label,
+            format!("c|srcftoggle|{}|{}|{}", sub_id, ch_page, chlist_page),
+        )],
+        vec![InlineKeyboardButton::callback(
+            mode_btn_label,
+            format!("c|srcfmode|{}|{}|{}", sub_id, ch_page, chlist_page),
+        )],
+        vec![InlineKeyboardButton::callback(
+            i18n::t(lang, "filter_set_kw"),
+            format!("c|srcfkw|{}|{}|{}", sub_id, ch_page, chlist_page),
+        )],
+        back_close_row(
+            lang,
+            "back",
+            format!("c|src|{}|{}|{}", sub_id, ch_page, chlist_page),
+        ),
     ];
     let kb = InlineKeyboardMarkup::new(buttons);
     deliver(bot, &target, &text, Some(kb)).await?;

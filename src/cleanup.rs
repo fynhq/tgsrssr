@@ -1,9 +1,9 @@
+use futures_util::TryStreamExt;
+use sqlx::Row;
 use std::collections::{BinaryHeap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use futures_util::TryStreamExt;
-use sqlx::Row;
 use tokio::fs;
 use tracing::{info, warn};
 use walkdir::WalkDir;
@@ -67,7 +67,9 @@ pub async fn run_all_cleanup(config: &Config, db_pool: &Db) {
 /// the retry window to be mistakenly deleted).
 /// Full query (no limit): during long outages with backlog, a limited query
 /// would miss entries that need protection.
-async fn outbox_protected_paths(db_pool: &Db) -> anyhow::Result<std::collections::HashSet<PathBuf>> {
+async fn outbox_protected_paths(
+    db_pool: &Db,
+) -> anyhow::Result<std::collections::HashSet<PathBuf>> {
     let mut set = std::collections::HashSet::new();
     let mut media_jsons = db::outbox_media_json_stream(db_pool);
     while let Some(mj) = media_jsons.try_next().await? {
@@ -472,7 +474,9 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
                     warn!("wal_checkpoint reported busy; continuing with VACUUM INTO snapshot");
                 }
             }
-            Err(e) => warn!(error = %e, "wal_checkpoint failed; continuing with VACUUM INTO snapshot"),
+            Err(e) => {
+                warn!(error = %e, "wal_checkpoint failed; continuing with VACUUM INTO snapshot")
+            }
         }
 
         // Write to a temp path first, then rename (atomic replacement): a
@@ -486,7 +490,10 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
         // is local config data, and single quotes are escaped.
         let tmp_literal = tmp.to_string_lossy().replace('\'', "''");
         let vacuum = format!("VACUUM INTO '{}'", tmp_literal);
-        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(vacuum)).execute(db_pool).await {
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(vacuum))
+            .execute(db_pool)
+            .await
+        {
             fs::remove_file(&tmp).await.ok();
             return Err(e.into());
         }
@@ -516,7 +523,9 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
                 if date < cutoff {
                     match fs::remove_file(entry.path()).await {
                         Ok(()) => info!(backup = %name_str, "removed old database backup"),
-                        Err(e) => warn!(backup = %name_str, error = %e, "failed to remove old database backup"),
+                        Err(e) => {
+                            warn!(backup = %name_str, error = %e, "failed to remove old database backup")
+                        }
                     }
                 }
             }
@@ -545,15 +554,21 @@ pub async fn run_startup_cleanup(config: &Config, db_pool: &Db) {
 async fn sweep_media_tmp_files(root: &Path) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(mut entries) = fs::read_dir(&dir).await else { continue };
+        let Ok(mut entries) = fs::read_dir(&dir).await else {
+            continue;
+        };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            let Ok(meta) = entry.metadata().await else { continue };
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
             if meta.is_dir() {
                 stack.push(entry.path());
             } else if entry.file_name().to_string_lossy().starts_with(".tmp_") {
                 match fs::remove_file(entry.path()).await {
                     Ok(()) => info!(file = %entry.path().display(), "removed stale media tmp file"),
-                    Err(e) => warn!(file = %entry.path().display(), error = %e, "failed to remove stale media tmp file"),
+                    Err(e) => {
+                        warn!(file = %entry.path().display(), error = %e, "failed to remove stale media tmp file")
+                    }
                 }
             }
         }
@@ -565,7 +580,11 @@ mod tests {
     use super::*;
 
     fn at(secs: u64, name: &str, size: u64) -> (SystemTime, PathBuf, u64) {
-        (SystemTime::UNIX_EPOCH + Duration::from_secs(secs), PathBuf::from(name), size)
+        (
+            SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            PathBuf::from(name),
+            size,
+        )
     }
 
     #[test]
@@ -598,7 +617,10 @@ mod tests {
         // 168h -> 7+1.
         assert_eq!(outbound_cutoff(today, 168), today - chrono::Days::new(8));
         // Extreme (bounded by config) values must not panic.
-        assert_eq!(outbound_cutoff(today, 87_600), today - chrono::Days::new(3651));
+        assert_eq!(
+            outbound_cutoff(today, 87_600),
+            today - chrono::Days::new(3651)
+        );
         assert_eq!(outbound_cutoff(today, u64::MAX), today);
     }
 }

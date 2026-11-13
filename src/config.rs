@@ -340,12 +340,7 @@ fn env_parse_or<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {
     }
 }
 
-fn clamp_warn<T: Copy + PartialOrd + std::fmt::Display>(
-    key: &str,
-    value: T,
-    min: T,
-    max: T,
-) -> T {
+fn clamp_warn<T: Copy + PartialOrd + std::fmt::Display>(key: &str, value: T, min: T, max: T) -> T {
     if value < min {
         eprintln!(
             "WARNING: {} = {} is below the supported minimum {}, clamping",

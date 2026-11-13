@@ -1,5 +1,5 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{SqlitePool};
+use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -19,8 +19,6 @@ pub use chats::*;
 pub use configs::*;
 pub use filters::*;
 pub use subs::*;
-
-
 
 pub type Db = SqlitePool;
 
@@ -232,7 +230,9 @@ pub async fn normalize_telegram_entry_ids(db: &Db) -> anyhow::Result<u64> {
              WHERE (feed_url LIKE 'https://t.me/%' OR feed_url LIKE 'http://t.me/%')
                AND instr(entry_id, '/') > 0"
         );
-        sqlx::query(sqlx::AssertSqlSafe(cleanup)).execute(db).await?;
+        sqlx::query(sqlx::AssertSqlSafe(cleanup))
+            .execute(db)
+            .await?;
     }
     Ok(moved)
 }
@@ -377,25 +377,23 @@ mod tests {
         assert!(!set_subscription_active(&pool, sub_id, "2", true)
             .await
             .unwrap());
-        let state: (i64, i64) = sqlx::query_as(
-            "SELECT active, auto_disabled FROM subscriptions WHERE id = ?",
-        )
-        .bind(sub_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let state: (i64, i64) =
+            sqlx::query_as("SELECT active, auto_disabled FROM subscriptions WHERE id = ?")
+                .bind(sub_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(state, (0, 1));
 
         assert!(set_subscription_active(&pool, sub_id, "1", true)
             .await
             .unwrap());
-        let state: (i64, i64) = sqlx::query_as(
-            "SELECT active, auto_disabled FROM subscriptions WHERE id = ?",
-        )
-        .bind(sub_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let state: (i64, i64) =
+            sqlx::query_as("SELECT active, auto_disabled FROM subscriptions WHERE id = ?")
+                .bind(sub_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(state, (1, 0));
     }
 
@@ -477,18 +475,30 @@ mod tests {
         assert!(cfg.cp_overridden);
 
         // A false override must survive COALESCE instead of falling back to the channel value.
-        set_feed_config_field(&pool, "1", "https://example.com/feed", "caption_above_media", Some("0"))
-            .await
-            .unwrap();
+        set_feed_config_field(
+            &pool,
+            "1",
+            "https://example.com/feed",
+            "caption_above_media",
+            Some("0"),
+        )
+        .await
+        .unwrap();
         let cfg = get_effective_config(&pool, "1", "https://example.com/feed")
             .await
             .unwrap();
         assert!(!cfg.caption_above_media);
         assert!(cfg.cp_overridden);
 
-        set_feed_config_field(&pool, "1", "https://example.com/feed", "caption_above_media", None)
-            .await
-            .unwrap();
+        set_feed_config_field(
+            &pool,
+            "1",
+            "https://example.com/feed",
+            "caption_above_media",
+            None,
+        )
+        .await
+        .unwrap();
         let cfg = get_effective_config(&pool, "1", "https://example.com/feed")
             .await
             .unwrap();
@@ -532,7 +542,10 @@ mod tests {
         set_chat_config_field(&pool, "1", "content_mode", "content_only")
             .await
             .unwrap();
-        let cfg = get_chat_config(&pool, "1").await.unwrap().expect("row created");
+        let cfg = get_chat_config(&pool, "1")
+            .await
+            .unwrap()
+            .expect("row created");
         assert_eq!(cfg.interval_minutes, DEFAULT_INTERVAL_MINUTES);
         assert_eq!(cfg.content_mode, "content_only");
     }
@@ -541,15 +554,23 @@ mod tests {
     async fn trim_sent_messages_keeps_newest_rows() {
         let pool = test_pool().await;
         for mid in 1..=3 {
-            record_sent_message(&pool, "1", mid, "https://example.com/feed", &format!("e{mid}"), None)
-                .await
-                .unwrap();
-        }
-        assert_eq!(trim_sent_messages(&pool, 2).await.unwrap(), 1);
-        let rows: Vec<i64> = sqlx::query_scalar("SELECT message_id FROM sent_messages ORDER BY message_id")
-            .fetch_all(&pool)
+            record_sent_message(
+                &pool,
+                "1",
+                mid,
+                "https://example.com/feed",
+                &format!("e{mid}"),
+                None,
+            )
             .await
             .unwrap();
+        }
+        assert_eq!(trim_sent_messages(&pool, 2).await.unwrap(), 1);
+        let rows: Vec<i64> =
+            sqlx::query_scalar("SELECT message_id FROM sent_messages ORDER BY message_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(rows, vec![2, 3]);
     }
 
@@ -589,12 +610,11 @@ mod tests {
 
         let removed = cleanup_sent_entries(&pool, 180).await.unwrap();
         assert_eq!(removed, 1, "only the expired orphan should be removed");
-        let remaining: Vec<(String, String)> = sqlx::query_as(
-            "SELECT chat_id, entry_id FROM sent_entries ORDER BY entry_id",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let remaining: Vec<(String, String)> =
+            sqlx::query_as("SELECT chat_id, entry_id FROM sent_entries ORDER BY entry_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             remaining,
             vec![
@@ -611,14 +631,9 @@ mod tests {
         // statement is unavailable.
         // Use a real file-backed DB: VACUUM INTO on sqlx's shared in-memory
         // connection does not materialise the target file.
-        let db_path = std::env::temp_dir().join(format!(
-            "tgsrssr_vacuum_src_{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let path = std::env::temp_dir().join(format!(
-            "tgsrssr_vacuum_{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("tgsrssr_vacuum_src_{}.db", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("tgsrssr_vacuum_{}.db", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&path);
         let pool = SqlitePoolOptions::new()
@@ -640,7 +655,10 @@ mod tests {
             .await
             .expect("VACUUM INTO should be supported");
         let head = std::fs::read(&path).expect("snapshot file should exist");
-        assert!(head.starts_with(b"SQLite format 3\0"), "not a SQLite database");
+        assert!(
+            head.starts_with(b"SQLite format 3\0"),
+            "not a SQLite database"
+        );
         pool.close().await;
         std::fs::remove_file(&db_path).ok();
         std::fs::remove_file(&path).ok();
@@ -776,12 +794,14 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO subscriptions (chat_id, feed_url, feed_title) VALUES (?, ?, 'feed')")
-            .bind(old)
-            .bind(feed)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO subscriptions (chat_id, feed_url, feed_title) VALUES (?, ?, 'feed')",
+        )
+        .bind(old)
+        .bind(feed)
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO chat_configs (chat_id, interval_minutes) VALUES (?, 5)")
             .bind(old)
             .execute(&pool)
@@ -852,9 +872,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(count, 1, "{table} row not moved");
-            let old_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
-                format!("SELECT COUNT(*) FROM {table} WHERE {condition}"),
-            ))
+            let old_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE {condition}"
+            )))
             .bind(old)
             .fetch_one(&pool)
             .await
@@ -862,12 +882,16 @@ mod tests {
             assert_eq!(old_count, 0, "{table} old row left behind");
         }
 
-        let interval: i64 = sqlx::query_scalar("SELECT interval_minutes FROM chat_configs WHERE chat_id = ?")
-            .bind(new)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(interval, 5, "old chat config must win over provisional defaults");
+        let interval: i64 =
+            sqlx::query_scalar("SELECT interval_minutes FROM chat_configs WHERE chat_id = ?")
+                .bind(new)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            interval, 5,
+            "old chat config must win over provisional defaults"
+        );
 
         let settings: Vec<String> = sqlx::query_scalar(
             "SELECT key FROM settings WHERE instr(key, 'auto_disable_notified:') = 1
@@ -961,19 +985,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            entry_dedup_state(&pool, "1", "https://example.com/feed", "sent-entry").await.unwrap(),
+            entry_dedup_state(&pool, "1", "https://example.com/feed", "sent-entry")
+                .await
+                .unwrap(),
             (true, false)
         );
         assert_eq!(
-            entry_dedup_state(&pool, "1", "https://example.com/feed", "queued-entry").await.unwrap(),
+            entry_dedup_state(&pool, "1", "https://example.com/feed", "queued-entry")
+                .await
+                .unwrap(),
             (false, true)
         );
         assert_eq!(
-            entry_dedup_state(&pool, "1", "https://example.com/feed", "new-entry").await.unwrap(),
+            entry_dedup_state(&pool, "1", "https://example.com/feed", "new-entry")
+                .await
+                .unwrap(),
             (false, false)
         );
         assert_eq!(
-            entry_dedup_state(&pool, "1", "https://example.com/other", "sent-entry").await.unwrap(),
+            entry_dedup_state(&pool, "1", "https://example.com/other", "sent-entry")
+                .await
+                .unwrap(),
             (false, false)
         );
     }
@@ -1012,16 +1044,14 @@ mod tests {
         let feed = "https://example.com/feed";
         mark_entry_sent(&pool, "1", feed, "e1").await.unwrap();
         mark_entry_sent(&pool, "1", feed, "e2").await.unwrap();
-        mark_entry_sent(&pool, "2", feed, "other-chat").await.unwrap();
+        mark_entry_sent(&pool, "2", feed, "other-chat")
+            .await
+            .unwrap();
         mark_entry_sent(&pool, "1", "https://example.com/other", "other-feed")
             .await
             .unwrap();
 
-        let wanted = vec![
-            "e1".to_string(),
-            "e2".to_string(),
-            "missing".to_string(),
-        ];
+        let wanted = vec!["e1".to_string(), "e2".to_string(), "missing".to_string()];
         let found = sent_entry_ids_in_window(&pool, "1", feed, &wanted)
             .await
             .unwrap();
@@ -1087,12 +1117,18 @@ mod tests {
         let owner7 = subscription_urls_for_user_owner(&pool, 7).await.unwrap();
         assert_eq!(owner7.len(), 3, "both channels owned by user 7 must count");
         assert_eq!(
-            owner7.iter().filter(|u| crate::platforms::platform_for_url(u).is_some()).count(),
+            owner7
+                .iter()
+                .filter(|u| crate::platforms::platform_for_url(u).is_some())
+                .count(),
             1
         );
         let owner8 = subscription_urls_for_user_owner(&pool, 8).await.unwrap();
         assert_eq!(owner8.len(), 1);
-        assert!(subscription_urls_for_user_owner(&pool, 9).await.unwrap().is_empty());
+        assert!(subscription_urls_for_user_owner(&pool, 9)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1103,8 +1139,20 @@ mod tests {
         insert_chat(&pool, "2", "7", 0).await;
         insert_sub(&pool, "2", "https://example.com/disabled-chat", None).await;
         insert_sub(&pool, "1", "https://example.com/never", None).await;
-        insert_sub(&pool, "1", "https://example.com/old", Some("2020-01-01 00:00:00")).await;
-        insert_sub(&pool, "1", "https://example.com/newer", Some("2021-01-01 00:00:00")).await;
+        insert_sub(
+            &pool,
+            "1",
+            "https://example.com/old",
+            Some("2020-01-01 00:00:00"),
+        )
+        .await;
+        insert_sub(
+            &pool,
+            "1",
+            "https://example.com/newer",
+            Some("2021-01-01 00:00:00"),
+        )
+        .await;
 
         let due = get_due_subscriptions(&pool).await.unwrap();
         let urls: Vec<&str> = due.iter().map(|(s, _)| s.feed_url.as_str()).collect();

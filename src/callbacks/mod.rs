@@ -1,7 +1,6 @@
 use teloxide::prelude::*;
 use teloxide::types::{
-    CallbackQuery, ChatId, ChatMemberStatus, InlineKeyboardButton,
-    InlineKeyboardMarkup, ParseMode,
+    CallbackQuery, ChatId, ChatMemberStatus, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode,
 };
 use tracing::{debug, error, info, warn};
 
@@ -50,11 +49,7 @@ enum GuardTarget {
     None,
 }
 /// Handle incoming callback queries.
-pub async fn handle_callback(
-    bot: Bot,
-    q: CallbackQuery,
-    state: AppState,
-) -> ResponseResult<()> {
+pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> ResponseResult<()> {
     // Hoist the callback ID to the top of the function: subsequent branches use qid uniformly
     // (cloning when ownership is needed), avoiding q.id.clone() scattered everywhere.
     // CallbackQueryId is not Copy; clone it to keep q intact.
@@ -132,7 +127,10 @@ pub async fn handle_callback(
                                 error = %e,
                                 "ownership guard: subscription lookup failed, rejecting (fail-closed)"
                             );
-                            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed_retry")).await.ok();
+                            bot.answer_callback_query(qid.clone())
+                                .text(i18n::t(lang, "op_failed_retry"))
+                                .await
+                                .ok();
                             return Ok(());
                         }
                     }
@@ -156,7 +154,10 @@ pub async fn handle_callback(
                     error = %e,
                     "ownership guard: permission lookup failed, rejecting (fail-closed)"
                 );
-                bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "op_failed_retry")).await.ok();
+                bot.answer_callback_query(qid.clone())
+                    .text(i18n::t(lang, "op_failed_retry"))
+                    .await
+                    .ok();
                 return Ok(());
             }
         };
@@ -169,7 +170,10 @@ pub async fn handle_callback(
                 target_chat = %gcid,
                 "ownership guard rejected callback"
             );
-            bot.answer_callback_query(qid.clone()).text(i18n::t(lang, "no_permission")).await.ok();
+            bot.answer_callback_query(qid.clone())
+                .text(i18n::t(lang, "no_permission"))
+                .await
+                .ok();
             return Ok(());
         }
     }
@@ -854,11 +858,19 @@ pub(super) async fn fetch_sub_or_toast(
         Ok(Some(sub)) => Some(sub),
         Ok(None) => {
             // #37: the subscription has been deleted (stale button left by an old panel) → show a toast instead of staying silent.
-            bot.answer_callback_query(qid).text(i18n::t(lang, "sub_not_found")).await.ok();
+            bot.answer_callback_query(qid)
+                .text(i18n::t(lang, "sub_not_found"))
+                .await
+                .ok();
             None
         }
         Err(e) => {
-            bot.answer_callback_query(qid).text(toast_text(i18n::t(lang, "op_failed").replace("{:#}", &format!("{:#}", e)))).await.ok();
+            bot.answer_callback_query(qid)
+                .text(toast_text(
+                    i18n::t(lang, "op_failed").replace("{:#}", &format!("{:#}", e)),
+                ))
+                .await
+                .ok();
             None
         }
     }
@@ -895,7 +907,9 @@ async fn start_pending_op(
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(chat_id = chat.0, user_id, error = %e, "pending-op prompt send failed");
-            bot.send_message(chat, i18n::t(lang, "op_failed_retry")).await.ok();
+            bot.send_message(chat, i18n::t(lang, "op_failed_retry"))
+                .await
+                .ok();
             return Err(e);
         }
     };
@@ -903,7 +917,13 @@ async fn start_pending_op(
     let old = ops.insert((chat.0, user_id), make_op(prompt.id.0));
     drop(ops);
     if let Some(old) = old {
-        crate::push::retire_prompt(bot, chat, old.prompt_msg_id(), i18n::t(lang, "new_op_started")).await;
+        crate::push::retire_prompt(
+            bot,
+            chat,
+            old.prompt_msg_id(),
+            i18n::t(lang, "new_op_started"),
+        )
+        .await;
     }
     Ok(())
 }
@@ -922,15 +942,14 @@ pub async fn handle_my_chat_member(
     if !(chat.is_channel() || chat.is_supergroup() || chat.is_group()) {
         return Ok(());
     }
-    let chat_type = crate::db::chat_type_str(chat.is_channel(), chat.is_group(), chat.is_supergroup());
+    let chat_type =
+        crate::db::chat_type_str(chat.is_channel(), chat.is_group(), chat.is_supergroup());
     // Record the inviter (the user who performed the add/remove action) as the channel owner.
     let inviter = update.from.id.0 as i64;
     let inviter_id = inviter.to_string();
 
     match update.new_chat_member.status() {
-        ChatMemberStatus::Member
-        | ChatMemberStatus::Administrator
-        | ChatMemberStatus::Owner => {
+        ChatMemberStatus::Member | ChatMemberStatus::Administrator | ChatMemberStatus::Owner => {
             // Anyone can add a bot to a chat they administer. Registering the
             // chat for an unapproved inviter would both pollute chats and let
             // that stranger become the permanent owner (blocking the intended
@@ -945,7 +964,16 @@ pub async fn handle_my_chat_member(
             }
             let title = chat.title().map(|t| t.to_string());
             let username = chat.username().map(|u| u.to_string());
-            if let Err(e) = db::upsert_chat(&state.db, &chat_id, chat_type, title.as_deref(), username.as_deref(), Some(&inviter_id)).await {
+            if let Err(e) = db::upsert_chat(
+                &state.db,
+                &chat_id,
+                chat_type,
+                title.as_deref(),
+                username.as_deref(),
+                Some(&inviter_id),
+            )
+            .await
+            {
                 error!(chat_id = %chat_id, error = %e, "failed to upsert chat");
             } else {
                 info!(chat_id = %chat_id, added_by = %inviter_id, "chat registered");

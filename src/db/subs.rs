@@ -1,7 +1,9 @@
 //! Subscriptions, due scheduling, feed configs and retry state.
 
+use super::chats::{
+    cleanup_chat_settings_keys, cleanup_feed_settings_keys, clear_auto_disable_notified,
+};
 use super::*;
-use super::chats::{cleanup_chat_settings_keys, cleanup_feed_settings_keys, clear_auto_disable_notified};
 use sqlx::Row;
 
 /// Feed URLs of every active subscription in an enabled chat. Used by the
@@ -20,7 +22,9 @@ pub async fn active_subscription_urls(db: &Db) -> anyhow::Result<Vec<String>> {
 }
 
 /// Count subscriptions per chat (for the channel list page display).
-pub async fn count_subscriptions_per_chat(db: &Db) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+pub async fn count_subscriptions_per_chat(
+    db: &Db,
+) -> anyhow::Result<std::collections::HashMap<String, i64>> {
     let rows = sqlx::query("SELECT chat_id, COUNT(*) AS cnt FROM subscriptions GROUP BY chat_id")
         .fetch_all(db)
         .await?;
@@ -49,12 +53,18 @@ pub async fn subscription_urls_for_chat(db: &Db, chat_id: &str) -> anyhow::Resul
         .bind(chat_id)
         .fetch_all(db)
         .await?;
-    Ok(rows.into_iter().map(|r| r.get::<String, _>("feed_url")).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| r.get::<String, _>("feed_url"))
+        .collect())
 }
 
 /// All subscription URLs across the channels owned by `user_id`
 /// (`chats.added_by`). Drives the per-user total / platform-source caps.
-pub async fn subscription_urls_for_user_owner(db: &Db, user_id: i64) -> anyhow::Result<Vec<String>> {
+pub async fn subscription_urls_for_user_owner(
+    db: &Db,
+    user_id: i64,
+) -> anyhow::Result<Vec<String>> {
     let rows = sqlx::query(
         r#"SELECT s.feed_url
            FROM subscriptions s
@@ -64,7 +74,10 @@ pub async fn subscription_urls_for_user_owner(db: &Db, user_id: i64) -> anyhow::
     .bind(user_id.to_string())
     .fetch_all(db)
     .await?;
-    Ok(rows.into_iter().map(|r| r.get::<String, _>("feed_url")).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| r.get::<String, _>("feed_url"))
+        .collect())
 }
 
 pub async fn list_chats(db: &Db, user_id: i64) -> anyhow::Result<Vec<ChatRow>> {
@@ -78,7 +91,6 @@ pub async fn list_chats(db: &Db, user_id: i64) -> anyhow::Result<Vec<ChatRow>> {
     .await?;
     Ok(rows)
 }
-
 
 /// Insert (or re-activate) a subscription and mark its current entries as
 /// sent in one transaction. /sub uses this so a failure can neither leave a
@@ -187,7 +199,9 @@ pub async fn sent_entry_ids_in_window(
     const CHUNK: usize = 300;
     let mut found = std::collections::HashSet::new();
     for chunk in ids.chunks(CHUNK) {
-        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT entry_id FROM sent_entries
               WHERE chat_id = ? AND feed_url = ? AND entry_id IN ({placeholders})"
@@ -241,7 +255,10 @@ pub async fn entry_dedup_state(
     .bind(entry_id)
     .fetch_one(db)
     .await?;
-    Ok((row.get::<i64, _>("sent") != 0, row.get::<i64, _>("queued") != 0))
+    Ok((
+        row.get::<i64, _>("sent") != 0,
+        row.get::<i64, _>("queued") != 0,
+    ))
 }
 
 pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
@@ -270,7 +287,10 @@ pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
     .bind(sub_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("DELETE FROM subscriptions WHERE id = ?").bind(sub_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM subscriptions WHERE id = ?")
+        .bind(sub_id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -305,32 +325,34 @@ pub async fn delete_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<
 const SUB_COLUMNS: &str = "id, chat_id, feed_url, feed_title, title_overridden, original_title, active, error_count, last_fetch_at, last_error, http_etag, http_last_modified, auto_disabled, disabled_at";
 
 pub async fn get_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<Vec<SubRow>> {
-    let sql = format!(
-        "SELECT {SUB_COLUMNS} FROM subscriptions WHERE chat_id = ? ORDER BY id DESC"
-    );
+    let sql = format!("SELECT {SUB_COLUMNS} FROM subscriptions WHERE chat_id = ? ORDER BY id DESC");
     let rows = sqlx::query_as::<_, SubRow>(sqlx::AssertSqlSafe(sql))
-    .bind(chat_id)
-    .fetch_all(db)
-    .await?;
+        .bind(chat_id)
+        .fetch_all(db)
+        .await?;
     Ok(rows)
 }
 
 pub async fn get_subscription_by_id(db: &Db, sub_id: i64) -> anyhow::Result<Option<SubRow>> {
     let sql = format!("SELECT {SUB_COLUMNS} FROM subscriptions WHERE id = ?");
     let row = sqlx::query_as::<_, SubRow>(sqlx::AssertSqlSafe(sql))
-    .bind(sub_id)
-    .fetch_optional(db)
-    .await?;
+        .bind(sub_id)
+        .fetch_optional(db)
+        .await?;
     Ok(row)
 }
 
-pub async fn get_subscription_by_url(db: &Db, chat_id: &str, feed_url: &str) -> anyhow::Result<Option<SubRow>> {
+pub async fn get_subscription_by_url(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<Option<SubRow>> {
     let sql = format!("SELECT {SUB_COLUMNS} FROM subscriptions WHERE chat_id = ? AND feed_url = ?");
     let row = sqlx::query_as::<_, SubRow>(sqlx::AssertSqlSafe(sql))
-    .bind(chat_id)
-    .bind(feed_url)
-    .fetch_optional(db)
-    .await?;
+        .bind(chat_id)
+        .bind(feed_url)
+        .fetch_optional(db)
+        .await?;
     Ok(row)
 }
 
@@ -376,7 +398,11 @@ pub async fn rename_subscription_auto(db: &Db, sub_id: i64, new_title: &str) -> 
 }
 
 /// Effective config for one subscription (chat defaults + feed overrides).
-pub async fn get_effective_config(db: &Db, chat_id: &str, feed_url: &str) -> anyhow::Result<EffectiveConfig> {
+pub async fn get_effective_config(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<EffectiveConfig> {
     // Build from a one-row base so a missing chat_configs row does not hide
     // feed_configs overrides. This is the same precedence as the due query
     // below: feed override > channel config > DEFAULT_*.
@@ -708,4 +734,3 @@ pub async fn update_fetch_headers(
     .await?;
     Ok(())
 }
-

@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 // next_retry_at/last_error are only used in SQL WHERE/UPDATE and never read
 // directly on the Rust side — kept to preserve the complete mapping of the
 // database schema. `first_attempt_at` is read by the retry loop to measure the
@@ -184,5 +183,3 @@ pub async fn outbox_delete(db: &Db, id: i64) -> anyhow::Result<()> {
         .await?;
     Ok(())
 }
-
-

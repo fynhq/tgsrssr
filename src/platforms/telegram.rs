@@ -88,7 +88,10 @@ pub fn parse_channel_name(url: &str) -> Option<String> {
         return None;
     }
     // Channel usernames: 5-32 chars, alphanumeric + underscore.
-    if name.len() < 5 || name.len() > 32 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if name.len() < 5
+        || name.len() > 32
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return None;
     }
     Some(name.to_string())
@@ -100,12 +103,12 @@ pub fn parse_channel_name(url: &str) -> Option<String> {
 
 /// Channel display name from the info header.
 static RE_CHAN_TITLE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?is)tgme_channel_info_header_title[^>]*>.*?<span[^>]*>(.*?)</span>"#).unwrap()
+    regex::Regex::new(r#"(?is)tgme_channel_info_header_title[^>]*>.*?<span[^>]*>(.*?)</span>"#)
+        .unwrap()
 });
 /// Opening tag carrying the data-post attribute (used to locate block boundaries).
-static RE_DATA_POST: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"data-post="([^"]+)""#).unwrap()
-});
+static RE_DATA_POST: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"data-post="([^"]+)""#).unwrap());
 /// Message text container opening tag (main text only, not reply text).
 /// Captures nothing: the inner HTML is extracted by a balanced-div position
 /// scan (see `extract_main_text_html`), because the body can contain nested
@@ -138,16 +141,18 @@ static RE_REPLY_AUTHOR: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// Reply text container opening tag. Captures nothing: inner HTML is
 /// extracted by the balanced-div scan (`extract_balanced_div_inner`) since
 /// quoted content may itself contain nested `</div>`.
-static RE_REPLY_TEXT_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?is)<div[^>]*js-message_reply_text[^>]*>"#).unwrap()
-});
+static RE_REPLY_TEXT_OPEN: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"(?is)<div[^>]*js-message_reply_text[^>]*>"#).unwrap());
 /// Photo: background-image url on the photo wrap.
 /// Anchored inside the `tgme_widget_message_photo_wrap` tag: the page also
 /// uses background-image for video posters (video_thumb), reply message
 /// thumbnails (reply_thumb) and link preview cards; without the restriction
 /// those would be mistakenly extracted as body images.
 static RE_PHOTO_BG: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?is)<a\b[^>]*tgme_widget_message_photo_wrap[^>]*background-image:url\('([^']+)'\)"#).unwrap()
+    regex::Regex::new(
+        r#"(?is)<a\b[^>]*tgme_widget_message_photo_wrap[^>]*background-image:url\('([^']+)'\)"#,
+    )
+    .unwrap()
 });
 /// Video: `<video src=...>`.
 static RE_VIDEO_SRC: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -172,9 +177,8 @@ static RE_DOC_TITLE: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// (see `extract_published`) — never as "first datetime in the block", since
 /// the reply block precedes the main text and embeds the quoted message's own
 /// `<time datetime>`.
-static RE_DATETIME: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"datetime="([^"]+)""#).unwrap()
-});
+static RE_DATETIME: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"datetime="([^"]+)""#).unwrap());
 /// Main message date container: `<div class="tgme_widget_message_date">`
 /// wrapping the message's own `<time datetime=...>`. Any tag name with this
 /// class qualifies; matched generically so a markup tweak (div→span) still
@@ -256,7 +260,10 @@ pub async fn fetch_telegram_channel(
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             if page == 0 {
-                anyhow::bail!("Telegram channel does not exist or is private (no public web preview): @{}", channel);
+                anyhow::bail!(
+                    "Telegram channel does not exist or is private (no public web preview): @{}",
+                    channel
+                );
             }
             break;
         }
@@ -292,7 +299,9 @@ pub async fn fetch_telegram_channel(
         total_blocks += blocks.len();
         let before_len = entries.len();
         for (post, block) in &blocks {
-            if let Some(e) = message_to_entry(post, block, feed_title.as_deref().unwrap_or(channel), lang) {
+            if let Some(e) =
+                message_to_entry(post, block, feed_title.as_deref().unwrap_or(channel), lang)
+            {
                 // Dedup by entry id within the batch, matching the Weibo/X
                 // convention (fix for #8)
                 crate::platforms::push_unique_entry(&mut entries, &mut seen_ids, e);
@@ -343,7 +352,10 @@ pub async fn fetch_telegram_channel(
         );
     }
 
-    Ok(crate::fetcher::FetchResult::platform(Some(feed_title), entries))
+    Ok(crate::fetcher::FetchResult::platform(
+        Some(feed_title),
+        entries,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +376,11 @@ fn split_message_blocks(html: &str) -> Vec<(String, &str)> {
             let m = c.get(0)?;
             let post = c[1].to_string();
             // Only count actual message posts (channel/msgid format).
-            if post.contains('/') { Some((m.start(), post)) } else { None }
+            if post.contains('/') {
+                Some((m.start(), post))
+            } else {
+                None
+            }
         })
         .collect();
     posts
@@ -461,7 +477,11 @@ fn message_to_entry(data_post: &str, block: &str, feed_title: &str, lang: Lang) 
         };
         match marker {
             Some(m) => {
-                body = format!("<a href=\"{}\">{}</a>", crate::htmltext::escape_attr(&link), m);
+                body = format!(
+                    "<a href=\"{}\">{}</a>",
+                    crate::htmltext::escape_attr(&link),
+                    m
+                );
             }
             None => {
                 tracing::debug!(post = %data_post, "telegram message skipped (service or unsupported)");
@@ -474,9 +494,15 @@ fn message_to_entry(data_post: &str, block: &str, feed_title: &str, lang: Lang) 
     let plain = crate::fetcher::html_to_plain(&main_html);
     let title = crate::platforms::make_title(&plain, i18n::t(lang, "telegram_media_title"));
 
-
-
-    Some(crate::platforms::make_entry(msg_id.to_string(), title, feed_title.to_string(), body, "text/html", link, published))
+    Some(crate::platforms::make_entry(
+        msg_id.to_string(),
+        title,
+        feed_title.to_string(),
+        body,
+        "text/html",
+        link,
+        published,
+    ))
 }
 
 /// Extract a reply/quoted block and render it as a `<blockquote>`.
@@ -502,9 +528,7 @@ fn extract_reply_blockquote(block: &str) -> String {
     // entities in the name (`&amp;`) are decoded rather than shown literally.
     let author = RE_REPLY_AUTHOR
         .captures(&inner)
-        .map(|c| {
-            crate::fetcher::html_to_plain(&c[1]).trim().to_string()
-        })
+        .map(|c| crate::fetcher::html_to_plain(&c[1]).trim().to_string())
         .unwrap_or_default();
 
     // Reply text (keep raw HTML for link preservation): balanced-div scan so
@@ -562,9 +586,14 @@ fn extract_published(block: &str) -> Option<DateTime<Utc>> {
     // anchor (truncated markup): exclude through end of block — a missing
     // timestamp is safer than the quoted message's wrong one.
     let reply_range = RE_REPLY_BLOCK.find(block).map(|reply| {
-        let end = crate::htmltext::find_balanced_close(block, reply.end(), &RE_ANCHOR_OPEN, &RE_ANCHOR_CLOSE)
-            .map(|(close_start, _)| close_start)
-            .unwrap_or(block.len());
+        let end = crate::htmltext::find_balanced_close(
+            block,
+            reply.end(),
+            &RE_ANCHOR_OPEN,
+            &RE_ANCHOR_CLOSE,
+        )
+        .map(|(close_start, _)| close_start)
+        .unwrap_or(block.len());
         (reply.start(), end)
     });
     let in_reply = |pos: usize| matches!(&reply_range, Some((s, e)) if pos >= *s && pos < *e);
@@ -658,11 +687,17 @@ fn append_media_tags(body: &mut String, block: &str) {
     // `&amp;` in the query string.
     for caps in RE_PHOTO_BG.captures_iter(block) {
         let src = crate::htmltext::unescape_html(&caps[1]);
-        body.push_str(&format!("<img src=\"{}\">", crate::htmltext::escape_attr(&src)));
+        body.push_str(&format!(
+            "<img src=\"{}\">",
+            crate::htmltext::escape_attr(&src)
+        ));
     }
     for caps in RE_VIDEO_SRC.captures_iter(block) {
         let src = crate::htmltext::unescape_html(&caps[1]);
-        body.push_str(&format!("<video src=\"{}\"></video>", crate::htmltext::escape_attr(&src)));
+        body.push_str(&format!(
+            "<video src=\"{}\"></video>",
+            crate::htmltext::escape_attr(&src)
+        ));
     }
 }
 
@@ -672,10 +707,22 @@ mod tests {
 
     #[test]
     fn parse_channel_name_valid() {
-        assert_eq!(parse_channel_name("https://t.me/telegram"), Some("telegram".into()));
-        assert_eq!(parse_channel_name("https://telegram.me/telegram"), Some("telegram".into()));
-        assert_eq!(parse_channel_name("https://t.me/s/telegram"), Some("telegram".into()));
-        assert_eq!(parse_channel_name("https://t.me/some_channel_1"), Some("some_channel_1".into()));
+        assert_eq!(
+            parse_channel_name("https://t.me/telegram"),
+            Some("telegram".into())
+        );
+        assert_eq!(
+            parse_channel_name("https://telegram.me/telegram"),
+            Some("telegram".into())
+        );
+        assert_eq!(
+            parse_channel_name("https://t.me/s/telegram"),
+            Some("telegram".into())
+        );
+        assert_eq!(
+            parse_channel_name("https://t.me/some_channel_1"),
+            Some("some_channel_1".into())
+        );
     }
 
     #[test]
@@ -735,7 +782,11 @@ mod tests {
         let q = extract_reply_blockquote(block);
         assert!(q.contains("before"), "out: {}", q);
         assert!(q.contains("after"), "out: {}", q);
-        assert!(q.contains(r#"<a href="https://example.com">link text</a>"#), "out: {}", q);
+        assert!(
+            q.contains(r#"<a href="https://example.com">link text</a>"#),
+            "out: {}",
+            q
+        );
     }
 
     #[test]

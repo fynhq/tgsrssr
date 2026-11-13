@@ -161,7 +161,10 @@ mod tests {
 
     #[test]
     fn blacklist_returns_filtered_ids_for_mark_sent() {
-        let entries = vec![entry("bad", "bad news", None), entry("ok", "good news", None)];
+        let entries = vec![
+            entry("bad", "bad news", None),
+            entry("ok", "good news", None),
+        ];
         let cfg = filter(true, "blacklist", "bad");
         let keywords = cfg.keyword_list();
         let out = select_pending(

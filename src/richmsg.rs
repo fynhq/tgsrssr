@@ -159,7 +159,10 @@ pub enum RichMediaSource {
     /// Official API (or an untranslatable path): stream the local file through
     /// multipart/form-data. The file is read chunk by chunk at send time, so a
     /// large document does not occupy the equivalent heap memory.
-    File { path: std::path::PathBuf, filename: String },
+    File {
+        path: std::path::PathBuf,
+        filename: String,
+    },
 }
 
 /// Media type accepted by `InputRichMessageMedia`.
@@ -197,9 +200,9 @@ async fn value_and_part(
         RichMediaSource::FileId(id) => Ok((id, None)),
         RichMediaSource::FilePath(path) => Ok((format!("file://{path}"), None)),
         RichMediaSource::File { path, filename } => {
-            let file = tokio::fs::File::open(&path).await.with_context(|| {
-                format!("open rich media file failed: {}", path.display())
-            })?;
+            let file = tokio::fs::File::open(&path)
+                .await
+                .with_context(|| format!("open rich media file failed: {}", path.display()))?;
             let len = file
                 .metadata()
                 .await
@@ -233,10 +236,7 @@ fn rich_media_object(
     };
     let mut object = Map::new();
     object.insert("type".to_string(), Value::String(media_type.to_string()));
-    object.insert(
-        "media".to_string(),
-        Value::String(media_value.to_string()),
-    );
+    object.insert("media".to_string(), Value::String(media_value.to_string()));
 
     match kind {
         RichMediaKind::Video => {
@@ -259,10 +259,7 @@ fn rich_media_object(
                 object.insert("thumbnail".to_string(), Value::String(thumb.to_string()));
             }
             if disable_content_type_detection {
-                object.insert(
-                    "disable_content_type_detection".to_string(),
-                    json!(true),
-                );
+                object.insert("disable_content_type_detection".to_string(), json!(true));
             }
         }
         RichMediaKind::Photo => {}
@@ -352,7 +349,10 @@ pub async fn send_rich_message(
         payload.insert("chat_id".to_string(), json!(chat_id));
         payload.insert("rich_message".to_string(), rich);
         if let Some(id) = reply_to {
-            payload.insert("reply_parameters".to_string(), json!({ "message_id": id.0 }));
+            payload.insert(
+                "reply_parameters".to_string(),
+                json!({ "message_id": id.0 }),
+            );
         }
         let payload = Value::Object(payload);
         let response = bot
@@ -420,20 +420,17 @@ mod tests {
         assert_eq!(value, "abc");
         assert!(part.is_none());
 
-        let (value, part) =
-            value_and_part(RichMediaSource::FilePath("/tmp/a.jpg".into()), "m0")
-                .await
-                .unwrap();
+        let (value, part) = value_and_part(RichMediaSource::FilePath("/tmp/a.jpg".into()), "m0")
+            .await
+            .unwrap();
         assert_eq!(value, "file:///tmp/a.jpg");
         assert!(part.is_none());
     }
 
     #[tokio::test]
     async fn local_file_uses_attach_reference() {
-        let path = std::env::temp_dir().join(format!(
-            "tgsrssr-richmsg-{}.jpg",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("tgsrssr-richmsg-{}.jpg", uuid::Uuid::new_v4()));
         tokio::fs::write(&path, [1u8, 2, 3]).await.unwrap();
         let (value, part) = value_and_part(
             RichMediaSource::File {
@@ -453,10 +450,8 @@ mod tests {
     async fn multipart_upload_streams_local_file_bytes() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let path = std::env::temp_dir().join(format!(
-            "tgsrssr-richmsg-{}.bin",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("tgsrssr-richmsg-{}.bin", uuid::Uuid::new_v4()));
         let payload: Vec<u8> = (0..=255u8).cycle().take(8 * 1024).collect();
         tokio::fs::write(&path, &payload).await.unwrap();
 
@@ -497,7 +492,8 @@ mod tests {
             assert!(request.contains("filename=\"a.jpg\""));
             assert!(request.contains("attach://m0"));
             assert!(
-                data.windows(expected.len()).any(|w| w == expected.as_slice()),
+                data.windows(expected.len())
+                    .any(|w| w == expected.as_slice()),
                 "uploaded multipart body is missing the file bytes"
             );
 

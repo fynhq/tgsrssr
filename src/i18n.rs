@@ -252,7 +252,11 @@ mod tests {
                 );
             }
             assert_ne!(owner.label(), "[?]", "missing label for {owner:?}");
-            assert!(!owner.label().is_empty(), "empty {} label", owner.label_key());
+            assert!(
+                !owner.label().is_empty(),
+                "empty {} label",
+                owner.label_key()
+            );
         }
         assert_eq!(Lang::Zh.label_key(), "language.zh");
         assert_eq!(Lang::En.label_key(), "language.en");

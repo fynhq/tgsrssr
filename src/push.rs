@@ -7,8 +7,8 @@ use teloxide::types::{
 
 use crate::db::{self, Db};
 use crate::fetcher;
-use crate::i18n::Lang;
 use crate::htmltext::{merge_adjacent_blockquotes, split_html};
+use crate::i18n::Lang;
 use crate::media::{MediaItem, MediaKind};
 use crate::richmsg::{self, RichMedia, RichMediaKind, RichMediaSource};
 use crate::sendpolicy::{
@@ -78,7 +78,12 @@ pub fn no_preview() -> teloxide::types::LinkPreviewOptions {
 /// Defined in push.rs (batch A3: breaks the callbacks→commands reverse
 /// dependency edge); commands keeps a re-export to preserve existing call
 /// paths.
-pub async fn retire_prompt(bot: &Bot, chat: teloxide::types::ChatId, prompt_msg_id: i32, status: &str) {
+pub async fn retire_prompt(
+    bot: &Bot,
+    chat: teloxide::types::ChatId,
+    prompt_msg_id: i32,
+    status: &str,
+) {
     let mid = teloxide::types::MessageId(prompt_msg_id);
     if bot.edit_message_text(chat, mid, status).await.is_err() {
         // Truly uneditable (e.g. too old). Leave it in place — deleting would
@@ -127,7 +132,9 @@ pub struct SendOutcome {
 /// replacing the former in-body data-vote marker parsing). Returns
 /// (question, options, is_multi_select).
 /// Telegram limits: question ≤300 chars, options 2-10 items of ≤100 chars each.
-pub fn extract_poll(meta: Option<&crate::entrymeta::EntryMeta>) -> Option<(String, Vec<String>, bool)> {
+pub fn extract_poll(
+    meta: Option<&crate::entrymeta::EntryMeta>,
+) -> Option<(String, Vec<String>, bool)> {
     let poll = meta.and_then(|m| m.poll.as_ref())?;
     truncate_poll(&poll.question, &poll.options, poll.is_multi_select)
 }
@@ -136,7 +143,11 @@ pub fn extract_poll(meta: Option<&crate::entrymeta::EntryMeta>) -> Option<(Strin
 /// ≤100 chars each.
 /// Counted in UTF-16 code units (Telegram's measure; emoji count as 2 units),
 /// consistent with message splitting (#3 fix).
-fn truncate_poll(question: &str, options: &[String], is_multi: bool) -> Option<(String, Vec<String>, bool)> {
+fn truncate_poll(
+    question: &str,
+    options: &[String],
+    is_multi: bool,
+) -> Option<(String, Vec<String>, bool)> {
     // Guard: an empty question is never turned into a poll (weibo.rs already
     // blocks this at construction time; this defends against outbox
     // deserialization or future data bypassing the construction-side check).
@@ -189,7 +200,10 @@ pub async fn send_poll(
     use teloxide::types::InputPollOption;
     let poll_options: Vec<InputPollOption> = options
         .iter()
-        .map(|o| InputPollOption { text: o.clone(), formatting: None })
+        .map(|o| InputPollOption {
+            text: o.clone(),
+            formatting: None,
+        })
         .collect();
     pace(chat_id).await;
     let mut retry = SendRetryState::new(SendRetryPolicy::POLL, false, false);
@@ -652,7 +666,10 @@ async fn try_send_rich_media(
 /// behavior.
 async fn path_input(path: &std::path::Path) -> anyhow::Result<InputFile> {
     let logical_name = crate::media::logical_file_name(path);
-    let physical_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let physical_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     tokio::fs::File::open(path).await?;
     let input = InputFile::file(path.to_path_buf());
     Ok(if logical_name.as_str() != physical_name {
@@ -693,7 +710,10 @@ fn message_file_id_for(msg: &Message, mode: &str) -> Option<String> {
         "video" => msg.video().map(|v| v.file.id.0.clone()),
         "gif" => msg.animation().map(|a| a.file.id.0.clone()),
         "doc" => msg.document().map(|d| d.file.id.0.clone()),
-        _ => msg.photo().and_then(|s| s.last()).map(|p| p.file.id.0.clone()),
+        _ => msg
+            .photo()
+            .and_then(|s| s.last())
+            .map(|p| p.file.id.0.clone()),
     }
 }
 
@@ -758,9 +778,7 @@ pub struct PushCtx<'a> {
 /// one such item would fail the whole rich message and force the entry back to
 /// the standard path. They are sent afterwards as document messages quoting
 /// the main message instead.
-fn split_rich_docs<'a>(
-    docs: &[&'a MediaItem],
-) -> (Vec<&'a MediaItem>, Vec<&'a MediaItem>) {
+fn split_rich_docs<'a>(docs: &[&'a MediaItem]) -> (Vec<&'a MediaItem>, Vec<&'a MediaItem>) {
     let mut rich = Vec::new();
     let mut follow = Vec::new();
     for item in docs {
@@ -866,7 +884,9 @@ pub async fn send_entry_with_media(
         // classification; anything over the limits is merged into docs.
         if m.is_retweet && m.kind == MediaKind::Image {
             let format_doc = !m.is_gif && !crate::media::photo_format_compatible(&m.path);
-            if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold) || format_doc {
+            if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold)
+                || format_doc
+            {
                 docs.push(m);
             } else if m.is_gif {
                 gifs.push(m);
@@ -878,7 +898,9 @@ pub async fn send_entry_with_media(
         match m.kind {
             MediaKind::Image => {
                 let format_doc = !m.is_gif && !crate::media::photo_format_compatible(&m.path);
-                if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold) || format_doc {
+                if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold)
+                    || format_doc
+                {
                     docs.push(m);
                     tracing::debug!(
                         size = m.size,
@@ -950,7 +972,10 @@ pub async fn send_entry_with_media(
             && should_try_rich_media(full_text_len, rich_media_count),
         "/push: media path decision"
     );
-    if opts.allow_rich && !crate::richmsg::is_unsupported() && should_try_rich_media(full_text_len, rich_media_count) {
+    if opts.allow_rich
+        && !crate::richmsg::is_unsupported()
+        && should_try_rich_media(full_text_len, rich_media_count)
+    {
         match try_send_rich_media(
             bot,
             db,
@@ -1021,17 +1046,9 @@ pub async fn send_entry_with_media(
     if rich_delivered && !gifs.is_empty() {
         let gif_ops = build_rich_ops(&[], &gifs, &[]);
         let reply_to = anchor.as_ref().map(|m| m.id);
-        if let Err((_, _, e)) = send_rich_ops_with_retry(
-            bot,
-            db,
-            chat_id,
-            "",
-            false,
-            &gif_ops,
-            reply_to,
-            "rich_gifs",
-        )
-        .await
+        if let Err((_, _, e)) =
+            send_rich_ops_with_retry(bot, db, chat_id, "", false, &gif_ops, reply_to, "rich_gifs")
+                .await
         {
             tracing::warn!(
                 chat_id = chat_id,
@@ -1044,7 +1061,17 @@ pub async fn send_entry_with_media(
     }
 
     if !rich_delivered && !rich_ops.is_empty() {
-        let rich = send_rich_ops_with_retry(bot, db, chat_id, &caption, caption_above, &rich_ops, None, "main").await;
+        let rich = send_rich_ops_with_retry(
+            bot,
+            db,
+            chat_id,
+            &caption,
+            caption_above,
+            &rich_ops,
+            None,
+            "main",
+        )
+        .await;
         match rich {
             Ok((_, first_msg)) => {
                 anchor = first_msg;
@@ -1076,7 +1103,9 @@ pub async fn send_entry_with_media(
                     // caption overflow is sent as follow-up messages.
                     text_delivered = true;
                     for chunk in &overflow_chunks {
-                        if let Err(te) = send_chunk_with_retry(bot, chat_id, chunk, false, fallback_msg_id).await {
+                        if let Err(te) =
+                            send_chunk_with_retry(bot, chat_id, chunk, false, fallback_msg_id).await
+                        {
                             tracing::warn!(
                                 chat_id = chat_id,
                                 entry_id = %fetcher::entry_id(entry),
@@ -1086,7 +1115,9 @@ pub async fn send_entry_with_media(
                             break;
                         }
                     }
-                } else if let Some((body, footer)) = format_entry_parts(entry, feed_title, author, opts, meta) {
+                } else if let Some((body, footer)) =
+                    format_entry_parts(entry, feed_title, author, opts, meta)
+                {
                     match send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await {
                         Ok(sent) => {
                             let m = sent.first;
@@ -1103,7 +1134,8 @@ pub async fn send_entry_with_media(
                             tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %te, "text fallback also failed, propagating for outbox");
                             return Err(anyhow::anyhow!(
                                 "media send failed ({}) and text fallback also failed: {}",
-                                e, te
+                                e,
+                                te
                             ));
                         }
                     }
@@ -1140,7 +1172,18 @@ pub async fn send_entry_with_media(
                 // must not silently drop the images on this branch.
                 if !rt_photos.is_empty() {
                     let rt_ops = build_rich_ops(&rt_photos, &[], &[]);
-                    if let Err((_, _, re)) = send_rich_ops_with_retry(bot, db, chat_id, "", false, &rt_ops, fallback_msg_id, "rt_images_text_fallback").await {
+                    if let Err((_, _, re)) = send_rich_ops_with_retry(
+                        bot,
+                        db,
+                        chat_id,
+                        "",
+                        false,
+                        &rt_ops,
+                        fallback_msg_id,
+                        "rt_images_text_fallback",
+                    )
+                    .await
+                    {
                         tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %re, "retweet images send failed after text fallback");
                     }
                 }
@@ -1185,7 +1228,11 @@ pub async fn send_entry_with_media(
     let docs_to_send: &[&MediaItem] = if rich_delivered { &follow_docs } else { &docs };
     if !docs_to_send.is_empty() {
         let reply_to = anchor.as_ref().map(|m| m.id);
-        let cap = if anchor.is_none() { caption.as_str() } else { "" };
+        let cap = if anchor.is_none() {
+            caption.as_str()
+        } else {
+            ""
+        };
         match send_doc_group(bot, db, chat_id, docs_to_send, cap, reply_to).await {
             Ok(msgs) => {
                 first_doc_msg = msgs.into_iter().next();
@@ -1208,7 +1255,11 @@ pub async fn send_entry_with_media(
                     }
                 }
                 for (i, d) in docs_to_send.iter().enumerate().skip(delivered.len()) {
-                    let cap = if i == 0 && anchor.is_none() { caption.as_str() } else { "" };
+                    let cap = if i == 0 && anchor.is_none() {
+                        caption.as_str()
+                    } else {
+                        ""
+                    };
                     match send_doc_msg(bot, db, chat_id, d, cap, chain_id).await {
                         Ok(m) => {
                             if first_doc_msg.is_none() {
@@ -1240,12 +1291,26 @@ pub async fn send_entry_with_media(
     // the first rt op to prevent losing the body text.
     if !rt_photos.is_empty() {
         let rt_is_sole_carrier = anchor.is_none() && first_doc_msg.is_none();
-        let rt_caption = if rt_is_sole_carrier { caption.as_str() } else { "" };
+        let rt_caption = if rt_is_sole_carrier {
+            caption.as_str()
+        } else {
+            ""
+        };
         let rt_reply_to = anchor.as_ref().or(first_doc_msg.as_ref()).map(|m| m.id);
         let rt_ops = build_rich_ops(&rt_photos, &[], &[]);
         // Network backoff retry consistent with the main rich_ops (resume
         // from the breakpoint).
-        let rt_res = send_rich_ops_with_retry(bot, db, chat_id, rt_caption, caption_above, &rt_ops, rt_reply_to, "rt_images").await;
+        let rt_res = send_rich_ops_with_retry(
+            bot,
+            db,
+            chat_id,
+            rt_caption,
+            caption_above,
+            &rt_ops,
+            rt_reply_to,
+            "rt_images",
+        )
+        .await;
         match rt_res {
             Ok((_, first_rt_msg)) => {
                 // When retweet images become the only delivered carrier,
@@ -1292,10 +1357,8 @@ pub async fn send_entry_with_media(
     // first_doc_msg is set), an overflow text failure does not return Err —
     // otherwise an upstream retry would re-send the media as a whole and
     // create duplicates. Instead, set media_failed and continue returning Ok.
-    let overflow_reply_to: Option<teloxide::types::MessageId> = anchor
-        .as_ref()
-        .or(first_doc_msg.as_ref())
-        .map(|m| m.id);
+    let overflow_reply_to: Option<teloxide::types::MessageId> =
+        anchor.as_ref().or(first_doc_msg.as_ref()).map(|m| m.id);
     // `caption_delivered` also covers a partial rt/rich send whose message
     // object is unavailable: an overflow failure must not trigger a whole
     // entry replay and duplicate the caption.
@@ -1304,7 +1367,9 @@ pub async fn send_entry_with_media(
     // overflow must not be sent again.
     if !rich_delivered {
         for chunk in &overflow_chunks {
-            if let Err(e) = send_chunk_with_retry(bot, chat_id, chunk, false, overflow_reply_to).await {
+            if let Err(e) =
+                send_chunk_with_retry(bot, chat_id, chunk, false, overflow_reply_to).await
+            {
                 if already_delivered {
                     tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %e, "overflow text failed after delivery, not retrying");
                     media_failed = true;
@@ -1342,10 +1407,7 @@ pub async fn send_entry_with_media(
     // data into a native Telegram poll. Sending it before the carrier check
     // meant "all documents failed -> return Err" retried the poll on every
     // outbox backoff (polls cannot be recalled).
-    let poll_reply_to = anchor
-        .as_ref()
-        .or(first_doc_msg.as_ref())
-        .map(|m| m.id);
+    let poll_reply_to = anchor.as_ref().or(first_doc_msg.as_ref()).map(|m| m.id);
     if try_send_poll(bot, chat_id, poll_reply_to, meta).await {
         media_failed = true;
     }
@@ -1492,47 +1554,43 @@ async fn send_doc_group(
             .map(|d| format!("{}:doc", d.content_hash))
             .collect();
         let has_thumb = chunk.iter().any(|d| d.thumb_path.is_some());
-        let msgs = send_with_full_retry(
-            db,
-            chat_id,
-            &keys,
-            has_thumb,
-            |use_cache, use_thumbs| {
-                let rp = rp.clone();
-                async move {
-                    let mut group: Vec<InputMedia> = Vec::new();
-                    for (j, d) in chunk.iter().enumerate() {
-                        let inp = resolve_input(db, d, "doc", use_cache).await?;
-                        let mut im = InputMediaDocument::new(inp);
-                        // Image documents opt out of content-type detection: a WebP
-                        // document is otherwise detected as a sticker, and stickers
-                        // cannot carry a caption. With detection disabled the message
-                        // stays a document and keeps its caption (verified on both
-                        // the official and local Bot API).
-                        if d.kind == MediaKind::Image {
-                            im.disable_content_type_detection = Some(true);
-                        }
-                        if j == 0 && !group_caption.is_empty() {
-                            im = im.caption(group_caption.to_string()).parse_mode(ParseMode::Html);
-                        }
-                        // Converted-to-document long/large images carry a thumbnail
-                        if use_thumbs {
-                            if let Some(tp) = &d.thumb_path {
-                                if let Ok(tin) = path_input(tp).await {
-                                    im.thumbnail = Some(tin);
-                                }
+        let msgs = send_with_full_retry(db, chat_id, &keys, has_thumb, |use_cache, use_thumbs| {
+            let rp = rp.clone();
+            async move {
+                let mut group: Vec<InputMedia> = Vec::new();
+                for (j, d) in chunk.iter().enumerate() {
+                    let inp = resolve_input(db, d, "doc", use_cache).await?;
+                    let mut im = InputMediaDocument::new(inp);
+                    // Image documents opt out of content-type detection: a WebP
+                    // document is otherwise detected as a sticker, and stickers
+                    // cannot carry a caption. With detection disabled the message
+                    // stays a document and keeps its caption (verified on both
+                    // the official and local Bot API).
+                    if d.kind == MediaKind::Image {
+                        im.disable_content_type_detection = Some(true);
+                    }
+                    if j == 0 && !group_caption.is_empty() {
+                        im = im
+                            .caption(group_caption.to_string())
+                            .parse_mode(ParseMode::Html);
+                    }
+                    // Converted-to-document long/large images carry a thumbnail
+                    if use_thumbs {
+                        if let Some(tp) = &d.thumb_path {
+                            if let Ok(tin) = path_input(tp).await {
+                                im.thumbnail = Some(tin);
                             }
                         }
-                        group.push(InputMedia::Document(im));
                     }
-                    let mut req = bot.send_media_group(chat, group);
-                    if let Some(ref params) = rp {
-                        req = req.reply_parameters(params.clone());
-                    }
-                    req.await.map_err(|e| anyhow::anyhow!(e))
+                    group.push(InputMedia::Document(im));
                 }
-            },
-        )
+                let mut req = bot.send_media_group(chat, group);
+                if let Some(ref params) = rp {
+                    req = req.reply_parameters(params.clone());
+                }
+                req.await.map_err(|e| anyhow::anyhow!(e))
+            }
+        })
         .await
         .map_err(|e| (all_msgs.clone(), e))?;
         // Write cache: returned messages correspond to the chunk in order
@@ -1741,7 +1799,18 @@ async fn send_rich_ops_with_retry(
     ctx: &str,
 ) -> Result<(usize, Option<Message>), RichSendFailure> {
     let mut first_delivered: Option<Box<Message>> = None;
-    let mut res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, 0, reply_first_to, None).await;
+    let mut res = send_rich_ops(
+        bot,
+        db,
+        chat_id,
+        caption,
+        caption_above,
+        ops,
+        0,
+        reply_first_to,
+        None,
+    )
+    .await;
     if let Err((_, first, _)) = &res {
         first_delivered = first.clone();
     }
@@ -1757,11 +1826,30 @@ async fn send_rich_ops_with_retry(
             }
             _ => None,
         };
-        let Some((sent, delay)) = retry_from else { break };
-        tracing::warn!(chat_id = chat_id, ctx = ctx, resume = sent, backoff = delay.as_secs(), "rich send network error, backing off before retry");
+        let Some((sent, delay)) = retry_from else {
+            break;
+        };
+        tracing::warn!(
+            chat_id = chat_id,
+            ctx = ctx,
+            resume = sent,
+            backoff = delay.as_secs(),
+            "rich send network error, backing off before retry"
+        );
         tokio::time::sleep(delay).await;
         let resume_anchor = first_delivered.as_ref().map(|m| m.id);
-        res = send_rich_ops(bot, db, chat_id, caption, caption_above, ops, sent, reply_first_to, resume_anchor).await;
+        res = send_rich_ops(
+            bot,
+            db,
+            chat_id,
+            caption,
+            caption_above,
+            ops,
+            sent,
+            reply_first_to,
+            resume_anchor,
+        )
+        .await;
         if first_delivered.is_none() {
             if let Err((_, first, _)) = &res {
                 first_delivered = first.clone();
@@ -1812,74 +1900,107 @@ async fn send_op(
 
     match op {
         RichOp::Photo(p) => {
-            let m = send_with_cache_retry(db, chat_id, op, false, |cache_enabled, _attach_thumb| { let use_cache = cache_enabled; async move {
-                let inp = resolve_input(db, p, "photo", use_cache).await?;
-                let mut req = bot
-                    .send_photo(chat, inp)
-                    .caption(caption)
-                    .parse_mode(ParseMode::Html)
-                    .show_caption_above_media(caption_above);
-                if let Some(rp) = rp {
-                    req = req.reply_parameters(rp.clone());
-                }
-                req.await.map_err(|e| anyhow::anyhow!(e))
-            }}).await?;
+            let m =
+                send_with_cache_retry(db, chat_id, op, false, |cache_enabled, _attach_thumb| {
+                    let use_cache = cache_enabled;
+                    async move {
+                        let inp = resolve_input(db, p, "photo", use_cache).await?;
+                        let mut req = bot
+                            .send_photo(chat, inp)
+                            .caption(caption)
+                            .parse_mode(ParseMode::Html)
+                            .show_caption_above_media(caption_above);
+                        if let Some(rp) = rp {
+                            req = req.reply_parameters(rp.clone());
+                        }
+                        req.await.map_err(|e| anyhow::anyhow!(e))
+                    }
+                })
+                .await?;
             cache_file_id(db, p, "photo", message_file_id_for(&m, "photo")).await;
             Ok(vec![m])
         }
         RichOp::Gif(g) => {
-            let m = send_with_cache_retry(db, chat_id, op, false, |cache_enabled, _attach_thumb| { let use_cache = cache_enabled; async move {
-                let inp = resolve_input(db, g, "gif", use_cache).await?;
-                let mut req = bot
-                    .send_animation(chat, inp)
-                    .caption(caption)
-                    .parse_mode(ParseMode::Html)
-                    .show_caption_above_media(caption_above);
-                if let Some(rp) = rp {
-                    req = req.reply_parameters(rp.clone());
-                }
-                req.await.map_err(|e| anyhow::anyhow!(e))
-            }}).await?;
+            let m =
+                send_with_cache_retry(db, chat_id, op, false, |cache_enabled, _attach_thumb| {
+                    let use_cache = cache_enabled;
+                    async move {
+                        let inp = resolve_input(db, g, "gif", use_cache).await?;
+                        let mut req = bot
+                            .send_animation(chat, inp)
+                            .caption(caption)
+                            .parse_mode(ParseMode::Html)
+                            .show_caption_above_media(caption_above);
+                        if let Some(rp) = rp {
+                            req = req.reply_parameters(rp.clone());
+                        }
+                        req.await.map_err(|e| anyhow::anyhow!(e))
+                    }
+                })
+                .await?;
             cache_file_id(db, g, "gif", message_file_id_for(&m, "gif")).await;
             Ok(vec![m])
         }
         RichOp::Video(v) => {
-            let m = send_with_cache_retry(db, chat_id, op, v.thumb_path.is_some(), |cache_enabled, attach_thumb| { let use_cache = cache_enabled; async move {
-                let inp = resolve_input(db, v, "video", use_cache).await?;
-                let mut req = bot
-                    .send_video(chat, inp)
-                    .caption(caption)
-                    .parse_mode(ParseMode::Html)
-                    .show_caption_above_media(caption_above)
-                    .supports_streaming(true);
-                if let Some(d) = v.duration_secs {
-                    req = req.duration(d);
-                }
-                if attach_thumb {
-                    if let Some(tp) = &v.thumb_path {
-                        if let Ok(tin) = path_input(tp).await {
-                            req = req.thumbnail(tin);
+            let m = send_with_cache_retry(
+                db,
+                chat_id,
+                op,
+                v.thumb_path.is_some(),
+                |cache_enabled, attach_thumb| {
+                    let use_cache = cache_enabled;
+                    async move {
+                        let inp = resolve_input(db, v, "video", use_cache).await?;
+                        let mut req = bot
+                            .send_video(chat, inp)
+                            .caption(caption)
+                            .parse_mode(ParseMode::Html)
+                            .show_caption_above_media(caption_above)
+                            .supports_streaming(true);
+                        if let Some(d) = v.duration_secs {
+                            req = req.duration(d);
                         }
+                        if attach_thumb {
+                            if let Some(tp) = &v.thumb_path {
+                                if let Ok(tin) = path_input(tp).await {
+                                    req = req.thumbnail(tin);
+                                }
+                            }
+                        }
+                        if let Some(rp) = rp {
+                            req = req.reply_parameters(rp.clone());
+                        }
+                        req.await.map_err(|e| anyhow::anyhow!(e))
                     }
-                }
-                if let Some(rp) = rp {
-                    req = req.reply_parameters(rp.clone());
-                }
-                req.await.map_err(|e| anyhow::anyhow!(e))
-            }}).await?;
+                },
+            )
+            .await?;
             cache_file_id(db, v, "video", message_file_id_for(&m, "video")).await;
             Ok(vec![m])
         }
         RichOp::Group(items) => {
             let has_thumb = items.iter().any(|m| m.thumb_path.is_some());
-            let msgs = send_with_cache_retry(db, chat_id, op, has_thumb, |cache_enabled, attach_thumb| { let use_cache = cache_enabled; async move {
-                let group = build_group_inputs(db, items, caption, caption_above, use_cache, attach_thumb).await?;
-                let mut req = bot.send_media_group(chat, group);
-                if let Some(rp) = rp {
-                    req = req.reply_parameters(rp.clone());
-                }
-                req.await.map_err(|e| anyhow::anyhow!(e))
-            }}).await?;
+            let msgs =
+                send_with_cache_retry(db, chat_id, op, has_thumb, |cache_enabled, attach_thumb| {
+                    let use_cache = cache_enabled;
+                    async move {
+                        let group = build_group_inputs(
+                            db,
+                            items,
+                            caption,
+                            caption_above,
+                            use_cache,
+                            attach_thumb,
+                        )
+                        .await?;
+                        let mut req = bot.send_media_group(chat, group);
+                        if let Some(rp) = rp {
+                            req = req.reply_parameters(rp.clone());
+                        }
+                        req.await.map_err(|e| anyhow::anyhow!(e))
+                    }
+                })
+                .await?;
             // Write cache: returned messages correspond to items in order
             for (m, item) in msgs.iter().zip(items.iter()) {
                 let mode = group_item_mode(item);
@@ -2050,7 +2171,10 @@ pub async fn send_entry_msg(
                         error = %e,
                         "text chunk failed after an earlier chunk was delivered; not retrying the whole entry"
                     );
-                    return Ok(TextSendOutcome { first, partial: true });
+                    return Ok(TextSendOutcome {
+                        first,
+                        partial: true,
+                    });
                 }
                 return Err(e);
             }
@@ -2075,7 +2199,11 @@ async fn send_single_html(
 ) -> anyhow::Result<Message> {
     // Unified blockquote folding rules (fold when >200 chars).
     let html_text = normalize_blockquote_fold(html_text);
-    let lpo = if link_preview { None } else { Some(no_preview()) };
+    let lpo = if link_preview {
+        None
+    } else {
+        Some(no_preview())
+    };
     let mut retry = SendRetryState::new(SendRetryPolicy::TEXT, false, false);
     let mut plain_text: Option<String> = None;
 
@@ -2101,7 +2229,11 @@ async fn send_single_html(
                 let err_str = error_chain_string(&e);
                 match retry.next_action(&err_str) {
                     SendRetryAction::RetryFlood { delay } => {
-                        tracing::warn!(chat_id = chat_id, wait_secs = delay.as_secs(), "flood control, backing off");
+                        tracing::warn!(
+                            chat_id = chat_id,
+                            wait_secs = delay.as_secs(),
+                            "flood control, backing off"
+                        );
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -2144,7 +2276,11 @@ async fn send_chunk_with_retry(
                 let es = error_chain_string(e.as_ref());
                 match retry.next_action(&es) {
                     SendRetryAction::RetryTransient { delay } => {
-                        tracing::warn!(chat_id = chat_id, backoff = delay.as_secs(), "text chunk send failed, retrying");
+                        tracing::warn!(
+                            chat_id = chat_id,
+                            backoff = delay.as_secs(),
+                            "text chunk send failed, retrying"
+                        );
                         tokio::time::sleep(delay).await;
                         pace(chat_id).await;
                         continue;
@@ -2186,7 +2322,11 @@ mod tests {
 
     /// Build an EntryMeta containing a poll (simulating what weibo.rs
     /// produces).
-    fn meta_with_poll(question: &str, options: Vec<&str>, is_multi: bool) -> crate::entrymeta::EntryMeta {
+    fn meta_with_poll(
+        question: &str,
+        options: Vec<&str>,
+        is_multi: bool,
+    ) -> crate::entrymeta::EntryMeta {
         crate::entrymeta::EntryMeta {
             prerendered_html: false,
             poll: Some(crate::entrymeta::PollData {
@@ -2222,9 +2362,17 @@ mod tests {
         let long_opt = "选".repeat(110);
         let meta = meta_with_poll(&long_q, vec![&long_opt, "短"], false);
         let (q, opts, _) = extract_poll(Some(&meta)).unwrap();
-        assert!(q.chars().count() <= 300, "question too long: {}", q.chars().count());
+        assert!(
+            q.chars().count() <= 300,
+            "question too long: {}",
+            q.chars().count()
+        );
         assert!(q.ends_with("..."));
-        assert!(opts[0].chars().count() <= 100, "option too long: {}", opts[0].chars().count());
+        assert!(
+            opts[0].chars().count() <= 100,
+            "option too long: {}",
+            opts[0].chars().count()
+        );
         assert!(opts[0].ends_with("..."));
     }
 
@@ -2283,7 +2431,10 @@ mod tests {
             summary.contains("<a href=\"https://mp.weixin.qq.com/s?x=1&amp;y=2\">示例公众号</a>"),
             "hyperlink lost: {summary}"
         );
-        assert!(summary.contains("本文来自微信公众号："), "lead lost: {summary}");
+        assert!(
+            summary.contains("本文来自微信公众号："),
+            "lead lost: {summary}"
+        );
         // The account name stays in its sentence position (anchor text must
         // not drift away from the surrounding words).
         assert!(
@@ -2311,11 +2462,26 @@ mod tests {
             "<div id=\"img-group-hesq8\"><img src=\"https://example.com/a.jpg\"><p>▲ 图片说明</p></div>",
         );
         let summary = entry_summary(&rss_entry_with_body(body), 140, None);
-        assert!(!summary.contains("@media"), "css leaked into summary: {summary}");
-        assert!(!summary.contains("prefers-color-scheme"), "css leaked into summary: {summary}");
-        assert!(!summary.contains("rgba("), "css leaked into summary: {summary}");
-        assert!(summary.contains("这周又来长沙出差了"), "lead lost: {summary}");
-        assert!(summary.contains("衡东菜"), "second paragraph lost: {summary}");
+        assert!(
+            !summary.contains("@media"),
+            "css leaked into summary: {summary}"
+        );
+        assert!(
+            !summary.contains("prefers-color-scheme"),
+            "css leaked into summary: {summary}"
+        );
+        assert!(
+            !summary.contains("rgba("),
+            "css leaked into summary: {summary}"
+        );
+        assert!(
+            summary.contains("这周又来长沙出差了"),
+            "lead lost: {summary}"
+        );
+        assert!(
+            summary.contains("衡东菜"),
+            "second paragraph lost: {summary}"
+        );
     }
 
     #[test]
@@ -2327,9 +2493,20 @@ mod tests {
             "<p>前文。<a href=\"https://mp.weixin.qq.com/s/abc\">{long_label}</a>后续内容。</p>"
         );
         let summary = entry_summary(&rss_entry_with_body(&body), 20, None);
-        assert!(summary.ends_with("</a>......"), "unbalanced or misplaced suffix: {summary}");
-        assert_eq!(summary.matches("<a ").count(), 1, "unbalanced anchor: {summary}");
-        assert_eq!(summary.matches("</a>").count(), 1, "unbalanced anchor: {summary}");
+        assert!(
+            summary.ends_with("</a>......"),
+            "unbalanced or misplaced suffix: {summary}"
+        );
+        assert_eq!(
+            summary.matches("<a ").count(),
+            1,
+            "unbalanced anchor: {summary}"
+        );
+        assert_eq!(
+            summary.matches("</a>").count(),
+            1,
+            "unbalanced anchor: {summary}"
+        );
         assert!(summary.starts_with("前文。"), "lead lost: {summary}");
     }
 
@@ -2339,9 +2516,15 @@ mod tests {
         // empty hyperlink.
         let body = "<p>正文内容比较长按 here</p><p><a href=\"https://mp.weixin.qq.com/s/x\">后面的链接</a></p>";
         let summary = entry_summary(&rss_entry_with_body(body), 6, None);
-        assert!(!summary.contains("<a"), "empty/dangling anchor emitted: {summary}");
+        assert!(
+            !summary.contains("<a"),
+            "empty/dangling anchor emitted: {summary}"
+        );
         assert!(!summary.contains("</a>"), "orphan close emitted: {summary}");
-        assert!(summary.ends_with("......"), "truncation marker missing: {summary}");
+        assert!(
+            summary.ends_with("......"),
+            "truncation marker missing: {summary}"
+        );
     }
 
     #[test]
@@ -2353,7 +2536,10 @@ mod tests {
         let body = "<p>成本&lt;100&amp;更多&gt;一些文字继续更多内容截断部分。</p>";
         // Budget ends exactly after the "&amp;" reference.
         let summary = entry_summary(&rss_entry_with_body(body), 7, None);
-        assert_eq!(summary, "成本&lt;100&amp;......", "entity cut wrong: {summary}");
+        assert_eq!(
+            summary, "成本&lt;100&amp;......",
+            "entity cut wrong: {summary}"
+        );
         // Budget ends just before it: nothing of the reference may appear.
         let summary = entry_summary(&rss_entry_with_body(body), 6, None);
         assert_eq!(summary, "成本&lt;100......", "entity cut wrong: {summary}");
@@ -2447,10 +2633,8 @@ mod tests {
                 RichOp::Gif(g) => format!("gif:{}", g.content_hash),
                 RichOp::Video(v) => format!("video:{}", v.content_hash),
                 RichOp::Group(items) => {
-                    let parts: Vec<String> = items
-                        .iter()
-                        .map(|m| m.content_hash.to_string())
-                        .collect();
+                    let parts: Vec<String> =
+                        items.iter().map(|m| m.content_hash.to_string()).collect();
                     format!("group[{}]", parts.join("+"))
                 }
             })
@@ -2482,9 +2666,15 @@ mod tests {
         // sendMediaGroup requires 2–10 items, so a lone media goes through
         // its dedicated single op, dispatched by kind.
         let v = mk_item("v1", MediaKind::Video, false);
-        assert_eq!(op_labels(&build_rich_ops(&[], &[], &[&v])), vec!["video:v1"]);
+        assert_eq!(
+            op_labels(&build_rich_ops(&[], &[], &[&v])),
+            vec!["video:v1"]
+        );
         let p = mk_item("p1", MediaKind::Image, false);
-        assert_eq!(op_labels(&build_rich_ops(&[&p], &[], &[])), vec!["photo:p1"]);
+        assert_eq!(
+            op_labels(&build_rich_ops(&[&p], &[], &[])),
+            vec!["photo:p1"]
+        );
     }
 
     #[test]
@@ -2495,10 +2685,7 @@ mod tests {
         let g1 = mk_item("g1", MediaKind::Image, true);
         let g2 = mk_item("g2", MediaKind::Image, true);
         let ops = build_rich_ops(&[&p], &[&g1, &g2], &[&v]);
-        assert_eq!(
-            op_labels(&ops),
-            vec!["group[v1+p1]", "gif:g1", "gif:g2"]
-        );
+        assert_eq!(op_labels(&ops), vec!["group[v1+p1]", "gif:g1", "gif:g2"]);
     }
 
     #[test]
@@ -2506,20 +2693,19 @@ mod tests {
         // 12 media > the 10-per-album cap: first album fills to 10, the
         // remainder becomes a follow-up album (which the sender replies to
         // the first). Videos lead, then images fill the same pool.
-        let videos: Vec<MediaItem> =
-            (0..3).map(|i| mk_item(&format!("v{i}"), MediaKind::Video, false)).collect();
-        let photos: Vec<MediaItem> =
-            (0..9).map(|i| mk_item(&format!("p{i}"), MediaKind::Image, false)).collect();
+        let videos: Vec<MediaItem> = (0..3)
+            .map(|i| mk_item(&format!("v{i}"), MediaKind::Video, false))
+            .collect();
+        let photos: Vec<MediaItem> = (0..9)
+            .map(|i| mk_item(&format!("p{i}"), MediaKind::Image, false))
+            .collect();
         let vrefs: Vec<&MediaItem> = videos.iter().collect();
         let prefs: Vec<&MediaItem> = photos.iter().collect();
         let ops = build_rich_ops(&prefs, &[], &vrefs);
         assert_eq!(ops.len(), 2);
         assert_eq!(
             op_labels(&ops),
-            vec![
-                "group[v0+v1+v2+p0+p1+p2+p3+p4+p5+p6]",
-                "group[p7+p8]",
-            ]
+            vec!["group[v0+v1+v2+p0+p1+p2+p3+p4+p5+p6]", "group[p7+p8]",]
         );
     }
 
@@ -2538,7 +2724,10 @@ mod tests {
             .iter()
             .filter(|m| m.kind == MediaKind::Image && !m.is_gif)
             .collect();
-        let vrefs: Vec<&MediaItem> = sliced.iter().filter(|m| m.kind == MediaKind::Video).collect();
+        let vrefs: Vec<&MediaItem> = sliced
+            .iter()
+            .filter(|m| m.kind == MediaKind::Video)
+            .collect();
         let ops = build_rich_ops(&prefs, &[], &vrefs);
         assert_eq!(op_labels(&ops), vec!["photo:p1"]);
     }
@@ -2593,7 +2782,10 @@ mod tests {
         // No media (GIF/document excluded upstream or empty): do not trigger.
         assert!(!should_try_rich_media(CAPTION_LIMIT + 1, 0));
         // Rich hard limits.
-        assert!(!should_try_rich_media(CAPTION_LIMIT + 1, RICH_MEDIA_MAX + 1));
+        assert!(!should_try_rich_media(
+            CAPTION_LIMIT + 1,
+            RICH_MEDIA_MAX + 1
+        ));
         assert!(!should_try_rich_media(RICH_TEXT_MAX + 1, 11));
     }
 
@@ -2635,10 +2827,7 @@ mod tests {
     #[test]
     fn rich_html_converts_crlf_outside_pre() {
         let body = "a\r\nb<pre>c\r\nd</pre>";
-        assert_eq!(
-            rich_html(body, "", "", true),
-            "a<br>b<pre>c\r\nd</pre>"
-        );
+        assert_eq!(rich_html(body, "", "", true), "a<br>b<pre>c\r\nd</pre>");
     }
 
     #[test]
@@ -2721,9 +2910,18 @@ mod tests {
 
     #[test]
     fn content_mode_accepts_legacy_camel_case_defaults() {
-        assert_eq!(ContentMode::from_str("TitleSummary"), ContentMode::TitleSummary);
-        assert_eq!(ContentMode::from_str("TitleContent"), ContentMode::TitleContent);
-        assert_eq!(ContentMode::from_str("content_only"), ContentMode::ContentOnly);
+        assert_eq!(
+            ContentMode::from_str("TitleSummary"),
+            ContentMode::TitleSummary
+        );
+        assert_eq!(
+            ContentMode::from_str("TitleContent"),
+            ContentMode::TitleContent
+        );
+        assert_eq!(
+            ContentMode::from_str("content_only"),
+            ContentMode::ContentOnly
+        );
         assert_eq!(ContentMode::from_str("MediaOnly"), ContentMode::MediaOnly);
         assert_eq!(ContentMode::from_str("unknown"), ContentMode::TitleLink);
     }
