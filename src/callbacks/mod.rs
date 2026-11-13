@@ -22,6 +22,8 @@ use settings::{
 pub mod settings;
 pub mod unsub;
 
+mod data;
+
 /// Telegram callback-query toasts are limited to 200 characters; a long
 /// database error chain would otherwise make the toast itself fail and leave
 /// the user with no feedback at all.
@@ -38,36 +40,15 @@ fn toast_text(text: String) -> String {
 
 /// Ownership guard level for callback ops (single-source definition, shared by the guard and
 /// the dispatch, eliminating drift from maintaining two copies).
-/// - Chat: parts[2] is the chat_id; verify ownership directly;
-/// - Sub: parts[2] is the sub_id; reverse-look-up the subscription to get chat_id, then verify;
+/// - Chat: args[0] is the chat_id; verify ownership directly;
+/// - Sub: args[0] is the sub_id; reverse-look-up the subscription to get chat_id, then verify;
 /// - None: no target channel involved (list page/cancel/cookies panel/silent pagination); no guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuardTarget {
     Chat,
     Sub,
     None,
 }
-
-/// The single mapping from op → guard level. Every op handled by the dispatch
-/// below MUST be classified explicitly; an unknown op returns None and is
-/// rejected (fail-closed). Previously unclassified ops defaulted to "no
-/// target", so a new channel/source-management op could silently skip the
-/// ownership guard.
-fn guard_target(op: &str) -> Option<GuardTarget> {
-    Some(match op {
-        // chat level: parts[2] = chat_id
-        "ch" | "cfg" | "cfgi" | "cfgm" | "cfgs" | "cfglp" | "cfgcp" | "resumeall"
-        | "cfgiv" | "cfgmv" | "cfgsv" | "unsubpg" | "unsuballask" | "unsuball" => GuardTarget::Chat,
-        // sub level: parts[2] = sub_id
-        "src" | "srcpause" | "srcresume" | "srcrename" | "srcfip" | "srcfmp"
-        | "srcfsp" | "srcfcp" | "srcflp" | "srcfilter" | "srcftoggle" | "srcfmode" | "srcfkw"
-        | "srcfi" | "srcfm" | "srcfs" | "unsub" => GuardTarget::Sub,
-        // explicitly no target channel involved
-        "chlist" | "lang" | "cancelop" | "ck" | "page" => GuardTarget::None,
-        // Unknown op: fail closed.
-        _ => return None,
-    })
-}
-
 /// Handle incoming callback queries.
 pub async fn handle_callback(
     bot: Bot,
@@ -118,21 +99,24 @@ pub async fn handle_callback(
     // Ownership guard (pure personal isolation, no admin bypass): callback data comes from the
     // client, and chat_id/sub_id can be enumerated and forged, so ownership must be verified
     // before any management operation runs.
-    // For chat-level routes parts[2] is the chat_id; for sub-level routes parts[2] is the sub_id,
+    // For chat-level routes args[0] is the chat_id; for sub-level routes args[0] is the sub_id,
     // requiring a subscription reverse-lookup to obtain the chat_id. chlist/cancelop/ck/page etc.
     // don't involve a target channel and are skipped.
     //
-    // Single-sourcing the guard tiers: the op → guard level is defined solely by guard_target()
-    // (previously the two chat/sub arrays had to be manually kept in sync with the match branches
-    // below; forgetting to add a guard for a new op would silently pass it through — fail-open).
-    // When adding an op, just classify it into the right tier inside guard_target(); unclassified
-    // ops are uniformly treated as having no target (no guard), so ops involving channel/source
-    // management must be classified explicitly.
-    let op = parts.get(1).copied().unwrap_or("");
-    let guard_chat_id: Option<String> = match guard_target(op) {
-        Some(GuardTarget::Chat) => parts.get(2).map(|s| s.to_string()),
-        Some(GuardTarget::Sub) => {
-            match parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
+    // The op → guard mapping lives in `CallbackOp::guard_target`; unknown or
+    // malformed callback data is rejected before this point.
+    let cb = match data::CallbackData::parse(&data) {
+        Some(cb) => cb,
+        None => {
+            tracing::warn!("malformed or unknown callback data rejected (fail-closed)");
+            bot.answer_callback_query(qid).await.ok();
+            return Ok(());
+        }
+    };
+    let guard_chat_id: Option<String> = match cb.op.guard_target() {
+        GuardTarget::Chat => cb.args.first().map(|s| s.to_string()),
+        GuardTarget::Sub => {
+            match cb.args.first().and_then(|s| s.parse::<i64>().ok()) {
                 Some(sub_id) => {
                     match db::get_subscription_by_id(&state.db, sub_id).await {
                         Ok(Some(s)) => Some(s.chat_id),
@@ -156,16 +140,7 @@ pub async fn handle_callback(
                 None => None,
             }
         }
-        Some(GuardTarget::None) => None,
-        None => {
-            // Unknown op: fail closed instead of dispatching with no ownership
-            // guard. The dispatch match would ignore it anyway; rejecting here
-            // guarantees a future op cannot bypass the guard by being forgotten
-            // in guard_target().
-            tracing::warn!(user_id = user_id, op = %op, "unknown callback op rejected (fail-closed)");
-            bot.answer_callback_query(qid).await.ok();
-            return Ok(());
-        }
+        GuardTarget::None => None,
     };
     if let Some(gcid) = &guard_chat_id {
         let allowed = match db::can_manage_chat(&state.db, user_id, gcid).await {
@@ -861,7 +836,7 @@ pub async fn handle_callback(
     bot.answer_callback_query(qid).await.ok();
 
     if let Err(e) = &res {
-        tracing::warn!(user_id = user_id, op = %op, error = %e, "callback dispatch failed (spinner cleared)");
+        tracing::warn!(user_id = user_id, op = %parts.get(1).copied().unwrap_or("?"), error = %e, "callback dispatch failed (spinner cleared)");
     }
     res
 }
@@ -1007,33 +982,4 @@ pub async fn handle_my_chat_member(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{guard_target, GuardTarget};
-
-    /// Every op handled by the dispatch must be explicitly classified. This
-    /// list is the regression guard against a new op silently bypassing the
-    /// ownership check; unknown ops (the last assert) now fail closed.
-    #[test]
-    fn all_dispatched_ops_are_classified() {
-        for op in [
-            "ch", "cfg", "cfgi", "cfgm", "cfgs", "cfglp", "cfgcp", "resumeall", "cfgiv",
-            "cfgmv", "cfgsv", "unsubpg", "unsuballask", "unsuball",
-        ] {
-            assert!(matches!(guard_target(op), Some(GuardTarget::Chat)), "{op}");
-        }
-        for op in [
-            "src", "srcpause", "srcresume", "srcrename", "srcfip", "srcfmp", "srcfsp",
-            "srcfcp", "srcflp", "srcfilter", "srcftoggle", "srcfmode", "srcfkw", "srcfi",
-            "srcfm", "srcfs", "unsub",
-        ] {
-            assert!(matches!(guard_target(op), Some(GuardTarget::Sub)), "{op}");
-        }
-        for op in ["chlist", "lang", "cancelop", "ck"] {
-            assert!(matches!(guard_target(op), Some(GuardTarget::None)), "{op}");
-        }
-        assert!(guard_target("unknown-op").is_none());
-    }
 }
