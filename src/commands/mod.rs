@@ -721,12 +721,22 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     let progress_id = progress_msg.id;
 
     let fetch_started = std::time::Instant::now();
-    let fr = match fetch::fetch_command_feed_unchecked(
+    let platform = crate::platforms::platform_for_url(&feed_url);
+    let is_weibo = platform.is_some_and(|p| p.id == "weibo");
+    // Weibo: first fetch the timeline without detail/vote enrichment; after
+    // selecting the target entry, re-fetch with Enrichment::Target so only that
+    // entry pays the detail requests.
+    let first_enrichment = if is_weibo {
+        fetcher::Enrichment::None
+    } else {
+        fetcher::Enrichment::Full
+    };
+    let mut fr = match fetch::fetch_command_feed_unchecked(
         state,
         &feed_url,
         lang,
         allow_trusted_private,
-        fetcher::Enrichment::Full,
+        first_enrichment,
     )
     .await
     {
@@ -749,7 +759,7 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
     tracing::info!(
         target: "tgsrssr::test",
         raw_feed_url = %raw_feed_url, feed_url = %feed_url,
-        platform = crate::platforms::platform_for_url(&feed_url).map(|p| p.id).unwrap_or("rss"),
+        platform = platform.map(|p| p.id).unwrap_or("rss"),
         elapsed_ms = fetch_elapsed_ms,
         entries = fr.entries.len(), feed_title = ?fr.feed_title,
         not_modified = fr.not_modified, metas = fr.metas.len(),
@@ -758,7 +768,57 @@ async fn handle_test(bot: &Bot, msg: &Message, state: &AppState, args: &str, lan
         "/test: fetch details"
     );
 
-    let entry = match fr.entries.get(entry_index) {
+    let target_id = match fr.entries.get(entry_index) {
+        Some(e) => fetcher::entry_id(e),
+        None => {
+            test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_index_oob").replacen("{}", &fr.entries.len().to_string(), 1).replacen("{}", &entry_index.to_string(), 1)).await;
+            return Ok(());
+        }
+    };
+    if is_weibo {
+        let enrich_started = std::time::Instant::now();
+        match fetch::fetch_command_feed_unchecked(
+            state,
+            &feed_url,
+            lang,
+            allow_trusted_private,
+            fetcher::Enrichment::Target(target_id.clone()),
+        )
+        .await
+        {
+            Ok(new_fr)
+                if new_fr
+                    .entries
+                    .iter()
+                    .any(|e| fetcher::entry_id(e) == target_id) =>
+            {
+                fr = new_fr;
+                tracing::info!(
+                    target: "tgsrssr::test",
+                    elapsed_ms = enrich_started.elapsed().as_millis() as u64,
+                    entry_id = %target_id,
+                    entries = fr.entries.len(),
+                    "/test: target enrichment refetch ok"
+                );
+            }
+            Ok(_) => tracing::warn!(
+                entry_id = %target_id,
+                "/test: target entry missing from enrichment refetch; using list data"
+            ),
+            Err(e) => {
+                if let fetch::CommandFetchError::FetchFailed(ref err) = e {
+                    tracing::warn!(feed_url = %feed_url, error = %err, "/test: target enrichment refetch failed; using list data");
+                } else {
+                    tracing::warn!(feed_url = %feed_url, "/test: target enrichment refetch failed; using list data");
+                }
+            }
+        }
+    }
+    let entry = match fr
+        .entries
+        .iter()
+        .find(|e| fetcher::entry_id(e) == target_id)
+    {
         Some(e) => e,
         None => {
             test_report(bot, msg.chat.id, progress_id, i18n::t(lang, "test_index_oob").replacen("{}", &fr.entries.len().to_string(), 1).replacen("{}", &entry_index.to_string(), 1)).await;

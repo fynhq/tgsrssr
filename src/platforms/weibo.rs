@@ -148,11 +148,17 @@ pub async fn fetch_by_url(
 /// `Enrichment::None` (used by `/sub`) skips the whole window; `Full` still
 /// skips entries the scheduler already pushed.
 fn should_skip_detail(
-    enrichment: crate::fetcher::Enrichment,
+    enrichment: &crate::fetcher::Enrichment,
     known_sent: Option<&std::collections::HashSet<String>>,
     mblog_id: &str,
 ) -> bool {
-    !enrichment.is_full() || known_sent.is_some_and(|s| s.contains(mblog_id))
+    match enrichment {
+        crate::fetcher::Enrichment::Full => {
+            known_sent.is_some_and(|s| s.contains(mblog_id))
+        }
+        crate::fetcher::Enrichment::None => true,
+        crate::fetcher::Enrichment::Target(_) => !enrichment.allows(mblog_id),
+    }
 }
 
 /// Fetch a weibo user timeline and convert to FetchResult.
@@ -326,7 +332,7 @@ pub async fn fetch_weibo_user(
         // so skip those requests; the scheduler filters them from the push
         // list via the same sent-entry set. `/sub` disables enrichment
         // entirely: it marks the whole visible window as sent afterwards.
-        let skip_detail = should_skip_detail(opts.enrichment, opts.known_sent, &mblog_id);
+        let skip_detail = should_skip_detail(&opts.enrichment, opts.known_sent, &mblog_id);
 
         // Mutable copy: once detail data is fetched, overwrite pics in place /
         // extract the full text
@@ -1755,33 +1761,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enrichment_none_skips_detail_for_the_whole_window() {
+    fn enrichment_controls_detail_scope() {
+        use crate::fetcher::Enrichment;
+
         let known = std::collections::HashSet::from(["m1".to_string()]);
-        assert!(should_skip_detail(
-            crate::fetcher::Enrichment::None,
-            None,
-            "m1"
-        ));
-        assert!(should_skip_detail(
-            crate::fetcher::Enrichment::None,
-            Some(&known),
-            "m2"
-        ));
-        assert!(!should_skip_detail(
-            crate::fetcher::Enrichment::Full,
-            None,
-            "m1"
-        ));
-        assert!(!should_skip_detail(
-            crate::fetcher::Enrichment::Full,
-            Some(&known),
-            "m2"
-        ));
-        assert!(should_skip_detail(
-            crate::fetcher::Enrichment::Full,
-            Some(&known),
-            "m1"
-        ));
+        assert!(should_skip_detail(&Enrichment::None, None, "m1"));
+        assert!(should_skip_detail(&Enrichment::None, Some(&known), "m2"));
+        assert!(!should_skip_detail(&Enrichment::Full, None, "m1"));
+        assert!(!should_skip_detail(&Enrichment::Full, Some(&known), "m2"));
+        assert!(should_skip_detail(&Enrichment::Full, Some(&known), "m1"));
+        // Target: only the named entry is enriched, even if it was already sent.
+        let target = Enrichment::Target("m1".to_string());
+        assert!(!should_skip_detail(&target, Some(&known), "m1"));
+        assert!(should_skip_detail(&target, None, "m2"));
     }
 
     #[test]

@@ -227,18 +227,26 @@ impl FetchResult {
 }
 
 /// Platform-only enrichment depth. RSS sources ignore this field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Enrichment {
     /// Fetch per-entry detail/vote data when the platform supports it.
     Full,
     /// Timeline data only. Used by `/sub`, which marks the whole visible
     /// window as sent and therefore does not need detail enrichment.
     None,
+    /// Enrich only the named entry. `/test` first fetches the timeline without
+    /// detail calls, then re-fetches with the selected entry id.
+    Target(String),
 }
 
 impl Enrichment {
-    pub fn is_full(self) -> bool {
-        matches!(self, Self::Full)
+    /// Whether detail/vote enrichment is allowed for this entry id.
+    pub fn allows(&self, entry_id: &str) -> bool {
+        match self {
+            Self::Full => true,
+            Self::None => false,
+            Self::Target(id) => id == entry_id,
+        }
     }
 }
 
