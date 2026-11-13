@@ -791,6 +791,214 @@ fn split_rich_docs<'a>(docs: &[&'a MediaItem]) -> (Vec<&'a MediaItem>, Vec<&'a M
     (rich, follow)
 }
 
+/// Classified media for one entry. Retweet inline images are kept separate
+/// because they are sent as a follow-up that quotes the main message.
+struct MediaPlan<'a> {
+    photos: Vec<&'a MediaItem>,
+    gifs: Vec<&'a MediaItem>,
+    docs: Vec<&'a MediaItem>,
+    videos: Vec<&'a MediaItem>,
+    rt_photos: Vec<&'a MediaItem>,
+}
+
+/// Classify prepared media exactly as the send path needs it.
+fn classify_media<'a>(media: &'a [MediaItem], aspect_threshold: f64) -> MediaPlan<'a> {
+    let mut photos: Vec<&MediaItem> = Vec::new();
+    let mut gifs: Vec<&MediaItem> = Vec::new();
+    let mut docs: Vec<&MediaItem> = Vec::new();
+    let mut videos: Vec<&MediaItem> = Vec::new();
+    let mut rt_photos: Vec<&MediaItem> = Vec::new();
+    for m in media {
+        // Retweet inline images go through the same oversized/long-image/GIF
+        // classification; anything over the limits is merged into docs.
+        if m.is_retweet && m.kind == MediaKind::Image {
+            let format_doc = !m.is_gif && !crate::media::photo_format_compatible(&m.path);
+            if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold)
+                || format_doc
+            {
+                docs.push(m);
+            } else if m.is_gif {
+                gifs.push(m);
+            } else {
+                rt_photos.push(m);
+            }
+            continue;
+        }
+        match m.kind {
+            MediaKind::Image => {
+                let format_doc = !m.is_gif && !crate::media::photo_format_compatible(&m.path);
+                if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold)
+                    || format_doc
+                {
+                    docs.push(m);
+                    tracing::debug!(
+                        size = m.size,
+                        w = m.width,
+                        h = m.height,
+                        format_doc = format_doc,
+                        "image -> document (oversized/long/w+h/format)"
+                    );
+                } else if m.is_gif {
+                    // GIFs go through sendAnimation; the photo API does not
+                    // play animated images.
+                    gifs.push(m);
+                } else {
+                    photos.push(m);
+                }
+            }
+            MediaKind::Video => videos.push(m),
+            MediaKind::Other => docs.push(m),
+        }
+    }
+    MediaPlan {
+        photos,
+        gifs,
+        docs,
+        videos,
+        rt_photos,
+    }
+}
+
+struct CaptionPlan {
+    caption: String,
+    overflow_chunks: Vec<String>,
+}
+
+/// Split the full rendered text into the media caption and plain-text overflow.
+fn plan_caption(full_caption: &str) -> CaptionPlan {
+    let caption_chunks = split_html(full_caption, CAPTION_LIMIT);
+    let caption = caption_chunks.first().cloned().unwrap_or_default();
+    let overflow_chunks = if caption_chunks.len() > 1 {
+        let rest = merge_adjacent_blockquotes(&caption_chunks[1..].join("\n\n"));
+        split_html(&rest, SAFE_LIMIT)
+    } else {
+        Vec::new()
+    };
+    CaptionPlan {
+        caption,
+        overflow_chunks,
+    }
+}
+
+/// Recover after the main rich-media send failed: send the overflow text or
+/// the full text fallback, then the documents/retweet images/poll. Returns the
+/// final SendOutcome, or Err when nothing was delivered (outbox retry).
+#[allow(clippy::too_many_arguments)]
+async fn fallback_after_main_media_failure(
+    bot: &Bot,
+    db: &Db,
+    chat_id: i64,
+    entry: &Entry,
+    feed_title: &str,
+    author: Option<&str>,
+    opts: RenderOpts,
+    meta: Option<&crate::entrymeta::EntryMeta>,
+    docs: &[&MediaItem],
+    rt_photos: &[&MediaItem],
+    overflow_chunks: &[String],
+    sent: usize,
+    delivered: Option<&Message>,
+    error: &anyhow::Error,
+) -> anyhow::Result<SendOutcome> {
+    let mut delivered_tg_link = delivered.and_then(tg_message_link);
+    let mut fallback_msg_id: Option<teloxide::types::MessageId> = delivered.map(|m| m.id);
+    let mut text_delivered = false;
+    let mut text_partial = false;
+    if sent > 0 {
+        // The first op (which carries the caption) was delivered before the
+        // failure; only the caption overflow is sent as follow-up messages.
+        text_delivered = true;
+        for chunk in overflow_chunks {
+            if let Err(te) =
+                send_chunk_with_retry(bot, chat_id, chunk, false, fallback_msg_id).await
+            {
+                tracing::warn!(
+                    chat_id = chat_id,
+                    entry_id = %fetcher::entry_id(entry),
+                    error = %te,
+                    "overflow text failed after partial media delivery"
+                );
+                break;
+            }
+        }
+    } else if let Some((body, footer)) = format_entry_parts(entry, feed_title, author, opts, meta) {
+        match send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await {
+            Ok(sent) => {
+                let m = sent.first;
+                delivered_tg_link = tg_message_link(&m);
+                fallback_msg_id = Some(m.id);
+                text_delivered = true;
+                text_partial = sent.partial;
+            }
+            Err(te) => {
+                tracing::warn!(
+                    chat_id = chat_id,
+                    entry_id = %fetcher::entry_id(entry),
+                    error = %te,
+                    "text fallback also failed, propagating for outbox"
+                );
+                return Err(anyhow::anyhow!(
+                    "media send failed ({}) and text fallback also failed: {}",
+                    error,
+                    te
+                ));
+            }
+        }
+    }
+    if !text_delivered {
+        return Err(anyhow::anyhow!(
+            "media send failed ({}) and no text fallback available",
+            error
+        ));
+    }
+    // The text is already delivered; document/rt failures only degrade media.
+    for (di, d) in docs.iter().enumerate() {
+        if let Err(de) = send_doc_msg(bot, db, chat_id, d, "", fallback_msg_id).await {
+            tracing::warn!(
+                chat_id = chat_id,
+                entry_id = %fetcher::entry_id(entry),
+                failed_doc = di,
+                skipped_docs = docs.len() - di - 1,
+                error = %de,
+                "document send failed after text fallback"
+            );
+            break;
+        }
+    }
+    if !rt_photos.is_empty() {
+        let rt_ops = build_rich_ops(rt_photos, &[], &[]);
+        if let Err((_, _, re)) = send_rich_ops_with_retry(
+            bot,
+            db,
+            chat_id,
+            "",
+            false,
+            &rt_ops,
+            fallback_msg_id,
+            "rt_images_text_fallback",
+        )
+        .await
+        {
+            tracing::warn!(
+                chat_id = chat_id,
+                entry_id = %fetcher::entry_id(entry),
+                error = %re,
+                "retweet images send failed after text fallback"
+            );
+        }
+    }
+    try_send_poll(bot, chat_id, fallback_msg_id, meta).await;
+    Ok(SendOutcome {
+        media_failed: true,
+        entry_link: fetcher::entry_link(entry),
+        delivered_tg_link,
+        delivered_message_id: fallback_msg_id.map(|m| m.0 as i64),
+        text_only: sent == 0,
+        uncertain: false,
+        text_partial,
+    })
+}
+
 /// Send an entry with prepared media. Strategy:
 /// - images ≤10MB (normal aspect) → sendPhoto / sendMediaGroup
 /// - images >10MB (photo hard limit) → sendDocument
@@ -850,77 +1058,18 @@ pub async fn send_entry_with_media(
         return send_text_only(bot, chat_id, entry, feed_title, author, opts, meta).await;
     }
 
-    // Caption is limited to 1024 chars. If the full text exceeds it, use the
-    // first chunk as the media caption and send the rest as follow-up messages.
-    // The overflow is sent as plain text messages (limit 4096), so re-split
-    // the remainder at SAFE_LIMIT instead of CAPTION_LIMIT.
-    //
-    // Splitting at 1024 may break one large blockquote into multiple
-    // fragments (each ≤1024); before re-splitting the overflow at 4096,
-    // adjacent fragments are merged back into a single blockquote to avoid
-    // multiple collapsed blocks in one message. If the merged result still
-    // exceeds 4096, split_html splits it again (each part wrapped on its own).
-    let caption_chunks = split_html(&full_caption, CAPTION_LIMIT);
-    let caption = caption_chunks.first().cloned().unwrap_or_default();
-    let overflow_chunks: Vec<String> = if caption_chunks.len() > 1 {
-        let rest = merge_adjacent_blockquotes(&caption_chunks[1..].join("\n\n"));
-        split_html(&rest, SAFE_LIMIT)
-    } else {
-        Vec::new()
-    };
+    let CaptionPlan {
+        caption,
+        overflow_chunks,
+    } = plan_caption(&full_caption);
 
-    // Classify. Converting long/oversized (>10MB) images to documents is a
-    // normal downgrade: only a debug log is recorded, and admins are not
-    // notified (only an actual send failure triggers a notification).
-    let mut photos: Vec<&MediaItem> = Vec::new();
-    let mut gifs: Vec<&MediaItem> = Vec::new();
-    let mut docs: Vec<&MediaItem> = Vec::new();
-    let mut videos: Vec<&MediaItem> = Vec::new();
-    // Inline images from the retweeted original post (Weibo [view image]
-    // links); sent separately and quoting the main message.
-    let mut rt_photos: Vec<&MediaItem> = Vec::new();
-    for m in media {
-        // Retweet inline images: go through the same oversized/long-image/GIF
-        // classification; anything over the limits is merged into docs.
-        if m.is_retweet && m.kind == MediaKind::Image {
-            let format_doc = !m.is_gif && !crate::media::photo_format_compatible(&m.path);
-            if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold)
-                || format_doc
-            {
-                docs.push(m);
-            } else if m.is_gif {
-                gifs.push(m);
-            } else {
-                rt_photos.push(m);
-            }
-            continue;
-        }
-        match m.kind {
-            MediaKind::Image => {
-                let format_doc = !m.is_gif && !crate::media::photo_format_compatible(&m.path);
-                if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold)
-                    || format_doc
-                {
-                    docs.push(m);
-                    tracing::debug!(
-                        size = m.size,
-                        w = m.width,
-                        h = m.height,
-                        format_doc = format_doc,
-                        "image -> document (oversized/long/w+h/format)"
-                    );
-                } else if m.is_gif {
-                    // GIFs go through sendAnimation; the photo API does not
-                    // play animated images
-                    gifs.push(m);
-                } else {
-                    photos.push(m);
-                }
-            }
-            MediaKind::Video => videos.push(m),
-            MediaKind::Other => docs.push(m),
-        }
-    }
+    let MediaPlan {
+        photos,
+        gifs,
+        docs,
+        videos,
+        rt_photos,
+    } = classify_media(media, aspect_threshold);
 
     // Op-list send: each op == one Telegram API call, so a retried send can
     // resume after the last successful op without duplicating messages.
@@ -1086,124 +1235,23 @@ pub async fn send_entry_with_media(
                     error = %e,
                     "media send failed, falling back to text"
                 );
-                // Fall back to text so the entry is never lost, and capture the
-                // delivered message's link for the owner notice. `delivered`
-                // is the first op's message when sent > 0; a later retry may
-                // have resumed after it, but the helper keeps the original
-                // first message across attempts.
-                let mut delivered_tg_link = delivered.as_ref().and_then(|m| tg_message_link(m));
-                let mut fallback_msg_id: Option<teloxide::types::MessageId> =
-                    delivered.as_ref().map(|m| m.id);
-                let mut text_delivered = false;
-                let mut text_partial = false;
-                if sent > 0 {
-                    // The first op (which carries the caption) was delivered
-                    // before the failure. Re-sending the full title+body would
-                    // duplicate the caption in the channel, so only the
-                    // caption overflow is sent as follow-up messages.
-                    text_delivered = true;
-                    for chunk in &overflow_chunks {
-                        if let Err(te) =
-                            send_chunk_with_retry(bot, chat_id, chunk, false, fallback_msg_id).await
-                        {
-                            tracing::warn!(
-                                chat_id = chat_id,
-                                entry_id = %fetcher::entry_id(entry),
-                                error = %te,
-                                "overflow text failed after partial media delivery"
-                            );
-                            break;
-                        }
-                    }
-                } else if let Some((body, footer)) =
-                    format_entry_parts(entry, feed_title, author, opts, meta)
-                {
-                    match send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await {
-                        Ok(sent) => {
-                            let m = sent.first;
-                            delivered_tg_link = tg_message_link(&m);
-                            fallback_msg_id = Some(m.id);
-                            text_delivered = true;
-                            text_partial = sent.partial;
-                        }
-                        Err(te) => {
-                            // Text fallback also failed: the entry was not
-                            // delivered at all. Return Err so the scheduler
-                            // goes through outbox persistent retry — never
-                            // silently mark it sent and lose the entry.
-                            tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %te, "text fallback also failed, propagating for outbox");
-                            return Err(anyhow::anyhow!(
-                                "media send failed ({}) and text fallback also failed: {}",
-                                e,
-                                te
-                            ));
-                        }
-                    }
-                }
-                // Media-only mode (no text to fall back to): the entry was
-                // not delivered at all; likewise goes through outbox retry.
-                if !text_delivered {
-                    return Err(anyhow::anyhow!(
-                        "media send failed ({}) and no text fallback available",
-                        e
-                    ));
-                }
-                // After the main media failed and fell back to plain text,
-                // still try to send the converted-to-document long/large
-                // images, quoting the fallback body message for easy
-                // navigation. The text is already delivered, so a document
-                // failure does not affect entry completeness.
-                for (di, d) in docs.iter().enumerate() {
-                    if let Err(de) = send_doc_msg(bot, db, chat_id, d, "", fallback_msg_id).await {
-                        tracing::warn!(
-                            chat_id = chat_id,
-                            entry_id = %fetcher::entry_id(entry),
-                            failed_doc = di,
-                            skipped_docs = docs.len() - di - 1,
-                            error = %de,
-                            "document send failed after text fallback"
-                        );
-                        break;
-                    }
-                }
-                // Retweet inline images get the same follow-up send, quoting
-                // the fallback body message. Use the retry variant for
-                // consistency with the main path: a transient network blip
-                // must not silently drop the images on this branch.
-                if !rt_photos.is_empty() {
-                    let rt_ops = build_rich_ops(&rt_photos, &[], &[]);
-                    if let Err((_, _, re)) = send_rich_ops_with_retry(
-                        bot,
-                        db,
-                        chat_id,
-                        "",
-                        false,
-                        &rt_ops,
-                        fallback_msg_id,
-                        "rt_images_text_fallback",
-                    )
-                    .await
-                    {
-                        tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %re, "retweet images send failed after text fallback");
-                    }
-                }
-                // Weibo poll: after the media failure falls back to plain
-                // text, the poll is likewise sent as a follow-up (v1.9.7
-                // fix: this path previously missed the send, so when the
-                // media send of a poll post with media failed, the poll was
-                // permanently lost).
-                try_send_poll(bot, chat_id, fallback_msg_id, meta).await;
-                return Ok(SendOutcome {
-                    media_failed: true,
-                    entry_link: fetcher::entry_link(entry),
-                    delivered_tg_link,
-                    delivered_message_id: fallback_msg_id.map(|m| m.0 as i64),
-                    // sent > 0: the first media op (caption) was delivered;
-                    // sent == 0: the full text fallback carries the entry.
-                    text_only: sent == 0,
-                    uncertain: false,
-                    text_partial,
-                });
+                return fallback_after_main_media_failure(
+                    bot,
+                    db,
+                    chat_id,
+                    entry,
+                    feed_title,
+                    author,
+                    opts,
+                    meta,
+                    &docs,
+                    &rt_photos,
+                    &overflow_chunks,
+                    sent,
+                    delivered.as_deref(),
+                    &e,
+                )
+                .await;
             }
         }
     }
