@@ -515,6 +515,245 @@ async fn entry_already_handled(
     Ok(sent || queued)
 }
 
+/// What the entry loop should do after a send failure was handled.
+enum SendFailureAction {
+    /// Entry handled (queued, migrated, serialized fallback); continue.
+    Continue,
+    /// Defer the current entry but keep processing later entries.
+    DeferContinue,
+    /// Defer and stop this feed's remaining entries (source disabled or
+    /// outbox queue full).
+    DeferBreak,
+}
+
+struct SendFailureCtx<'a> {
+    state: &'a AppState,
+    bot: &'a Bot,
+    sub: &'a db::SubRow,
+    cfg: &'a db::EffectiveConfig,
+    lang: Lang,
+    owner_id: Option<i64>,
+    chat_title: &'a str,
+    feed_title: &'a str,
+    entry: &'a feed_rs::model::Entry,
+    entry_id: &'a str,
+    author: Option<&'a str>,
+    notify_warnings: &'a [String],
+    oversized: &'a [crate::media::OversizedVideo],
+    notify_oversized: bool,
+    dl_retry_note: &'a str,
+    media_items: &'a [crate::media::MediaItem],
+    meta: Option<&'a crate::entrymeta::EntryMeta>,
+    error: &'a anyhow::Error,
+}
+
+/// Handle one entry send failure: supergroup migration, source/queue
+/// disabling, and outbox enqueue. Extracted from `process_feed` so the entry
+/// loop keeps only the success path.
+async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFailureAction> {
+    let state = ctx.state;
+    let bot = ctx.bot;
+    let sub = ctx.sub;
+    let cfg = ctx.cfg;
+    let lang = ctx.lang;
+    let owner_id = ctx.owner_id;
+    let chat_title = ctx.chat_title;
+    let feed_title = ctx.feed_title;
+    let entry = ctx.entry;
+    let eid = ctx.entry_id;
+    let author = ctx.author;
+    let notify_warnings = ctx.notify_warnings;
+    let oversized = ctx.oversized;
+    let notify_oversized = ctx.notify_oversized;
+    let dl_retry_note = ctx.dl_retry_note;
+    let media_items = ctx.media_items;
+    let meta = ctx.meta;
+    let e = ctx.error;
+
+    // Group upgraded to a supergroup: migrate every chat-scoped row and skip
+    // the outbox insert; the next fetch uses the new chat id. Without this, the
+    // old subscription would keep failing into outbox until abandoned after
+    // 72h.
+    if let Some(new_id) = migrated_chat_id_from_error(e) {
+        match db::migrate_chat_id(&state.db, &cfg.chat_id, &new_id).await {
+            Ok(()) => {
+                info!(
+                    old_chat_id = %cfg.chat_id,
+                    new_chat_id = %new_id,
+                    "chat id migrated after send error; retrying on the next cycle"
+                );
+                return Ok(SendFailureAction::Continue);
+            }
+            Err(me) => warn!(
+                old_chat_id = %cfg.chat_id,
+                new_chat_id = %new_id,
+                error = %me,
+                "chat id migration after send error failed"
+            ),
+        }
+    }
+    // A broken chat (bot removed / no posting rights) would otherwise succeed
+    // at fetching forever while every entry is queued and abandoned after 72h.
+    // Count consecutive send failures and disable the source or chat once the
+    // threshold is reached.
+    if record_send_failure(bot, state, sub, cfg, lang, feed_title, e).await {
+        return Ok(SendFailureAction::DeferBreak);
+    }
+
+    // Per-source queue cap: even intermittent failures can accumulate rows
+    // indefinitely. Stop fetching before the queue grows without bound; the
+    // source is auto-disabled and can be resumed after fixing it.
+    let queued = match db::outbox_count_for_feed(&state.db, &cfg.chat_id, &cfg.feed_url).await {
+        Ok(n) => n,
+        Err(err) => {
+            warn!(feed = %cfg.feed_url, error = %err, "outbox count failed, deferring entry");
+            return Ok(SendFailureAction::DeferContinue);
+        }
+    };
+    if queued >= OUTBOX_PER_FEED_LIMIT {
+        warn!(
+            feed = %cfg.feed_url,
+            queued,
+            "outbox queue reached the per-source limit; disabling source"
+        );
+        match db::auto_disable_subscription(&state.db, sub.id).await {
+            Ok(true) => {
+                let name = if feed_title.is_empty() { &cfg.feed_url } else { feed_title };
+                let msg = i18n::t(lang, "notif_outbox_full")
+                    .replacen("{}", &push::escape_html(name), 1)
+                    .replacen("{}", &OUTBOX_PER_FEED_LIMIT.to_string(), 1);
+                notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+            }
+            Ok(false) => {}
+            Err(err) => warn!(feed = %cfg.feed_url, error = %err, "outbox-full auto-disable failed"),
+        }
+        return Ok(SendFailureAction::DeferBreak);
+    }
+
+    warn!(feed = %cfg.feed_url, error = %e, "send failed, queuing to outbox");
+    // Push failed: write into the outbox persistent retry queue (exponential
+    // backoff, abandon at 72h). `entry_json` is the sole source for
+    // deserialization on retry: if serialization failed and an empty string
+    // were enqueued, the retry would fail to deserialize, only delete the row
+    // without mark_sent, and the entry would be permanently lost once it rolls
+    // out of the window. So on failure we take the "enqueue failed" branch
+    // (mark_sent + notify owner), leaving no hidden hazard.
+    let entry_json = match serde_json::to_string(entry) {
+        Ok(j) => j,
+        Err(se) => {
+            error!(feed = %cfg.feed_url, entry_id = %eid, error = %se, "entry_json serialization failed, marking sent");
+            db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, eid).await?;
+            let elink = fetcher::entry_link(entry).unwrap_or_default();
+            let msg = push_fail_msg(
+                lang,
+                i18n::t(lang, "notif_serialize_failed"),
+                feed_title,
+                &format!("{:#}", e),
+                "label_source",
+                &elink,
+            );
+            notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+            return Ok(SendFailureAction::Continue);
+        }
+    };
+    // A media_json failure degrades to an empty array (the retry proceeds as
+    // text without media); a meta_json failure degrades to no meta (the retry
+    // loses the poll/prerendered markers) — neither loses the entry.
+    let media_json = serde_json::to_string(media_items).unwrap_or_default();
+    // Group-C sidecar: serialize EntryMeta so it can be restored on retry.
+    let meta_json = meta
+        .map(|m| serde_json::to_string(m).unwrap_or_default())
+        .unwrap_or_default();
+    let now_ts = chrono::Utc::now().timestamp();
+    let next_retry = now_ts + outbox_backoff_secs(0);
+    let entry_link = fetcher::entry_link(entry).unwrap_or_default();
+    match db::outbox_insert(
+        &state.db,
+        &cfg.chat_id,
+        &cfg.feed_url,
+        eid,
+        feed_title,
+        &entry_json,
+        &media_json,
+        &meta_json,
+        &cfg.content_mode,
+        &cfg.source_display,
+        cfg.link_preview,
+        cfg.caption_above_media,
+        author,
+        next_retry,
+        now_ts,
+    )
+    .await
+    {
+        Ok(true) => {
+            // Newly enqueued: notify the owner (only on the first failure).
+            let msg = push_fail_msg(
+                lang,
+                i18n::t(lang, "notif_queued"),
+                feed_title,
+                &format!("{:#}", e),
+                "label_source",
+                &entry_link,
+            );
+            notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+            // Download-failure/oversized-video alerts are not persisted: send
+            // them at enqueue time, otherwise these alerts would be lost once
+            // the outbox retry succeeds.
+            if !notify_warnings.is_empty() {
+                notify_download_failed(
+                    bot,
+                    lang,
+                    owner_id,
+                    feed_title,
+                    notify_warnings,
+                    dl_retry_note,
+                    None,
+                    &entry_link,
+                )
+                .await;
+            }
+            if notify_oversized {
+                for ov in oversized {
+                    notify_oversized_video(
+                        bot,
+                        lang,
+                        owner_id,
+                        chat_title,
+                        &entry_link,
+                        None,
+                        false,
+                        ov,
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(false) => {
+            // Already in the queue (enqueued by a previous fetch round): do
+            // not notify again, avoiding the same notice every round during a
+            // persistent outage.
+            debug!(feed = %cfg.feed_url, entry_id = %eid, "already in outbox, skipping notice");
+        }
+        Err(insert_err) => {
+            // outbox write failed: fall back to marking sent (prevents
+            // infinite retries).
+            error!(feed = %cfg.feed_url, error = %insert_err, "outbox insert failed, marking sent");
+            db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, eid).await?;
+            let msg = push_fail_msg(
+                lang,
+                i18n::t(lang, "notif_enqueue_failed"),
+                feed_title,
+                &format!("{:#}", e),
+                "label_source",
+                &entry_link,
+            );
+            notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+        }
+    }
+    Ok(SendFailureAction::Continue)
+}
+
 /// Process a single source: fetch + push new entries in chronological order.
 /// Parallel across sources, serial within a source.
 /// All failure notifications are sent immediately, no longer batched until the
@@ -1240,200 +1479,34 @@ async fn process_feed(
                             .await;
                     }
                     Err(e) => {
-                        // Group upgraded to a supergroup: migrate every
-                        // chat-scoped row and skip the outbox insert; the next
-                        // fetch uses the new chat id. Without this, the old
-                        // subscription would keep failing into outbox until
-                        // abandoned after 72h.
-                        if let Some(new_id) = migrated_chat_id_from_error(&e) {
-                            match db::migrate_chat_id(&state.db, &cfg.chat_id, &new_id).await {
-                                Ok(()) => {
-                                    info!(
-                                        old_chat_id = %cfg.chat_id,
-                                        new_chat_id = %new_id,
-                                        "chat id migrated after send error; retrying on the next cycle"
-                                    );
-                                    continue;
-                                }
-                                Err(me) => warn!(
-                                    old_chat_id = %cfg.chat_id,
-                                    new_chat_id = %new_id,
-                                    error = %me,
-                                    "chat id migration after send error failed"
-                                ),
-                            }
-                        }
-                        // A broken chat (bot removed / no posting rights) would
-                        // otherwise succeed at fetching forever while every
-                        // entry is queued and abandoned after 72h. Count
-                        // consecutive send failures and disable the source or
-                        // chat once the threshold is reached.
-                        if record_send_failure(bot, state, &sub, &cfg, lang, &feed_title, &e).await {
-                            deferred = true;
-                            break;
-                        }
-
-                        // Per-source queue cap: even intermittent failures can
-                        // accumulate rows indefinitely. Stop fetching before
-                        // the queue grows without bound; the source is
-                        // auto-disabled and can be resumed after fixing it.
-                        let queued = match db::outbox_count_for_feed(&state.db, &cfg.chat_id, &cfg.feed_url).await {
-                            Ok(n) => n,
-                            Err(err) => {
-                                warn!(feed = %cfg.feed_url, error = %err, "outbox count failed, deferring entry");
+                        let failure = SendFailureCtx {
+                            state,
+                            bot,
+                            sub: &sub,
+                            cfg: &cfg,
+                            lang,
+                            owner_id,
+                            chat_title: &chat_title,
+                            feed_title: &feed_title,
+                            entry,
+                            entry_id: &eid,
+                            author: author.as_deref(),
+                            notify_warnings: &notify_warnings,
+                            oversized: &oversized,
+                            notify_oversized,
+                            dl_retry_note: &dl_retry_note,
+                            media_items: &prepared.items,
+                            meta,
+                            error: &e,
+                        };
+                        match handle_send_failure(&failure).await? {
+                            SendFailureAction::Continue => {}
+                            SendFailureAction::DeferContinue => {
                                 deferred = true;
-                                continue;
                             }
-                        };
-                        if queued >= OUTBOX_PER_FEED_LIMIT {
-                            warn!(
-                                feed = %cfg.feed_url,
-                                queued,
-                                "outbox queue reached the per-source limit; disabling source"
-                            );
-                            match db::auto_disable_subscription(&state.db, sub.id).await {
-                                Ok(true) => {
-                                    let name = if feed_title.is_empty() { &cfg.feed_url } else { &feed_title };
-                                    let msg = i18n::t(lang, "notif_outbox_full")
-                                        .replacen("{}", &push::escape_html(name), 1)
-                                        .replacen("{}", &OUTBOX_PER_FEED_LIMIT.to_string(), 1);
-                                    notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                                }
-                                Ok(false) => {}
-                                Err(err) => warn!(feed = %cfg.feed_url, error = %err, "outbox-full auto-disable failed"),
-                            }
-                            deferred = true;
-                            break;
-                        }
-
-                        warn!(feed = %cfg.feed_url, error = %e, "send failed, queuing to outbox");
-                        // Push failed: write into the outbox persistent retry
-                        // queue (exponential backoff, abandon at 72h).
-                        // entry_json is the sole source for deserialization on
-                        // retry: if serialization failed and an empty string
-                        // were enqueued, the retry would fail to deserialize,
-                        // only delete the row without mark_sent, and the entry
-                        // would be permanently lost once it rolls out of the
-                        // window. So on failure we take the "enqueue failed"
-                        // branch (mark_sent + notify owner), leaving no hidden
-                        // hazard.
-                        let entry_json = match serde_json::to_string(entry) {
-                            Ok(j) => j,
-                            Err(se) => {
-                                error!(feed = %cfg.feed_url, entry_id = %eid, error = %se, "entry_json serialization failed, marking sent");
-                                db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
-                                let elink = fetcher::entry_link(entry).unwrap_or_default();
-                                let msg = push_fail_msg(
-                                    lang,
-                                    i18n::t(lang, "notif_serialize_failed"),
-                                    &feed_title,
-                                    &format!("{:#}", e),
-                                    "label_source",
-                                    &elink,
-                                );
-                                notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                                continue;
-                            }
-                        };
-                        // A media_json failure degrades to an empty array (the
-                        // retry proceeds as text without media); a meta_json
-                        // failure degrades to no meta (the retry loses the
-                        // poll/prerendered markers) — neither loses the entry,
-                        // which is acceptable.
-                        let media_json = serde_json::to_string(&prepared.items).unwrap_or_default();
-                        // Group-C sidecar: serialize EntryMeta so it can be
-                        // restored on retry.
-                        let meta_json = meta
-                            .map(|m| serde_json::to_string(m).unwrap_or_default())
-                            .unwrap_or_default();
-                        let now_ts = chrono::Utc::now().timestamp();
-                        let next_retry = now_ts + outbox_backoff_secs(0);
-                        let entry_link = fetcher::entry_link(entry).unwrap_or_default();
-                        match db::outbox_insert(
-                            &state.db,
-                            &cfg.chat_id,
-                            &cfg.feed_url,
-                            &eid,
-                            &feed_title,
-                            &entry_json,
-                            &media_json,
-                            &meta_json,
-                            &cfg.content_mode,
-                            &cfg.source_display,
-                            cfg.link_preview,
-                            cfg.caption_above_media,
-                            author.as_deref(),
-                            next_retry,
-                            now_ts,
-                        )
-                        .await
-                        {
-                            Ok(true) => {
-                                // Newly enqueued: notify the owner (only notify
-                                // on the first failure).
-                                let msg = push_fail_msg(
-                                    lang,
-                                    i18n::t(lang, "notif_queued"),
-                                    &feed_title,
-                                    &format!("{:#}", e),
-                                    "label_source",
-                                    &entry_link,
-                                );
-                                notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                                // Download-failure/oversized-video alerts are
-                                // not persisted: send them at enqueue time,
-                                // otherwise these alerts would be lost forever
-                                // once the outbox retry succeeds.
-                                if !notify_warnings.is_empty() {
-                                    notify_download_failed(
-                                        bot,
-                                        lang,
-                                        owner_id,
-                                        &feed_title,
-                                        &notify_warnings,
-                                        &dl_retry_note,
-                                        None,
-                                        &entry_link,
-                                    )
-                                    .await;
-                                }
-                                if notify_oversized {
-                                    for ov in &oversized {
-                                        notify_oversized_video(
-                                            bot,
-                                            lang,
-                                            owner_id,
-                                            &chat_title,
-                                            &entry_link,
-                                            None,
-                                            false,
-                                            ov,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-                            Ok(false) => {
-                                // Already in the queue (enqueued by a previous
-                                // fetch round): do not notify again, avoiding
-                                // the same notice being spammed every round
-                                // during a persistent outage.
-                                debug!(feed = %cfg.feed_url, entry_id = %eid, "already in outbox, skipping notice");
-                            }
-                            Err(insert_err) => {
-                                // outbox write failed: fall back to marking sent
-                                // (prevents infinite retries)
-                                error!(feed = %cfg.feed_url, error = %insert_err, "outbox insert failed, marking sent");
-                                db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, &eid).await?;
-                                let msg = push_fail_msg(
-                                    lang,
-                                    i18n::t(lang, "notif_enqueue_failed"),
-                                    &feed_title,
-                                    &format!("{:#}", e),
-                                    "label_source",
-                                    &entry_link,
-                                );
-                                notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
+                            SendFailureAction::DeferBreak => {
+                                deferred = true;
+                                break;
                             }
                         }
                     }
