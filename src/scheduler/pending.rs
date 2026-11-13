@@ -38,7 +38,7 @@ pub(super) struct PendingSelection<'a> {
 ///   timestamp (sources with missing timestamps keep their original order).
 pub(super) fn select_pending<'a>(
     entries: &'a [Entry],
-    known_sent: &HashSet<u64>,
+    known_sent: &HashSet<String>,
     outbox_ids: &HashSet<String>,
     filter_cfg: &db::FilterConfig,
     filter_keywords: &[String],
@@ -59,7 +59,7 @@ pub(super) fn select_pending<'a>(
         if !seen_eids.insert(eid.clone()) {
             continue;
         }
-        if known_sent.contains(&db::entry_marker_hash(&eid)) {
+        if known_sent.contains(&eid) {
             continue;
         }
         if outbox_ids.contains(&eid) {
@@ -144,7 +144,7 @@ mod tests {
             entry("queued", "queued", None),
             entry("new", "new", None),
         ];
-        let known = HashSet::from([db::entry_marker_hash("sent")]);
+        let known = HashSet::from(["sent".to_string()]);
         let outbox = HashSet::from(["queued".to_string()]);
         let out = select_pending(
             &entries,

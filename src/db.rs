@@ -3,7 +3,6 @@ use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 mod outbox;
 mod sent;
 mod settings;
@@ -671,65 +670,65 @@ pub async fn add_subscription_with_sent(
     Ok(())
 }
 
-/// Batch form of `is_entry_sent` for one subscription. The fetch cycle filters
-/// entries against this set instead of running two queries per entry (a large
-/// feed could hold tens of thousands of entries), and platform fetchers use it
-/// to skip enrichment requests for already-pushed entries.
-pub async fn sent_entry_ids(
-    db: &Db,
-    chat_id: &str,
-    feed_url: &str,
-) -> anyhow::Result<std::collections::HashSet<String>> {
-    let rows = sqlx::query("SELECT entry_id FROM sent_entries WHERE chat_id = ? AND feed_url = ?")
-        .bind(chat_id)
-        .bind(feed_url)
-        .fetch_all(db)
-        .await?;
-    Ok(rows.into_iter().map(|r| r.get("entry_id")).collect())
-}
-
-/// Stable 64-bit marker hash for an entry id (SHA-256 truncated to 8 bytes).
-/// The fetch-cycle filter stores these instead of full id strings. A 64-bit
-/// collision is vanishingly rare and would only skip that one entry; the
-/// exact `entry_dedup_state` recheck before each send still uses the raw id.
-pub fn entry_marker_hash(entry_id: &str) -> u64 {
-    let digest = Sha256::digest(entry_id.as_bytes());
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    u64::from_be_bytes(bytes)
-}
-
-/// Compact form of [`sent_entry_ids`] for the fetch-cycle filter. Rows are
-/// streamed one at a time, so loading a long-lived subscription's history does
-/// not build a full rows vector plus a full `String` set at once.
+/// Bounded sent-entry snapshot for platform enrichment.
 ///
-/// `wanted` optionally restricts the returned set to marker hashes the caller
-/// actually needs (the current feed window). The table is still scanned row by
-/// row, but memory is bounded by the feed window rather than by the
-/// subscription's lifetime history: `sent_entries` rows are never pruned while
-/// the subscription exists, so a decades-old source can accumulate hundreds of
-/// thousands of markers.
-pub async fn sent_entry_id_hashes(
+/// `sent_entries` is never pruned while a subscription exists, so loading the
+/// full history for Weibo detail/vote suppression grows with the source's age.
+/// The snapshot is only a hint: a missing old entry costs one extra detail
+/// request and is still filtered by the exact window query below.
+pub const SENT_ENTRY_LOOKBACK_DAYS: i64 = 180;
+/// Row cap for the bounded snapshot (most recent first).
+pub const SENT_ENTRY_LOOKBACK_ROWS: i64 = 5000;
+
+/// Recent sent-entry ids for one subscription (bounded by age and row count).
+pub async fn sent_entry_ids_recent(
     db: &Db,
     chat_id: &str,
     feed_url: &str,
-    wanted: Option<&std::collections::HashSet<u64>>,
-) -> anyhow::Result<std::collections::HashSet<u64>> {
-    use futures_util::TryStreamExt;
-    let mut rows = sqlx::query_scalar::<_, String>(
-        "SELECT entry_id FROM sent_entries WHERE chat_id = ? AND feed_url = ?",
+    retention_days: i64,
+    limit: i64,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let rows = sqlx::query(
+        "SELECT entry_id FROM sent_entries
+          WHERE chat_id = ? AND feed_url = ? AND sent_at >= datetime('now', ?)
+          ORDER BY sent_at DESC LIMIT ?",
     )
     .bind(chat_id)
     .bind(feed_url)
-    .fetch(db);
-    let mut set = std::collections::HashSet::new();
-    while let Some(id) = rows.try_next().await? {
-        let hash = entry_marker_hash(&id);
-        if wanted.is_none_or(|w| w.contains(&hash)) {
-            set.insert(hash);
+    .bind(format!("-{} days", retention_days))
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.get("entry_id")).collect())
+}
+
+/// Sent-entry ids from the current feed window (chunked `IN` query).
+///
+/// Uses the `UNIQUE(chat_id, feed_url, entry_id)` index so only matching rows
+/// are read; the table's full history is never scanned. Chunking keeps the
+/// bound count below SQLite's variable limit.
+pub async fn sent_entry_ids_in_window(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+    ids: &[String],
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    const CHUNK: usize = 300;
+    let mut found = std::collections::HashSet::new();
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT entry_id FROM sent_entries
+              WHERE chat_id = ? AND feed_url = ? AND entry_id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
+        query = query.bind(chat_id).bind(feed_url);
+        for id in chunk {
+            query = query.bind(id);
         }
+        found.extend(query.fetch_all(db).await?);
     }
-    Ok(set)
+    Ok(found)
 }
 
 /// Batch form of the per-entry outbox check for one subscription. The fetch
@@ -2194,16 +2193,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn entry_marker_hash_is_stable_and_distinct() {
-        let a = entry_marker_hash("entry-a");
-        assert_eq!(a, entry_marker_hash("entry-a"));
-        assert_ne!(a, entry_marker_hash("entry-b"));
-        assert_ne!(entry_marker_hash(""), entry_marker_hash("x"));
+    #[tokio::test]
+    async fn sent_entry_ids_recent_is_bounded_by_age_and_limit() {
+        let pool = test_pool().await;
+        let feed = "https://example.com/feed";
+        mark_entry_sent(&pool, "1", feed, "fresh1").await.unwrap();
+        mark_entry_sent(&pool, "1", feed, "fresh2").await.unwrap();
+        sqlx::query(
+            "INSERT INTO sent_entries (chat_id, feed_url, entry_id, sent_at)
+             VALUES ('1', ?, 'old', datetime('now', '-200 days'))",
+        )
+        .bind(feed)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let recent = sent_entry_ids_recent(&pool, "1", feed, 180, 5000)
+            .await
+            .unwrap();
+        assert!(recent.contains("fresh1"));
+        assert!(recent.contains("fresh2"));
+        assert!(!recent.contains("old"), "age cap must exclude old rows");
+
+        let limited = sent_entry_ids_recent(&pool, "1", feed, 180, 1)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1, "row cap must bound the snapshot");
     }
 
     #[tokio::test]
-    async fn sent_entry_id_hashes_matches_sent_ids_for_the_subscription() {
+    async fn sent_entry_ids_in_window_reads_only_requested_ids() {
         let pool = test_pool().await;
         let feed = "https://example.com/feed";
         mark_entry_sent(&pool, "1", feed, "e1").await.unwrap();
@@ -2213,25 +2232,32 @@ mod tests {
             .await
             .unwrap();
 
-        let ids = sent_entry_ids(&pool, "1", feed).await.unwrap();
-        let hashes = sent_entry_id_hashes(&pool, "1", feed, None).await.unwrap();
-        assert_eq!(ids.len(), 2);
-        assert_eq!(hashes.len(), 2);
-        assert!(hashes.contains(&entry_marker_hash("e1")));
-        assert!(hashes.contains(&entry_marker_hash("e2")));
-        assert!(!hashes.contains(&entry_marker_hash("other-chat")));
-        assert!(!hashes.contains(&entry_marker_hash("other-feed")));
-
-        // A wanted filter bounds the result to the current feed window while
-        // preserving the same membership answers for those ids.
-        let wanted = std::collections::HashSet::from([
-            entry_marker_hash("e2"),
-            entry_marker_hash("not-sent"),
-        ]);
-        let filtered = sent_entry_id_hashes(&pool, "1", feed, Some(&wanted))
+        let wanted = vec![
+            "e1".to_string(),
+            "e2".to_string(),
+            "missing".to_string(),
+        ];
+        let found = sent_entry_ids_in_window(&pool, "1", feed, &wanted)
             .await
             .unwrap();
-        assert_eq!(filtered, std::collections::HashSet::from([entry_marker_hash("e2")]));
+        assert_eq!(
+            found,
+            std::collections::HashSet::from(["e1".to_string(), "e2".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn sent_entry_ids_in_window_handles_multiple_chunks() {
+        let pool = test_pool().await;
+        let feed = "https://example.com/feed";
+        let ids: Vec<String> = (0..320).map(|i| format!("e{i}")).collect();
+        for id in &ids {
+            mark_entry_sent(&pool, "1", feed, id).await.unwrap();
+        }
+        let found = sent_entry_ids_in_window(&pool, "1", feed, &ids)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), ids.len(), "chunk boundary must not drop rows");
     }
 
     async fn insert_chat(pool: &Db, chat_id: &str, owner: &str, enabled: i64) {
