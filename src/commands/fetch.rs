@@ -164,3 +164,62 @@ async fn is_self_telegram_source(
         .as_deref()
         .is_some_and(|u| u.eq_ignore_ascii_case(&channel)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_error_text_platform_closed_and_self_source() {
+        let closed = sub_error_text(Lang::En, CommandFetchError::PlatformClosed("Weibo"));
+        assert!(closed.contains("Weibo"));
+        assert!(closed.contains("unavailable"));
+
+        // Compare against the locale value to avoid duplicating user copy in
+        // the source tree.
+        assert_eq!(
+            sub_error_text(Lang::Zh, CommandFetchError::SelfSource),
+            i18n::t(Lang::Zh, "sub_self_channel")
+        );
+    }
+
+    #[test]
+    fn sub_error_text_escapes_fetch_and_check_errors() {
+        let fetch = sub_error_text(
+            Lang::En,
+            CommandFetchError::FetchFailed(anyhow::anyhow!("bad <tag> & value")),
+        );
+        assert!(fetch.contains("<blockquote>"));
+        assert!(fetch.contains("&lt;tag&gt; &amp; value"));
+
+        let check = sub_error_text(
+            Lang::En,
+            CommandFetchError::CheckFailed(anyhow::anyhow!("db <error>")),
+        );
+        assert!(check.contains("&lt;error&gt;"));
+    }
+
+    #[test]
+    fn sub_error_text_busy_wraps_platform_busy() {
+        let text = sub_error_text(Lang::En, CommandFetchError::Busy);
+        assert!(text.contains(i18n::t(Lang::En, "platform_busy")));
+        assert!(text.contains("Fetch failed"));
+    }
+
+    #[test]
+    fn test_error_text_is_plain_text() {
+        let fetch = test_error_text(
+            Lang::En,
+            CommandFetchError::FetchFailed(anyhow::anyhow!("bad <tag> & value")),
+        );
+        // /test result messages are sent without parse mode, so the error is
+        // shown verbatim rather than HTML-escaped.
+        assert!(fetch.contains("bad <tag> & value"));
+        assert!(!fetch.contains("&lt;"));
+
+        assert_eq!(
+            test_error_text(Lang::En, CommandFetchError::Busy),
+            i18n::t(Lang::En, "platform_busy")
+        );
+    }
+}
