@@ -218,3 +218,66 @@ pub async fn find_sent_message(
         created_at: r.get("created_at"),
     }))
 }
+
+/// Bounded sent-entry snapshot for platform enrichment.
+///
+/// `sent_entries` is never pruned while a subscription exists, so loading the
+/// full history for Weibo detail/vote suppression grows with the source's age.
+/// The snapshot is only a hint: a missing old entry costs one extra detail
+/// request and is still filtered by the exact window query below.
+pub const SENT_ENTRY_LOOKBACK_DAYS: i64 = 180;
+/// Row cap for the bounded snapshot (most recent first).
+pub const SENT_ENTRY_LOOKBACK_ROWS: i64 = 5000;
+
+/// Recent sent-entry ids for one subscription (bounded by age and row count).
+pub async fn sent_entry_ids_recent(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+    retention_days: i64,
+    limit: i64,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let rows = sqlx::query(
+        "SELECT entry_id FROM sent_entries
+          WHERE chat_id = ? AND feed_url = ? AND sent_at >= datetime('now', ?)
+          ORDER BY sent_at DESC LIMIT ?",
+    )
+    .bind(chat_id)
+    .bind(feed_url)
+    .bind(format!("-{} days", retention_days))
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.get("entry_id")).collect())
+}
+
+/// Sent-entry ids from the current feed window (chunked `IN` query).
+///
+/// Uses the `UNIQUE(chat_id, feed_url, entry_id)` index so only matching rows
+/// are read; the table's full history is never scanned. Chunking keeps the
+/// bound count below SQLite's variable limit.
+pub async fn sent_entry_ids_in_window(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+    ids: &[String],
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    const CHUNK: usize = 300;
+    let mut found = std::collections::HashSet::new();
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT entry_id FROM sent_entries
+              WHERE chat_id = ? AND feed_url = ? AND entry_id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
+        query = query.bind(chat_id).bind(feed_url);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        found.extend(query.fetch_all(db).await?);
+    }
+    Ok(found)
+}

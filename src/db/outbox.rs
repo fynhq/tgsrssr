@@ -1,6 +1,7 @@
 //! Persistent retry queue (outbox) storage.
 
 use super::*;
+use sqlx::Row;
 
 // next_retry_at/last_error are only used in SQL WHERE/UPDATE and never read
 // directly on the Rust side — kept to preserve the complete mapping of the
@@ -182,4 +183,22 @@ pub async fn outbox_delete(db: &Db, id: i64) -> anyhow::Result<()> {
         .execute(db)
         .await?;
     Ok(())
+}
+
+/// Batch form of the per-entry outbox check for one subscription. The fetch
+/// cycle skips entries the outbox already owns (the outbox has sole retry
+/// authority). Callers must fail closed: a query error means the outbox state
+/// is unknown, so the feed is deferred to the next round instead of treating
+/// the set as empty.
+pub async fn outbox_entry_ids(
+    db: &Db,
+    chat_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let rows = sqlx::query("SELECT entry_id FROM outbox WHERE chat_id = ? AND feed_url = ?")
+        .bind(chat_id)
+        .bind(feed_url)
+        .fetch_all(db)
+        .await?;
+    Ok(rows.into_iter().map(|r| r.get("entry_id")).collect())
 }
