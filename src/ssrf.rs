@@ -1,9 +1,9 @@
 //! SSRF guard: reject URLs/IPs that resolve to private or loopback ranges.
 //!
 //! Shared by the feed-fetch path (fetcher.rs) and the media-download path
-//! (media.rs). Extracted from media.rs (batch-A architecture refactor) so the
-//! fetcher no longer depends on the media module — dependency direction is
-//! now one-way (fetcher → ssrf, media → ssrf).
+//! (media.rs). Extracted from media.rs so the fetcher no longer depends on the
+//! media module — dependency direction is now one-way (fetcher → ssrf,
+//! media → ssrf).
 //!
 //! DNS-rebinding defence: direct-connection clients install
 //! [`GuardedResolver`] as their DNS resolver, so the addresses reqwest

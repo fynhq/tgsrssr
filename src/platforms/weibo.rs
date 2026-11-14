@@ -58,7 +58,7 @@ fn status_id_str(mblog: &Value) -> Option<String> {
 
 // ── Markdown rendering regexes (for posts with md_render_mark == 1) ──
 // RE_BR / RE_BLANK_LINES / RE_IMG_ALT / RE_IMG are identical to the ones in
-// fetcher.rs; reuse the fetcher exports directly (L5 fix: previously defined
+// fetcher.rs; reuse the fetcher exports directly (previously defined
 // twice in both places).
 /// Protect existing <a> tags (output of absolutize_hrefs) so they are not
 /// escaped during rendering.
@@ -492,7 +492,7 @@ fn patch_pics(mblog: &mut Value, detail: &Value) {
     }
 }
 
-/// Shared request skeleton for weibo JSON APIs (M4 fix: fetch_vote_object
+/// Shared request skeleton for weibo JSON APIs (fetch_vote_object
 /// and fetch_status_show each used to write the request → status check →
 /// JSON parse → warn template once, ~30 lines matched line by line).
 /// Returns the parsed JSON Value; any failure returns None and leaves a log
@@ -1029,7 +1029,7 @@ fn mblog_to_entry(
     // image via the "View image" card. The original link stays as a clickable
     // hyperlink; the decoded real image URLs are collected into
     // EntryMeta.retweet_images so the media pipeline sends them as a
-    // separate message after the main one (group C sidecar, replacing the
+    // separate message after the main one (sidecar, replacing the
     // former data-rt injection).
     let (text, main_inline_imgs) = extract_inline_images(&text, lang);
 
@@ -1137,7 +1137,7 @@ fn mblog_to_entry(
     }
 
     // Collect main-post inline images (from [View image] links) into sidecar.
-    // Group C: no longer inject <img data-rt="1"> into body; pass them via
+    // No longer inject <img data-rt="1"> into body; pass them via
     // EntryMeta.retweet_images instead.
     // Dedup: skip URLs already rendered as <img> in the FINAL body. This
     // check runs AFTER the blockquote append above on purpose — when the
@@ -1156,7 +1156,7 @@ fn mblog_to_entry(
         rt_images.push(img_url.clone());
     }
 
-    // Vote data: build EntryMeta.poll (group C sidecar, replacing the former
+    // Vote data: build EntryMeta.poll (sidecar, replacing the former
     // <div data-vote> body injection).
     let poll_meta = vote_obj.and_then(|vo| {
         let question = vo["content"].as_str()?.to_string();
@@ -1198,13 +1198,13 @@ fn mblog_to_entry(
     let link = format!("https://weibo.com/{}/{}", link_uid, bid);
 
     // Markdown-rendered posts carry pre-converted Telegram HTML in the body.
-    // Group C: now explicitly marked via EntryMeta.prerendered_html (replacing
+    // Now explicitly marked via EntryMeta.prerendered_html (replacing
     // the content_type MIME code); content_type uniformly goes back to standard
     // text/html.
     let content_mime = "text/html";
 
-    // The prerendered flag is carried by EntryMeta.prerendered_html (group C
-    // sidecar, replacing the former MIME code).
+    // The prerendered flag is carried by EntryMeta.prerendered_html (sidecar,
+    // replacing the former MIME code).
     let meta = crate::entrymeta::EntryMeta {
         prerendered_html: is_markdown,
         poll: poll_meta,
@@ -1340,7 +1340,7 @@ fn render_md_inline(text: &str) -> String {
 
     // 3) Escape HTML special characters (placeholders contain no &<> at this
     // point, so this is safe).
-    // Decode pre-existing HTML entities FIRST (P1-2 double-escape fix): the
+    // Decode pre-existing HTML entities FIRST (double-escape fix): the
     // weibo markdown editor stores visible `&` / `<` / `>` / non-breaking
     // spaces as `&amp;` / `&lt;` / `&gt;` / `&nbsp;`. Escaping them as-is would
     // render them literally as `&amp;amp;` etc. decode_entities is the visible
@@ -1497,7 +1497,7 @@ fn render_weibo_markdown(text: &str) -> String {
             let html = format!(
                 "{}{}</code></pre>",
                 open_tag,
-                // Same decode-once-escape-once rule as render_md_inline (P1-2):
+                // Same decode-once-escape-once rule as render_md_inline:
                 // fenced content comes from the same pre-escaped editor storage,
                 // so `&amp;` inside a code block must not become `&amp;amp;`.
                 crate::htmltext::escape_html(&crate::htmltext::decode_entities(&content))
@@ -2397,7 +2397,7 @@ mod tests {
 
     #[test]
     fn md_preescaped_entities_not_double_escaped() {
-        // P1-2 regression: the weibo markdown editor stores visible & and
+        // Regression: the weibo markdown editor stores visible & and
         // spacing as entities; escaping them without decoding first produced
         // &amp;amp; (rendered literally in Telegram).
         let out = render_weibo_markdown("A &amp; B");

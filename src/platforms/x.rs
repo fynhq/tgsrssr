@@ -1448,7 +1448,7 @@ fn linkify_hashtags_in_text(text: &str) -> String {
 
 /// Extract a tweet's full text (note_tweet takes priority, falling back to
 /// legacy.full_text — the convention fixed in #7) and clean t.co links,
-/// returning readable text. M7 fix: the main tweet/RT/QT three call sites
+/// returning readable text. The main tweet/RT/QT three call sites
 /// previously repeated the same extraction chain verbatim; collapsed into a
 /// single function.
 fn tweet_full_text(result: &Value) -> String {
@@ -1465,7 +1465,7 @@ fn tweet_full_text(result: &Value) -> String {
 /// Append a RT/QT blockquote to the body. `prefix` = "RT" or "QT".
 /// Quoted media is always included (QT matches RT, v1.10.16): an image-only
 /// quote tweet must not degrade to plain text when the main tweet itself has
-/// no media. M7 fix: the former RT and QT blocks were verbatim duplicates;
+/// no media. The former RT and QT blocks were verbatim duplicates;
 /// collapsed into a single function.
 fn append_quote_block(body: &mut String, result: &Value, prefix: &str) {
     // Handle TweetWithVisibilityResults wrapper (shared with tweet_to_entry).

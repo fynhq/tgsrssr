@@ -1,7 +1,6 @@
 //! Unsubscribe flow: single unsub, unsub panel, unsub-all confirmation.
-//! Split out of callbacks/mod.rs (batch-3 refactor). Uses shared panel
-//! helpers from `crate::ui`; callback-only toast/guard helpers stay in
-//! `super`.
+//! Split out of callbacks/mod.rs. Uses shared panel helpers from `crate::ui`;
+//! callback-only toast/guard helpers stay in `super`.
 
 use teloxide::prelude::*;
 use teloxide::types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};

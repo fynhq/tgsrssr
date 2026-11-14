@@ -23,8 +23,8 @@ const SENT_MESSAGES_MAX_ROWS: i64 = 5000;
 
 /// Run all cleanup tasks once. `ctx` is a log prefix distinguishing the
 /// periodic run ("cleanup") from the startup run ("startup cleanup").
-/// L6 fix: run_all_cleanup and run_startup_cleanup duplicated the same
-/// 5-task sequence; collapsed into one function parameterized by context.
+/// The two entry points previously duplicated the same 5-task sequence;
+/// collapsed into one function parameterized by context.
 async fn run_cleanup_tasks(config: &Config, db_pool: &Db, ctx: &str) {
     // The two media-cleanup passes below both need the outbox protection set.
     // Computing it once here (instead of once per pass) halves the full-table

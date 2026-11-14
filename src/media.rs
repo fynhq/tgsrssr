@@ -1295,7 +1295,7 @@ fn absolutize_media_url(entry: &Entry, raw: &str) -> String {
 /// then <img>/<video>/<source> tags inside the body HTML.
 /// Returns (url, kind, mime, is_retweet, owner_mid). is_retweet is true for
 /// images listed in EntryMeta.retweet_images (weibo [view image] links,
-/// group-C sidecar); owner_mid is the Weibo status id embedded on a <video>
+/// sidecar); owner_mid is the Weibo status id embedded on a <video>
 /// tag, used to resolve HD playback from the correct post.
 pub fn extract_media_urls(
     entry: &Entry,
@@ -1378,7 +1378,7 @@ pub fn extract_media_urls(
         remaining = RE_URL_ICON_SPAN.replace_all(&remaining, "").to_string();
 
         // 3) <img> tags: extract src/data-src as images.
-        //    Group C: imgs inside the body are always is_rt=false; retweet
+        //    Imgs inside the body are always is_rt=false; retweet
         //    inline images are explicitly injected via meta.retweet_images
         //    below (the former data-rt detection has been removed).
         for caps in RE_IMG_TAG.captures_iter(&remaining) {
@@ -1391,7 +1391,7 @@ pub fn extract_media_urls(
         }
     }
 
-    // Group-C sidecar: meta.retweet_images explicitly injects retweet inline
+    // Sidecar: meta.retweet_images explicitly injects retweet inline
     // images (decoded from Weibo [view image] links), flagged with
     // is_retweet=true so they are split into a standalone message at push
     // time.
@@ -2671,7 +2671,7 @@ mod tests {
 
     #[test]
     fn retweet_inline_image_flagged() {
-        // Group C: retweet inline images are passed in via
+        // Retweet inline images are passed in via
         // EntryMeta.retweet_images and flagged with is_retweet.
         let body = r#"<img src="https://tvax1.sinaimg.cn/large/normal.jpg">"#;
         let entry = entry_with_body(body);

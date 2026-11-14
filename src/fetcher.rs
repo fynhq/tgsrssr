@@ -205,7 +205,7 @@ pub struct FetchResult {
     /// next conditional request.
     pub http_etag: Option<String>,
     pub http_last_modified: Option<String>,
-    /// Structured entry metadata (sidecar, group-C refactor):
+    /// Structured entry metadata (sidecar):
     /// entry_id → EntryMeta. Replaces the in-body data-vote/data-rt markers
     /// and the content_type MIME secret handshake; populated on demand by
     /// platform sources, always empty for RSS sources.
@@ -213,7 +213,7 @@ pub struct FetchResult {
 }
 
 impl FetchResult {
-    /// Platform-source constructor (F6 convergence): native fetching does not
+    /// Platform-source constructor: native fetching does not
     /// go through HTTP conditional requests, so the negotiation headers are
     /// always empty. The three platforms previously duplicated the same
     /// literal verbatim; funneling them here prevents field drift.
@@ -347,7 +347,7 @@ pub const MAX_BODY_BYTES: u64 = 20 * 1024 * 1024;
 /// entries are kept after the normal newest-first sort.
 pub const MAX_ENTRIES_PER_FEED: usize = 500;
 
-/// Stream-read a response body while enforcing the size cap (M8 fix: the
+/// Stream-read a response body while enforcing the size cap (the
 /// fetcher and telegram.rs previously duplicated the same bytes_stream loop
 /// verbatim in two places). Checks while reading and aborts as soon as the
 /// limit is exceeded — does not rely on a Content-Length pre-check (that
@@ -683,7 +683,7 @@ pub fn entry_author(entry: &Entry) -> Option<String> {
 /// routine branch; do not lower these call-site values without checking that.
 ///
 /// When `meta.prerendered_html` is true (weibo markdown-rendered posts,
-/// group-C sidecar, replacing the former content_type `text/x-tg-html` MIME
+/// sidecar; it replaces the former content_type `text/x-tg-html` MIME
 /// secret handshake), the body
 /// is already valid Telegram HTML — only media tags are stripped,
 /// formatting tags (<b>/<i>/<s>/<code>/<a>/<blockquote>) are preserved.
@@ -728,7 +728,7 @@ pub(crate) fn entry_body_html_from_source(
     // html_to_telegram_html conversion which would strip formatting tags.
     // Only remove media tags (<img>/<video>/<source>) — media is sent as
     // separate attachments by the media pipeline.
-    // Group C: explicitly marked via EntryMeta.prerendered_html (replacing
+    // Explicitly marked via EntryMeta.prerendered_html (replacing
     // the text/x-tg-html MIME secret handshake).
     let is_prerendered = meta.map(|m| m.prerendered_html).unwrap_or(false);
 
@@ -1326,7 +1326,7 @@ mod tests {
         assert!(out.contains("</blockquote>"), "out: {}", out);
     }
 
-    // ===== entry_body_html prerendered path (group-C sidecar) =====
+    // ===== entry_body_html prerendered path (sidecar) =====
 
     fn entry_with_body_html(body: &str) -> feed_rs::model::Entry {
         use feed_rs::model::{Content, Entry};

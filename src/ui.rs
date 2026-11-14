@@ -66,9 +66,9 @@ pub(crate) fn back_close_row(
     ]
 }
 
-/// Build the pagination nav row (prev / indicator / next). M6 fix: three
-/// call sites duplicated this exact logic; only the callback URL differs,
-/// supplied via `mk_url`. Returns None when there is only one page.
+/// Build the pagination nav row (prev / indicator / next). Three call sites
+/// duplicated this exact logic; only the callback URL differs, supplied via
+/// `mk_url`. Returns None when there is only one page.
 pub(crate) fn nav_row(
     page: usize,
     total_pages: usize,

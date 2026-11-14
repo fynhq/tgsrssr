@@ -1,5 +1,5 @@
 //! Settings pages: channel-level config, feed-level overrides, option pages.
-//! Split out of callbacks/mod.rs (batch-B3 refactor); behavior unchanged.
+//! Split out of callbacks/mod.rs; behavior unchanged.
 //! Uses shared panel helpers from `crate::ui`.
 
 use teloxide::prelude::*;
@@ -17,7 +17,8 @@ use crate::ui::{
 };
 
 /// Shows current values with a ✓ and lets the owner switch them in place.
-/// Settings main page: three second-level entries + link-preview toggle.
+/// Settings main page: three second-level entries + caption/link-preview
+/// toggles.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn render_settings_page(
     bot: &Bot,
@@ -84,7 +85,7 @@ pub(super) async fn render_settings_page(
     Ok(())
 }
 
-/// Data-driven option page spec (M2 fix: 6 near-identical render functions
+/// Data-driven option page spec (6 near-identical render functions
 /// collapsed into one renderer + declarative specs).
 struct OptionPageSpec {
     title: String,

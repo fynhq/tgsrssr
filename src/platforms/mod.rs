@@ -20,11 +20,11 @@ use std::pin::Pin;
 use crate::state::AppState;
 use feed_rs::model::{Content, Entry, Link, Person, Text};
 
-/// Build a unified feed-rs [`Entry`] from platform-native fields (M1 fix:
-/// the weibo/x/telegram fetchers each repeated ~40 lines of isomorphic
+/// Build a unified feed-rs [`Entry`] from platform-native fields. The
+/// weibo/x/telegram fetchers each repeated ~40 lines of isomorphic
 /// literals differing only in content_type; collapsed into a single
-/// constructor to prevent field drift).
-/// `content_type` is the body MIME (after group C it is always text/html;
+/// constructor to prevent field drift.
+/// `content_type` is the body MIME (it is always text/html;
 /// weibo markdown pre-rendering is now marked explicitly via
 /// EntryMeta.prerendered_html).
 pub fn make_entry(

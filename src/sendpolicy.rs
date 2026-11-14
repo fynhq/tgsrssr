@@ -1,9 +1,9 @@
 //! Send policy: per-chat pacing, flood-control backoff, and retryable-error
 //! classification for Telegram sends.
 //!
-//! Extracted from push.rs (batch-B2 architecture refactor) so the
-//! rate-limiting / retry-strategy concern lives apart from message rendering
-//! and media orchestration. Pure policy — no rendering, no DB.
+//! Extracted from push.rs so the rate-limiting / retry-strategy concern lives
+//! apart from message rendering and media orchestration. Pure policy — no
+//! rendering, no DB.
 
 use std::borrow::Cow;
 use std::collections::HashMap;

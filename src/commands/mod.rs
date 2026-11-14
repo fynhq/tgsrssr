@@ -968,7 +968,7 @@ async fn handle_test(
     };
 
     // Entry detail log: id, title, content_type, body length, sidecar metadata.
-    // Group C: poll/retweet-image/prerendered markers are now carried by EntryMeta; no longer checking in-body markers.
+    // Poll/retweet-image/prerendered markers are now carried by EntryMeta; no longer checking in-body markers.
     let body_len = entry
         .content
         .as_ref()
@@ -980,7 +980,7 @@ async fn handle_test(
         .as_ref()
         .map(|c| c.content_type.as_str())
         .unwrap_or("(none)");
-    // Group C sidecar: look up structured metadata by entry_id (populated for platform sources, always empty for RSS feeds).
+    // Sidecar: look up structured metadata by entry_id (populated for platform sources, always empty for RSS feeds).
     // Consistent with the scheduler's main push path, use fetcher::entry_id (guards against drift in the fallback branch when entry.id is empty).
     let meta = fr.metas.get(&fetcher::entry_id(entry));
     let has_poll = meta.and_then(|m| m.poll.as_ref()).is_some();
@@ -1559,14 +1559,14 @@ fn parse_tg_message_link(link: &str) -> Option<(String, i64)> {
 // ===== Helpers =====
 
 /// Retire a pending-op prompt by editing it into a plain status line.
-/// The implementation is consolidated in push::retire_prompt (batch A3: cut the
-/// callbacks→commands reverse dependency edge; re-exported here so existing call paths stay unchanged).
+/// The implementation is consolidated in push::retire_prompt (cutting the
+/// callbacks→commands reverse dependency edge); re-exported here so existing call paths stay unchanged.
 pub use crate::push::retire_prompt;
 
 /// Load a subscription by id and verify the user still owns its channel.
 /// Returns Some(sub) when owned, None when the sub is gone or the user lacks
-/// permission (prompt already retired with a message). L8 fix: RenameSub and
-/// SetFilterKeywords duplicated this fail-closed load+permission block.
+/// permission (prompt already retired with a message). RenameSub and
+/// SetFilterKeywords previously duplicated this fail-closed load+permission block.
 async fn load_sub_owned(
     bot: &Bot,
     state: &AppState,

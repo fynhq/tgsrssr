@@ -61,8 +61,8 @@ pub fn channel_header_text(
 // HTML helpers (imported via the `use` at the top).
 // Rate-limiting/backoff policy (pacer, SendRetryState, SendRetryPolicy)
 // moved to crate::sendpolicy (imported via the `use` at the top).
-// The Weibo poll data marker has been migrated to EntryMeta.poll (group-C
-// sidecar); RE_VOTE_DIV has been removed.
+// The Weibo poll data marker has been migrated to EntryMeta.poll (sidecar);
+// RE_VOTE_DIV has been removed.
 
 /// Visible-length budget used by the standard text path.
 ///

@@ -3,8 +3,8 @@
 //! This module contains **no async code and no bot/db dependencies** — only
 //! synchronous string/HTML manipulation: escaping, UTF-16 measurement,
 //! message splitting, blockquote folding, and entity decoding.
-//! Extracted from push.rs (batch-2 architecture refactor) to isolate the
-//! text-processing concern from the send-orchestration concern.
+//! Extracted from push.rs to isolate the text-processing concern from the
+//! send-orchestration concern.
 
 use std::sync::LazyLock;
 
@@ -1715,7 +1715,7 @@ mod tests {
     fn split_pre_oversized_single_line_hard_split() {
         // An oversized single line in a pre code block (no \n) must be
         // hard-split on UTF-16 boundaries; it must not pass through whole
-        // and produce a chunk over 4096 (H1 regression test).
+        // and produce a chunk over 4096 (regression test).
         let long_line = "x".repeat(9000); // Oversized single line with no newline
         let html = format!("<pre><code>{}</code></pre>", long_line);
         let chunks = split_html(&html, 4096);
@@ -1795,7 +1795,7 @@ mod tests {
     fn fold_nested_blockquote_no_orphan_close_tag() {
         // Nested blockquote: the positional scan must locate the outermost
         // closing tag and must not truncate at the first inner
-        // </blockquote>, leaving an orphan closing tag (M10 regression test).
+        // </blockquote>, leaving an orphan closing tag (regression test).
         let out = normalize_blockquote_fold(
             "<blockquote>外层 <blockquote>内层</blockquote> 结尾</blockquote>",
         );
@@ -1816,7 +1816,7 @@ mod tests {
         assert!(out.contains("甲") && out.contains("乙"), "got: {}", out);
     }
 
-    // ===== split_html_safe: tag/entity atomicity (P1 batch A) =====
+    // ===== split_html_safe: tag/entity atomicity =====
 
     fn tag_balanced(c: &str) -> bool {
         c.matches("<a ").count() == c.matches("</a>").count()
@@ -1827,7 +1827,7 @@ mod tests {
 
     #[test]
     fn split_safe_long_anchor_never_splits_tag() {
-        // The original defect (P1#1): a single oversized anchor paragraph was
+        // The original defect: a single oversized anchor paragraph was
         // hard-split inside the opening `<a href=…>` tag, leaving a chunk
         // starting with a bare `href="…"`. Every chunk must now be well-formed.
         // The limit stays above the open-tag width so a split point exists.
@@ -1920,7 +1920,7 @@ mod tests {
 
     #[test]
     fn split_html_oversized_bare_pre_rewraps_wellformed() {
-        // End-to-end (P1#2): external feeds commonly emit bare <pre> with no
+        // End-to-end: external feeds commonly emit bare <pre> with no
         // inner <code>. The old code matched only <pre><code>, left the
         // original <pre> inside the extracted content and re-wrapped it,
         // producing <pre><code><pre>… (double open). Every chunk must now have
@@ -1943,7 +1943,7 @@ mod tests {
 
     #[test]
     fn split_html_oversized_anchor_wellformed() {
-        // End-to-end (P1#1): an anchor whose text alone exceeds the limit is
+        // End-to-end: an anchor whose text alone exceeds the limit is
         // routed to split_html_safe via the no-tag branch; the old fallback
         // cut inside `<a href=…>`. Now every chunk must keep <a> balanced.
         let inner = "字".repeat(200);

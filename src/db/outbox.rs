@@ -17,7 +17,7 @@ pub struct OutboxRow {
     pub feed_title: String,
     pub entry_json: String,
     pub media_json: String,
-    /// Group-C sidecar: serialized EntryMeta JSON (empty string means no
+    /// Sidecar: serialized EntryMeta JSON (empty string means no
     /// metadata).
     pub meta_json: String,
     pub content_mode: String,

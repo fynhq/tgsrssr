@@ -194,7 +194,7 @@ pub(crate) fn push_line(msg: &mut String, lang: Lang, label_key: &str, value: &s
     }
 }
 
-/// Unified construction of push-failure notifications (M5 fix: the original
+/// Unified construction of push-failure notifications (the original
 /// 4 format! templates were verbatim duplicates).
 /// header = the text inside the parentheses (e.g. "queued for retry" /
 /// "abandoned" / "enqueue failed, entry lost"), reason = the details

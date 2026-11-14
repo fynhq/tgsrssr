@@ -250,7 +250,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Scheduler: fetch job + cleanup job + auto-heal job
+    // Scheduler: fetch + auto-heal + cleanup + outbox retry + pending-ops sweep
     let mut sched = JobScheduler::new().await?;
     scheduler::register_fetch_job(&sched, state.clone(), bot.clone()).await?;
     scheduler::register_heal_job(&sched, state.clone()).await?;

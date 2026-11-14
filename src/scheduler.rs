@@ -685,7 +685,7 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
     // text without media); a meta_json failure degrades to no meta (the retry
     // loses the poll/prerendered markers) — neither loses the entry.
     let media_json = serde_json::to_string(media_items).unwrap_or_default();
-    // Group-C sidecar: serialize EntryMeta so it can be restored on retry.
+    // Sidecar: serialize EntryMeta so it can be restored on retry.
     let meta_json = meta
         .map(|m| serde_json::to_string(m).unwrap_or_default())
         .unwrap_or_default();
@@ -1078,7 +1078,7 @@ async fn prepare_entry_for_send(
     storage_notice_sent: &mut bool,
 ) -> anyhow::Result<Result<EntryPrep, EntryPrepAction>> {
     let eid = entry_id;
-    // Group-C sidecar: structured metadata by entry_id (empty for RSS).
+    // Sidecar: structured metadata by entry_id (empty for RSS).
     let meta = fr.metas.get(eid);
     let prepared = if opts.mode.skip_media() {
         crate::media::PreparedMedia::empty()
@@ -2370,7 +2370,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             }
         }
 
-        // Group-C sidecar: the meta for outbox retries comes from the
+        // Sidecar: the meta for outbox retries comes from the
         // meta_json column. An empty string or a deserialization failure is
         // treated as no meta (compatibility with historical rows; behavior
         // degrades to pure text).
@@ -2383,10 +2383,10 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
 
         // Attempt send
         let result = if media_items.is_empty() {
-            // The pure-text path uniformly goes through send_text_only (H1 fix:
-            // converged with the main push path into a single function; the
-            // poll-resend logic had previously been fixed twice due to dual-path
-            // drift, v1.9.3/v1.9.6).
+            // The pure-text path uniformly goes through send_text_only; it was
+            // converged with the main push path into a single function because
+            // the poll-resend logic had previously been fixed twice due to
+            // dual-path drift (v1.9.3/v1.9.6).
             push::send_text_only(
                 bot,
                 chat_id,

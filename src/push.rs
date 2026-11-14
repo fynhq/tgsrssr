@@ -75,8 +75,8 @@ pub fn no_preview() -> teloxide::types::LinkPreviewOptions {
 /// single text edit suffices. If the edit fails (e.g. message too old) the
 /// message is left in place — never deleted.
 ///
-/// Defined in push.rs (batch A3: breaks the callbacks→commands reverse
-/// dependency edge); commands keeps a re-export to preserve existing call
+/// Defined in push.rs (breaks the callbacks→commands reverse dependency
+/// edge); commands keeps a re-export to preserve existing call
 /// paths.
 pub async fn retire_prompt(
     bot: &Bot,
@@ -128,7 +128,7 @@ pub struct SendOutcome {
     pub text_partial: bool,
 }
 
-/// Extract Weibo poll data from EntryMeta (group-C sidecar explicit protocol,
+/// Extract Weibo poll data from EntryMeta (sidecar explicit protocol,
 /// replacing the former in-body data-vote marker parsing). Returns
 /// (question, options, is_multi_select).
 /// Telegram limits: question ≤300 chars, options 2-10 items of ≤100 chars each.
@@ -269,8 +269,8 @@ pub async fn try_send_poll(
     false
 }
 
-/// Unified helper for the plain-text send path (H1 fix: the scheduler main
-/// push and the outbox retry previously duplicated
+/// Unified helper for the plain-text send path. The scheduler main push and
+/// the outbox retry previously duplicated
 /// format_entry_parts→send_entry_msg→try_send_poll→SendOutcome verbatim,
 /// and the poll follow-up logic had been fixed twice because of it
 /// (v1.9.3/v1.9.6); converged into a single function to prevent further
@@ -763,7 +763,7 @@ pub struct PushCtx<'a> {
     pub caption_above_media: bool,
     pub aspect_threshold: f64,
     pub media: &'a [MediaItem],
-    /// Structured entry metadata (group-C sidecar); None for RSS feeds /
+    /// Structured entry metadata (sidecar); None for RSS feeds /
     /// legacy outbox behavior.
     pub meta: Option<&'a crate::entrymeta::EntryMeta>,
 }
@@ -1428,7 +1428,7 @@ pub async fn send_entry_with_media(
         }
     }
 
-    // P1-1 fix (v1.10.21): the first caption chunk is attached to the first
+    // The first caption chunk is attached to the first
     // carrier (document/retweet images). If all carriers fail (both anchor
     // and first_doc_msg are None), the first 1024 characters of the body
     // were never delivered — even if the overflow text succeeded, the entry
@@ -1830,9 +1830,9 @@ async fn send_rich_ops(
     Ok((ops.len(), first_msg))
 }
 
-/// send_rich_ops + bounded backoff with resume on network errors (M3 fix:
-/// the main rich_ops and rt_photos sites previously duplicated the same
-/// loop verbatim). Only connection-class errors that are "definitely not
+/// send_rich_ops + bounded backoff with resume on network errors. The main
+/// rich_ops and rt_photos sites previously duplicated the same loop
+/// verbatim; only connection-class errors that are "definitely not
 /// delivered" are retried, resuming after the last successful op; already
 /// delivered parts are never re-sent.
 #[allow(clippy::too_many_arguments)]
@@ -1923,7 +1923,7 @@ async fn send_rich_ops_with_retry(
 /// When `reply_to` is set, the message quotes the specified message
 /// (follow-up groups quote the first group).
 ///
-/// D1 convergence: the file_id cache retry + flood backoff skeleton was
+/// The file_id cache retry + flood backoff skeleton was
 /// extracted into send_with_cache_retry; each media-type branch only
 /// provides a closure that "builds and sends the request given use_cache".
 #[allow(clippy::too_many_arguments)]
@@ -2059,7 +2059,7 @@ async fn send_op(
     }
 }
 
-/// Generic skeleton for file_id cache retry + flood backoff (D1 convergence).
+/// Generic skeleton for file_id cache retry + flood backoff.
 /// `attempt(use_cache)` builds and sends the request; when a file_id is
 /// rejected the cache is invalidated and it retries once with caching off;
 /// on flood 429 it backs off as Telegram requires, then retries.

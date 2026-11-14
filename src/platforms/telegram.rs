@@ -275,7 +275,7 @@ pub async fn fetch_telegram_channel(
             break;
         }
         // Response body size cap (20MB): shares read_body_capped with the RSS
-        // fetch path (M8 fix: the two former call sites repeated the same
+        // fetch path (the two former call sites repeated the same
         // bytes_stream loop verbatim). Streamed read; aborts as soon as the
         // limit is exceeded.
         let ctx = format!("Telegram channel @{} page {}", channel, page + 1);

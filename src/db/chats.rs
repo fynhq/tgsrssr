@@ -4,8 +4,8 @@ use super::*;
 
 /// Classify a Telegram chat for the DB chat_type column.
 /// Accepts the three predicates so it works with both `Chat` and `ChatFullInfo`.
-/// Defined in db.rs (batch A3: breaks the callbacks→commands reverse
-/// dependency edge); commands keeps a re-export to preserve existing call paths.
+/// Defined in db.rs (breaks the callbacks→commands reverse dependency edge);
+/// commands keeps a re-export to preserve existing call paths.
 pub fn chat_type_str(is_channel: bool, is_group: bool, is_supergroup: bool) -> &'static str {
     if is_channel {
         "channel"
