@@ -2,7 +2,7 @@ mod pending;
 mod policy;
 mod send_effects;
 
-use send_effects::SendSuccessCtx;
+use send_effects::{apply_send_success, SendSuccessCtx, SendSuccessExtras};
 
 use teloxide::prelude::*;
 use tokio::sync::Semaphore;
@@ -1257,46 +1257,22 @@ async fn send_and_handle(ctx: &SendAndHandleCtx<'_>) -> anyhow::Result<EntrySend
                 chat_title,
                 lang,
             };
-            // A1 policy: a rich-message ambiguity still marks the entry sent
-            // but asks the owner to verify the channel.
-            effects.notify_uncertain(&send_outcome).await;
-            effects.notify_text_partial(&send_outcome).await;
-            clear_send_failure(state, &cfg.chat_id, &cfg.feed_url).await;
-            if !notify_warnings.is_empty() {
-                notify_download_failed(
-                    bot,
-                    lang,
+            apply_send_success(
+                &effects,
+                &send_outcome,
+                &SendSuccessExtras {
                     owner_id,
                     feed_title,
-                    notify_warnings,
+                    entry_link: &entry_link,
+                    download_warnings: notify_warnings,
+                    oversized,
+                    notify_oversized,
                     dl_retry_note,
-                    send_outcome.delivered_tg_link.as_deref(),
-                    &entry_link,
-                )
-                .await;
-            }
-            effects.notify_media_failed(&send_outcome).await;
-            if notify_oversized {
-                for ov in oversized {
-                    notify_oversized_video(
-                        bot,
-                        lang,
-                        owner_id,
-                        chat_title,
-                        &entry_link,
-                        send_outcome.delivered_tg_link.as_deref(),
-                        send_outcome.text_only,
-                        ov,
-                    )
-                    .await;
-                }
-            }
-            effects
-                .record_and_mark_sent(
-                    &send_outcome,
-                    "mark_entry_sent failed after successful delivery (may re-push next cycle)",
-                )
-                .await;
+                    outbox_row_id: None,
+                },
+                "mark_entry_sent failed after successful delivery (may re-push next cycle)",
+            )
+            .await;
             Ok(EntrySendAction::Continue)
         }
         Err(e) => {
@@ -2196,6 +2172,14 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         );
     }
 
+    let due_count = due_ids.len();
+    let round_started = std::time::Instant::now();
+    let mut sent = 0usize;
+    let mut retried = 0usize;
+    let mut abandoned = 0usize;
+    let mut dropped = 0usize;
+    let mut skipped = 0usize;
+
     let transport = crate::media::MediaTransport::new(&state.config);
 
     for id in due_ids {
@@ -2203,9 +2187,13 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         // entry_json values, so the id list is the only shared batch state.
         let row = match db::outbox_get(&state.db, id).await {
             Ok(Some(row)) => row,
-            Ok(None) => continue,
+            Ok(None) => {
+                dropped += 1;
+                continue;
+            }
             Err(e) => {
                 warn!(outbox_id = id, error = %e, "outbox: row fetch failed, skipping");
+                skipped += 1;
                 continue;
             }
         };
@@ -2223,11 +2211,13 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 if let Err(e) = db::outbox_delete(&state.db, row.id).await {
                     warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete entry");
                 }
+                dropped += 1;
                 continue;
             }
             Ok(false) => {}
             Err(e) => {
                 warn!(entry_id = %row.entry_id, error = %e, "outbox: is_entry_sent check failed, skipping this round (fail-closed)");
+                skipped += 1;
                 continue;
             }
         }
@@ -2247,6 +2237,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 "outbox entry abandoned after 72h of retries"
             );
             abandon_outbox_row(bot, state, &row, "notif_timeout_72h").await;
+            abandoned += 1;
             continue;
         }
 
@@ -2258,6 +2249,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 if let Err(e) = db::outbox_delete(&state.db, row.id).await {
                     warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete entry");
                 }
+                dropped += 1;
                 continue;
             }
         };
@@ -2312,6 +2304,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 "outbox entry abandoned: MediaOnly without sendable media"
             );
             abandon_outbox_row(bot, state, &row, reason).await;
+            abandoned += 1;
             continue;
         }
 
@@ -2349,6 +2342,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 if let Err(e) = db::outbox_delete(&state.db, row.id).await {
                     warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete entry");
                 }
+                dropped += 1;
                 continue;
             }
         };
@@ -2365,11 +2359,13 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 if let Err(e) = db::outbox_delete(&state.db, row.id).await {
                     warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete entry");
                 }
+                dropped += 1;
                 continue;
             }
             Ok(false) => {}
             Err(e) => {
                 warn!(entry_id = %row.entry_id, error = %e, "outbox: second is_entry_sent check failed, skipping this round (fail-closed)");
+                skipped += 1;
                 continue;
             }
         }
@@ -2424,26 +2420,28 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         match result {
             Ok(send_outcome) => {
                 info!(entry_id = %row.entry_id, feed = %row.feed_url, "outbox retry succeeded");
+                sent += 1;
                 // Resolve the owner-facing context only when a notice is
                 // actually needed; a successful retry usually needs none.
                 let needs_notice = send_outcome.text_partial
                     || send_outcome.media_failed
                     || send_outcome.uncertain;
-                let (chat_title, lang) = if needs_notice {
+                let (chat_title, lang, owner_id) = if needs_notice {
                     let chat_title = db::get_chat(&state.db, &row.chat_id)
                         .await
                         .ok()
                         .flatten()
                         .and_then(|c| c.title.or(c.username))
                         .unwrap_or_else(|| row.chat_id.clone());
-                    let lang = match db::get_chat_owner(&state.db, &row.chat_id).await {
-                        Ok(Some(owner)) => owner_lang(state, owner).await,
-                        _ => Lang::En,
+                    let (lang, owner_id) = match db::get_chat_owner(&state.db, &row.chat_id).await {
+                        Ok(Some(owner)) => (owner_lang(state, owner).await, Some(owner)),
+                        _ => (Lang::En, None),
                     };
-                    (chat_title, lang)
+                    (chat_title, lang, owner_id)
                 } else {
-                    (String::new(), Lang::En)
+                    (String::new(), Lang::En, None)
                 };
+                let entry_link = fetcher::entry_link(&entry).unwrap_or_default();
                 let effects = SendSuccessCtx {
                     bot,
                     state,
@@ -2453,31 +2451,22 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     chat_title: &chat_title,
                     lang,
                 };
-                clear_send_failure(state, &row.chat_id, &row.feed_url).await;
-                effects.notify_text_partial(&send_outcome).await;
-                // The retry path uses the standard send chain (allow_rich is
-                // false), so `uncertain` should not occur here; handling it
-                // anyway keeps this path aligned with the fetch path if the
-                // send chain changes.
-                effects.notify_uncertain(&send_outcome).await;
-                // The retry may deliver the text while its media is
-                // permanently lost (expired/rejected). Surface the same
-                // media_failed notice as the main path; otherwise the owner
-                // only sees the earlier "queued" message and never learns that
-                // the media was dropped.
-                effects.notify_media_failed(&send_outcome).await;
-                effects
-                    .record_and_mark_sent(
-                        &send_outcome,
-                        "outbox: failed to mark entry sent (may re-push on re-subscribe)",
-                    )
-                    .await;
-                if let Err(e) = db::outbox_delete(&state.db, row.id).await {
-                    warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete entry");
-                }
-                db::delete_setting(&state.db, &db::setting_key::outbox_media_lost(row.id))
-                    .await
-                    .ok();
+                apply_send_success(
+                    &effects,
+                    &send_outcome,
+                    &SendSuccessExtras {
+                        owner_id,
+                        feed_title: &row.feed_title,
+                        entry_link: &entry_link,
+                        download_warnings: &[],
+                        oversized: &[],
+                        notify_oversized: false,
+                        dl_retry_note: "",
+                        outbox_row_id: Some(row.id),
+                    },
+                    "outbox: failed to mark entry sent (may re-push on re-subscribe)",
+                )
+                .await;
             }
             Err(e) => {
                 if let Some(new_id) = migrated_chat_id_from_error(&e) {
@@ -2488,6 +2477,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                                 new_chat_id = %new_id,
                                 "outbox row migrated after send error"
                             );
+                            skipped += 1;
                             continue;
                         }
                         Err(me) => warn!(
@@ -2499,6 +2489,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     }
                 }
                 let attempts = row.attempts + 1;
+                retried += 1;
                 let backoff = outbox_backoff_secs(attempts);
                 let retry_now = chrono::Utc::now().timestamp();
                 let next_retry = retry_now + backoff;
@@ -2525,6 +2516,16 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             }
         }
     }
+    info!(
+        due = due_count,
+        sent,
+        retried,
+        abandoned,
+        dropped,
+        skipped,
+        elapsed_ms = round_started.elapsed().as_millis() as u64,
+        "outbox retry: summary"
+    );
     Ok(())
 }
 
