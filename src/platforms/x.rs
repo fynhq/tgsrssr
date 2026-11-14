@@ -1900,6 +1900,27 @@ mod tests {
     }
 
     #[test]
+    fn fixture_timeline_instructions_cover_all_supported_shapes() {
+        // Shape regression fixture: direct tweet, visibility wrapper, thread
+        // items, pinned entry, top/bottom cursors and the suggest-cursor
+        // instruction. All identifiers are synthetic.
+        let instructions: Value =
+            serde_json::from_str(include_str!("fixtures/x_user_tweets_instructions.json"))
+                .expect("fixture JSON");
+        let page = extract_timeline_page(&instructions);
+        assert_eq!(page.non_cursor_entries, 3);
+        assert_eq!(page.tweets.len(), 4);
+        let ids: Vec<&str> = page
+            .tweets
+            .iter()
+            .filter_map(|tweet| tweet["rest_id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["9001", "9002", "9003", "9004"]);
+        assert_eq!(page.bottom_cursor.as_deref(), Some("fixture-bottom-cursor"));
+        assert!(page.unhandled_instructions.is_empty());
+    }
+
+    #[test]
     fn extract_timeline_page_reports_unhandled_instruction_types() {
         // A future timeline redesign may move tweets into a new instruction
         // type. Known ones (AddEntries/AddEntry/SuggestCursor) are parsed and

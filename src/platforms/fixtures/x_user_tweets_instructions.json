@@ -1,0 +1,99 @@
+[
+  {
+    "type": "TimelinePinEntry",
+    "entry": {
+      "entryId": "tweet-1000",
+      "content": {
+        "itemContent": {
+          "tweet_results": {
+            "result": {
+              "rest_id": "1000",
+              "legacy": { "full_text": "pinned placeholder" }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "TimelineAddEntries",
+    "entries": [
+      {
+        "entryId": "tweet-9001",
+        "content": {
+          "itemContent": {
+            "tweet_results": {
+              "result": {
+                "__typename": "Tweet",
+                "rest_id": "9001",
+                "legacy": { "full_text": "direct tweet" }
+              }
+            }
+          }
+        }
+      },
+      {
+        "entryId": "tweet-9002",
+        "content": {
+          "itemContent": {
+            "tweet_results": {
+              "result": {
+                "__typename": "TweetWithVisibilityResults",
+                "tweet": {
+                  "rest_id": "9002",
+                  "legacy": { "full_text": "visibility-wrapped tweet" }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "entryId": "profile-conversation-9003",
+        "content": {
+          "items": [
+            {
+              "item": {
+                "itemContent": {
+                  "tweet_results": {
+                    "result": {
+                      "rest_id": "9003",
+                      "legacy": { "full_text": "thread root" }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "item": {
+                "itemContent": {
+                  "tweet_results": {
+                    "result": {
+                      "rest_id": "9004",
+                      "legacy": { "full_text": "thread reply" }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "entryId": "cursor-top-0",
+        "content": { "cursorType": "Top", "value": "fixture-top-cursor" }
+      },
+      {
+        "entryId": "cursor-bottom-0",
+        "content": { "cursorType": "Bottom", "value": "fixture-bottom-cursor" }
+      }
+    ]
+  },
+  {
+    "type": "TimelineSuggestCursor",
+    "entry": {
+      "entryId": "cursor-bottom-suggest",
+      "content": { "cursorType": "Bottom" }
+    }
+  }
+]
