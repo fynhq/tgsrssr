@@ -1,36 +1,14 @@
-//! In-memory command rate limiting and quota helpers.
-//!
-//! `/sub` and `/test` share one sliding-window limiter per non-admin user
-//! (10 calls per minute, no daily cap). The limiter is intentionally in-memory:
-//! a restart resets it, which is acceptable for an anti-abuse guard on a
-//! closed admin/whitelist deployment.
-//!
-//! Subscription quotas (per channel / per user / platform sources) are
-//! enforced from DB counts in the command layer; see `commands::handle_sub`.
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// `/sub` + `/test` calls allowed per non-admin user per window.
 pub const COMMANDS_PER_MINUTE: usize = 10;
-/// Sliding window length.
 pub const COMMAND_WINDOW: Duration = Duration::from_secs(60);
-/// Upper bound on tracked users. Allowed users are finite (admin + whitelist),
-/// but the map is capped anyway so a future access-control regression cannot
-/// grow it without bound.
 const MAX_TRACKED_USERS: usize = 4096;
-/// Maximum URLs accepted by a single `/sub` invocation (all users).
 pub const MAX_URLS_PER_SUB: usize = 10;
-/// Maximum cookie length accepted by the `/cookies` input flow.
 pub const MAX_COOKIE_CHARS: usize = 4096;
-/// Maximum feed-filter keyword string length accepted by the filter panel.
 pub const MAX_FILTER_KEYWORDS_CHARS: usize = 500;
 
-/// Sliding-window rate limiter keyed by user ID.
-///
-/// `allow_at` takes an explicit `Instant` so tests can simulate window
-/// expiry without sleeping.
 pub struct CommandRateLimiter {
     inner: Mutex<HashMap<i64, VecDeque<Instant>>>,
 }
@@ -42,7 +20,6 @@ impl CommandRateLimiter {
         }
     }
 
-    /// Record a call for `user_id` and report whether it is allowed.
     pub fn allow(&self, user_id: i64) -> bool {
         self.allow_at(user_id, Instant::now())
     }
@@ -53,10 +30,6 @@ impl CommandRateLimiter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if map.len() >= MAX_TRACKED_USERS {
-            // Drop queues whose calls have all left the window. If every
-            // tracked user is still active, fail closed for a new user instead
-            // of growing the map past the cap; silently exceeding the bound
-            // defeats the purpose of MAX_TRACKED_USERS.
             map.retain(|_, q| {
                 q.back()
                     .map(|t| now.duration_since(*t) < COMMAND_WINDOW)
@@ -88,13 +61,10 @@ impl Default for CommandRateLimiter {
     }
 }
 
-/// One decision point shared by `/sub` and `/test`: admins are exempt.
 pub fn allow_command(is_admin: bool, limiter: &CommandRateLimiter, user_id: i64) -> bool {
     is_admin || limiter.allow(user_id)
 }
 
-/// Subscription quota predicate: `cap <= 0` means unlimited; otherwise the
-/// post-add count must not exceed the cap.
 pub fn within_cap(cap: i64, current: i64, adding: i64) -> bool {
     cap <= 0 || current.saturating_add(adding) <= cap
 }
@@ -155,7 +125,6 @@ mod tests {
             !allow_command(false, &limiter, 7),
             "non-admin is rate limited"
         );
-        // Admin bypasses the limiter entirely.
         for _ in 0..100 {
             assert!(
                 allow_command(true, &limiter, 1),

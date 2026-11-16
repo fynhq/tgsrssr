@@ -1,7 +1,3 @@
-//! Settings pages: channel-level config, feed-level overrides, option pages.
-//! Split out of callbacks/mod.rs; behavior unchanged.
-//! Uses shared panel helpers from `crate::ui`.
-
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
@@ -16,9 +12,6 @@ use crate::ui::{
     fmt_interval, fmt_source_display, load_sub_or_deliver, PageTarget,
 };
 
-/// Shows current values with a ✓ and lets the owner switch them in place.
-/// Settings main page: three second-level entries + caption/link-preview
-/// toggles.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn render_settings_page(
     bot: &Bot,
@@ -85,33 +78,20 @@ pub(super) async fn render_settings_page(
     Ok(())
 }
 
-/// Data-driven option page spec (6 near-identical render functions
-/// collapsed into one renderer + declarative specs).
 struct OptionPageSpec {
     title: String,
-    /// Option rows: each row is a list of (display_label, callback_value) pairs.
     rows: Vec<Vec<(&'static str, String)>>,
-    /// Currently selected value (gets ✓ mark).
     current: String,
-    /// For feed-level: whether the value is overridden (✏️) vs inherited (🔗).
     overridden: bool,
-    /// When true (feed-level), ✓ is shown only if overridden AND value matches.
-    /// When false (channel-level), ✓ is shown unconditionally on match.
     require_override_for_mark: bool,
-    /// Value op (config/source interval/mode/source).
     op: CallbackOp,
-    /// ID segment (chat_id or sub_id as string).
     id_seg: String,
-    /// Page positions carried through the value selection.
     ch_page: usize,
     chlist_page: usize,
-    /// Back button callback data.
     back_cb: String,
-    /// Show the "follow channel" inherit button (feed-level only).
     show_inherit: bool,
 }
 
-/// Render an option selection page from a declarative spec.
 async fn render_option_page(
     bot: &Bot,
     target: &PageTarget<'_>,
@@ -163,7 +143,6 @@ async fn render_option_page(
     Ok(())
 }
 
-/// Second-level page: push interval options.
 pub(super) async fn render_settings_interval(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -205,7 +184,6 @@ pub(super) async fn render_settings_interval(
     render_option_page(bot, &target, &spec, lang).await
 }
 
-/// Second-level page: content mode options.
 pub(super) async fn render_settings_mode(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -243,7 +221,6 @@ pub(super) async fn render_settings_mode(
     render_option_page(bot, &target, &spec, lang).await
 }
 
-/// Second-level page: source display options.
 pub(super) async fn render_settings_source(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -278,11 +255,6 @@ pub(super) async fn render_settings_source(
     render_option_page(bot, &target, &spec, lang).await
 }
 
-/// Load chat config, creating the row on first access.
-/// Tolerant variant for DISPLAY paths (render_*): a transient DB read error
-/// falls back to the default row so the panel still renders. Write/toggle
-/// paths must use `load_chat_config_checked` instead — toggling from a wrong
-/// baseline persists an override contradicting the user's real setting.
 pub(super) async fn load_chat_config(db: &crate::db::Db, chat_id: &str) -> db::ChatConfigRow {
     match load_chat_config_checked(db, chat_id).await {
         Ok(c) => c,
@@ -290,10 +262,6 @@ pub(super) async fn load_chat_config(db: &crate::db::Db, chat_id: &str) -> db::C
     }
 }
 
-/// Strict variant for WRITE/toggle paths: propagates a DB read error so the
-/// caller aborts (the callback wrapper answers and clears the spinner) rather
-/// than writing an override computed from a wrong default baseline. A genuinely
-/// missing row (Ok(None)) is still a valid "use defaults" case, not an error.
 pub(super) async fn load_chat_config_checked(
     db: &crate::db::Db,
     chat_id: &str,
@@ -318,7 +286,6 @@ fn default_chat_config(chat_id: String) -> db::ChatConfigRow {
     }
 }
 
-/// Canonical stored value for the option page's ✓ comparison.
 fn content_mode_value(m: &str) -> &'static str {
     match ContentMode::from_str(m) {
         ContentMode::TitleSummary => "title_summary",
@@ -338,10 +305,6 @@ fn source_display_value(s: &str) -> &'static str {
     }
 }
 
-/// Second-level page: feed-level push interval override.
-/// `chlist_page` is the channel-list page carried through the round trip so
-/// "back to feed page" → "back to channel page" → "back to channel list"
-/// keeps the user's original positions.
 pub(super) async fn render_feed_interval(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -387,7 +350,6 @@ pub(super) async fn render_feed_interval(
     render_option_page(bot, &target, &spec, lang).await
 }
 
-/// Second-level page: feed-level content mode override.
 pub(super) async fn render_feed_mode(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -429,7 +391,6 @@ pub(super) async fn render_feed_mode(
     render_option_page(bot, &target, &spec, lang).await
 }
 
-/// Second-level page: feed-level source display override.
 pub(super) async fn render_feed_source(
     bot: &Bot,
     target: PageTarget<'_>,

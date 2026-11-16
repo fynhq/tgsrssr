@@ -1,3 +1,4 @@
+//! SQLite setup, schema helpers and shared row/setting types.
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
@@ -22,41 +23,19 @@ pub use subs::*;
 
 pub type Db = SqlitePool;
 
-/// Unified constructor for settings-table key names.
-///
-/// Previously the various runtime keys (cookie / cookie_expired_notified /
-/// platform_health / platform_streak / media_dl_fail) were hand-assembled with
-/// `format!` scattered across scheduler / callbacks / platforms — a single
-/// mistyped character produced no error and silently disabled the key.
-/// Centralizing them here means the key formats have a single definition,
-/// eliminating cross-file inconsistencies.
-///
-/// Since v1.11.0 the cookie and platform-health keys are global (no user_id
-/// segment): cookies are configured once by admins and shared by all users;
-/// platform health state was globalized accordingly. The old per-user keys
-/// are cleaned up at startup by migration logic in main.rs.
 pub mod setting_key {
-    /// Global platform login cookie: `cookie:<platform>`
     pub fn cookie(platform: &str) -> String {
         format!("cookie:{}", platform)
     }
-    /// Cookie-expired notification flag: `cookie_expired_notified:<platform>`
     pub fn cookie_expired_notified(platform: &str) -> String {
         format!("cookie_expired_notified:{}", platform)
     }
-    /// Platform health state (ok/down): `platform_health:<platform>`
     pub fn platform_health(platform: &str) -> String {
         format!("platform_health:{}", platform)
     }
-    /// Platform health hysteresis streak counter: `platform_streak:<platform>`
     pub fn platform_streak(platform: &str) -> String {
         format!("platform_streak:{}", platform)
     }
-    /// Media-only mode download-failure retry counter:
-    /// `media_dl_fail:<chat_id>:<feed_url_chars>:<feed_url>:<entry_id>`.
-    /// The length prefix prevents one source's prefix cleanup from deleting
-    /// another source's counter when one URL is a prefix of the other
-    /// (e.g. `http://h` vs `http://h:1200/x`).
     pub fn media_dl_fail(chat_id: &str, feed_url: &str, entry_id: &str) -> String {
         format!(
             "media_dl_fail:{}:{}:{}:{}",
@@ -66,56 +45,27 @@ pub mod setting_key {
             entry_id
         )
     }
-    /// Per-feed auto-disable notification flag: `auto_disable_notified:<chat_id>:<feed_url>`
-    /// Used for edge deduplication — when the same feed is disabled, later
-    /// self-healed, and then fails again, no duplicate notice is sent (#9 fix).
     pub fn auto_disable_notified(chat_id: &str, feed_url: &str) -> String {
         format!("auto_disable_notified:{}:{}", chat_id, feed_url)
     }
-    /// Consecutive-round counter of successful full-body fetches (HTTP 200,
-    /// not 304) that parsed zero entries: `stale_zero:<chat_id>:<feed_url>`.
-    /// Structure-independent silence detector: the per-platform zero-entry
-    /// warns need the platform response structure to still be recognized; if
-    /// a redesign makes the container keys vanish, the parser returns "valid
-    /// empty" and those warns never fire. This counter catches that case after
-    /// a sustained streak (warn log only, no user notification).
     pub fn stale_zero(chat_id: &str, feed_url: &str) -> String {
         format!("stale_zero:{}:{}", chat_id, feed_url)
     }
-    /// One-shot owner notice flag for media that expired while an outbox row
-    /// was waiting for retry: `outbox_media_lost:<outbox_id>`.
-    /// Deleted on success/abandon; cleanup_stale_settings removes orphans.
     pub fn outbox_media_lost(outbox_id: i64) -> String {
         format!("outbox_media_lost:{}", outbox_id)
     }
-    /// Consecutive send failures for one (chat, feed):
-    /// `send_fail:<chat_id>:<feed_url>`. Cleared on the next successful send
-    /// and on source resume; reaching the threshold auto-disables the source
-    /// instead of letting a broken chat enqueue entries for 72 hours.
     pub fn send_fail(chat_id: &str, feed_url: &str) -> String {
         format!("send_fail:{}:{}", chat_id, feed_url)
     }
 }
 
-/// Default config values (single source of truth on the Rust side).
-/// The SQL COALESCE literals must stay in sync with these (sqlx 0.9 forbids
-/// dynamic SQL so they cannot be injected via format!; consistency is asserted
-/// by test_default_constants_match_sql below).
 pub const DEFAULT_INTERVAL_MINUTES: i64 = 30;
 pub const DEFAULT_CONTENT_MODE: &str = "title_link";
 pub const DEFAULT_SOURCE_DISPLAY: &str = "source";
 pub const DEFAULT_CAPTION_ABOVE_MEDIA: i64 = 0;
 pub const DEFAULT_LINK_PREVIEW: i64 = 1;
-/// Upper bound for a per-chat/per-feed fetch interval. A forged or accidental
-/// huge value would make the due comparison never true and silently stop the
-/// source; one day is a generous ceiling.
 pub const MAX_INTERVAL_MINUTES: i64 = 1440;
 
-/// Row types for queries.
-// Some fields (chat_type/enabled etc.) only appear in SQL
-// WHERE/COALESCE and are never read on the Rust side — kept to preserve the
-// complete mapping of the database schema. (Exception: added_by is read on
-// the Rust side by get_chat_owner / can_manage_chat.)
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChatRow {
@@ -127,9 +77,6 @@ pub struct ChatRow {
     pub enabled: i64,
 }
 
-// error_count/last_fetch_at/last_error/auto_disabled/disabled_at are read and
-// written by SQL (due checks / error counting / self-heal cooldown) and never
-// read directly on the Rust side; kept for a complete schema mapping.
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SubRow {
@@ -143,20 +90,12 @@ pub struct SubRow {
     pub error_count: i64,
     pub last_fetch_at: Option<String>,
     pub last_error: Option<String>,
-    /// HTTP conditional-request negotiation headers (server replies 304 when
-    /// the source has not changed, saving a fetch)
     pub http_etag: Option<String>,
     pub http_last_modified: Option<String>,
-    /// 1 = system auto-disabled after consecutive failures (may auto-recover
-    /// after the cooldown); 0 = manually paused (never auto-recovers)
     pub auto_disabled: i64,
-    /// Moment of auto-disable (UTC); the cooldown is measured from this point
     pub disabled_at: Option<String>,
 }
 
-// chat_id/caption_above_media are not read on the Rust side (the caption
-// position is consumed via the COALESCE value in EffectiveConfig); kept for a
-// complete schema mapping.
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChatConfigRow {
@@ -168,7 +107,6 @@ pub struct ChatConfigRow {
     pub link_preview: i64,
 }
 
-/// Effective config for a subscription (after COALESCE).
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct EffectiveConfig {
@@ -186,9 +124,6 @@ pub struct EffectiveConfig {
     pub lp_overridden: bool,
 }
 
-/// Restrict a data path to owner-only permissions on Unix (0600 files,
-/// 0700 directories). No-op on Windows. Failures are logged, never fatal:
-/// a filesystem without permission support must not stop the bot.
 pub(crate) fn restrict_permissions(path: &Path, is_dir: bool) {
     #[cfg(unix)]
     {
@@ -210,10 +145,6 @@ pub(crate) fn restrict_permissions(path: &Path, is_dir: bool) {
     }
 }
 
-/// Normalize legacy Telegram entry ids (`<channel>/<msgid>`) to the new stable
-/// `<msgid>` form in the dedup/outbox tables. Idempotent; no schema change.
-/// Without this, upgrading would make every visible post look new and re-push
-/// the current window. Rows that collide with an existing new id are deleted.
 pub async fn normalize_telegram_entry_ids(db: &Db) -> anyhow::Result<u64> {
     let mut moved = 0u64;
     for table in ["sent_entries", "outbox", "sent_messages"] {
@@ -240,7 +171,6 @@ pub async fn normalize_telegram_entry_ids(db: &Db) -> anyhow::Result<u64> {
 pub async fn connect(db_path: &Path) -> anyhow::Result<Db> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
-        // The data dir holds the DB (and its backups): owner-only on Unix.
         restrict_permissions(parent, true);
     }
 
@@ -251,29 +181,18 @@ pub async fn connect(db_path: &Path) -> anyhow::Result<Db> {
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(5))
         .pragma("journal_size_limit", "52428800")
-        // Memory bounds. SQLite's default page cache is 2 MB per connection
-        // (up to 8 MB for this 4-connection pool); 512 KiB is enough for this
-        // workload (a few thousand small rows) and the OS page cache still
-        // serves hot pages. Temp b-trees stay on disk instead of in RAM, and
-        // mmap is disabled so the DB file does not inflate process RSS.
         .pragma("cache_size", "-512")
         .pragma("temp_store", "1")
         .pragma("mmap_size", "0");
 
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
-        // Reap idle connections so their page caches are returned between
-        // command/fetch bursts; reconnect is cheap for a local SQLite file.
         .idle_timeout(Some(Duration::from_secs(60)))
         .connect_with(options)
         .await?;
 
-    // Run migrations
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    // DB + WAL + SHM: owner-only. SQLite (re)creates the sidecar files on
-    // first write; doing this after connect+migrations covers the files that
-    // exist at startup, and the backup path re-applies it for a fresh DB.
     restrict_permissions(db_path, false);
     for suffix in ["-wal", "-shm"] {
         let sidecar = PathBuf::from(format!("{}{}", db_path.display(), suffix));
@@ -289,11 +208,6 @@ pub async fn connect(db_path: &Path) -> anyhow::Result<Db> {
 mod tests {
     use super::*;
 
-    /// Tripwire: the DEFAULT_* constants must stay in sync with the SQL
-    /// COALESCE literals in get_due_subscriptions / ensure_chat_config
-    /// (sqlx 0.9 forbids dynamic SQL, so they cannot be injected via format!).
-    /// When changing a constant, the SQL literal must be changed too,
-    /// otherwise this test fails.
     #[test]
     fn default_constants_match_sql_literals() {
         assert_eq!(DEFAULT_INTERVAL_MINUTES, 30);
@@ -302,10 +216,6 @@ mod tests {
         assert_eq!(DEFAULT_CAPTION_ABOVE_MEDIA, 0);
         assert_eq!(DEFAULT_LINK_PREVIEW, 1);
 
-        // Ensure the SQL COALESCE fallbacks use the same literals. The old
-        // version only compared the constants with hardcoded numbers and
-        // could never catch SQL drift. The relevant SQL now lives in the
-        // subscriptions/config submodules, so scan them together.
         let src = concat!(
             include_str!("db.rs"),
             include_str!("db/subs.rs"),
@@ -350,8 +260,6 @@ mod tests {
     }
 
     async fn test_pool() -> Db {
-        // Single connection: every sqlite::memory: connection would otherwise
-        // see its own empty database.
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -372,8 +280,6 @@ mod tests {
         .unwrap();
         let sub_id = res.last_insert_rowid();
 
-        // The callback ownership guard may have raced with a deleted/recreated
-        // row: a different chat must never toggle this id.
         assert!(!set_subscription_active(&pool, sub_id, "2", true)
             .await
             .unwrap());
@@ -432,7 +338,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ids, vec!["10", "11", "9"]);
-        // Idempotent: a second startup must not touch anything.
         assert_eq!(normalize_telegram_entry_ids(&pool).await.unwrap(), 0);
     }
 
@@ -474,7 +379,6 @@ mod tests {
         assert!(cfg.caption_above_media);
         assert!(cfg.cp_overridden);
 
-        // A false override must survive COALESCE instead of falling back to the channel value.
         set_feed_config_field(
             &pool,
             "1",
@@ -581,9 +485,6 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        // Old row for a subscription that still exists: must be kept even
-        // though it is past the retention period (re-pushing it after an
-        // inactive period is a regression).
         sqlx::query(
             "INSERT INTO sent_entries (chat_id, feed_url, entry_id, sent_at)
              VALUES ('1', 'https://example.com/feed', 'old-active', datetime('now', '-200 days'))",
@@ -591,7 +492,6 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // Old orphan (subscription removed): cleaned up.
         sqlx::query(
             "INSERT INTO sent_entries (chat_id, feed_url, entry_id, sent_at)
              VALUES ('2', 'https://example.com/gone', 'old-orphan', datetime('now', '-200 days'))",
@@ -599,7 +499,6 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // Recent orphan: kept until the retention period expires.
         sqlx::query(
             "INSERT INTO sent_entries (chat_id, feed_url, entry_id)
              VALUES ('2', 'https://example.com/gone', 'recent-orphan')",
@@ -626,11 +525,6 @@ mod tests {
 
     #[tokio::test]
     async fn vacuum_into_creates_a_sqlite_snapshot() {
-        // The daily backup relies on VACUUM INTO producing a standalone DB
-        // file (SQLite >= 3.27). Guard against a downgraded SQLite where the
-        // statement is unavailable.
-        // Use a real file-backed DB: VACUUM INTO on sqlx's shared in-memory
-        // connection does not materialise the target file.
         let db_path =
             std::env::temp_dir().join(format!("tgsrssr_vacuum_src_{}.db", uuid::Uuid::new_v4()));
         let path = std::env::temp_dir().join(format!("tgsrssr_vacuum_{}.db", uuid::Uuid::new_v4()));
@@ -699,7 +593,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Paused source: queued rows are held.
         assert!(outbox_due_ids(&pool, 1, 10).await.unwrap().is_empty());
         sqlx::query("UPDATE subscriptions SET active = 1 WHERE chat_id = '1'")
             .execute(&pool)
@@ -707,7 +600,6 @@ mod tests {
             .unwrap();
         assert_eq!(outbox_due_ids(&pool, 1, 10).await.unwrap().len(), 1);
 
-        // Disabled chat: queued rows are held again.
         assert!(set_chat_enabled(&pool, "1", false).await.unwrap());
         assert!(outbox_due_ids(&pool, 1, 10).await.unwrap().is_empty());
         assert!(!can_manage_chat(&pool, 42, "1").await.unwrap());
@@ -760,8 +652,6 @@ mod tests {
         assert_eq!(row.first_attempt_at, Some(123));
         assert_eq!(row.last_error.as_deref(), Some("boom"));
 
-        // A later retry must not move the first-attempt anchor; otherwise the
-        // 72h window would never expire under continuous failures.
         outbox_update_retry(&pool, row.id, 2, 10, 456, "still boom")
             .await
             .unwrap();
@@ -771,7 +661,6 @@ mod tests {
         assert_eq!(row.first_attempt_at, Some(123));
         assert_eq!(row.last_error.as_deref(), Some("still boom"));
 
-        // A removed row is reported as missing rather than an error.
         outbox_delete(&pool, row.id).await.unwrap();
         assert!(outbox_get(&pool, row.id).await.unwrap().is_none());
     }
@@ -788,7 +677,6 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        // Provisional row from an out-of-order my_chat_member update.
         sqlx::query("INSERT INTO chats (chat_id, chat_type, title, added_by) VALUES (?, 'supergroup', 'new', '99')")
             .bind(new)
             .execute(&pool)
@@ -848,7 +736,6 @@ mod tests {
         }
 
         migrate_chat_id(&pool, old, new).await.unwrap();
-        // Idempotent second call (e.g. duplicate service message).
         migrate_chat_id(&pool, old, new).await.unwrap();
 
         let chats: Vec<(String, Option<String>)> =
@@ -1135,7 +1022,6 @@ mod tests {
     async fn due_subscriptions_are_oldest_first_and_capped() {
         let pool = test_pool().await;
         insert_chat(&pool, "1", "7", 1).await;
-        // Disabled chats must not contribute due rows.
         insert_chat(&pool, "2", "7", 0).await;
         insert_sub(&pool, "2", "https://example.com/disabled-chat", None).await;
         insert_sub(&pool, "1", "https://example.com/never", None).await;
@@ -1167,7 +1053,6 @@ mod tests {
         );
         assert_eq!(count_due_subscriptions(&pool).await.unwrap(), 3);
 
-        // Backlog above the cap: only MAX_DUE_PER_CYCLE rows are selected.
         for i in 0..MAX_DUE_PER_CYCLE {
             insert_sub(&pool, "1", &format!("https://example.com/bulk/{}", i), None).await;
         }

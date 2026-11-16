@@ -1,9 +1,3 @@
-//! Single source for callback wire-format construction.
-//!
-//! Panels build `c|<op>|...` strings here instead of scattering `format!`
-//! literals. The format itself is unchanged, so callbacks already present in
-//! Telegram chats keep working.
-
 pub(crate) use super::data::CallbackOp;
 
 pub(crate) fn channel(chat_id: &str, ch_page: usize, chlist_page: usize) -> String {
@@ -131,7 +125,6 @@ pub(crate) fn cookies(platform: &str) -> String {
     format!("c|ck|{platform}")
 }
 
-/// Encode a config/source value choice (option-page rows and "inherit").
 pub(crate) fn value_callback(
     op: CallbackOp,
     id_seg: &str,
@@ -164,8 +157,6 @@ pub(crate) fn page() -> &'static str {
     "c|page"
 }
 
-/// Prefix for the generic option-page renderer (`c|<op>`); values are appended
-/// by `OptionPageSpec`.
 pub(crate) fn op_prefix(op: CallbackOp) -> String {
     format!("c|{}", op.as_str())
 }

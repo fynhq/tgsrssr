@@ -1,14 +1,9 @@
-//! Subscriptions, due scheduling, feed configs and retry state.
-
 use super::chats::{
     cleanup_chat_settings_keys, cleanup_feed_settings_keys, clear_auto_disable_notified,
 };
 use super::*;
 use sqlx::Row;
 
-/// Feed URLs of every active subscription in an enabled chat. Used by the
-/// scheduler's platform-health check to distinguish "all active sources ran"
-/// from "only the one source that happens to be due this round ran".
 pub async fn active_subscription_urls(db: &Db) -> anyhow::Result<Vec<String>> {
     let rows = sqlx::query_scalar::<_, String>(
         "SELECT s.feed_url
@@ -21,7 +16,6 @@ pub async fn active_subscription_urls(db: &Db) -> anyhow::Result<Vec<String>> {
     Ok(rows)
 }
 
-/// Count subscriptions per chat (for the channel list page display).
 pub async fn count_subscriptions_per_chat(
     db: &Db,
 ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
@@ -35,9 +29,6 @@ pub async fn count_subscriptions_per_chat(
     Ok(map)
 }
 
-/// Count all subscription rows for a chat (active + paused). Used by the
-/// `/sub` quota check: re-activating an existing paused row must not count as
-/// a new subscription, so the cap applies to rows, not active feeds.
 pub async fn count_subscriptions_for_chat(db: &Db, chat_id: &str) -> anyhow::Result<i64> {
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM subscriptions WHERE chat_id = ?")
         .bind(chat_id)
@@ -46,8 +37,6 @@ pub async fn count_subscriptions_for_chat(db: &Db, chat_id: &str) -> anyhow::Res
     Ok(n)
 }
 
-/// All subscription URLs for a chat (active + paused); quota pre-checks use
-/// the set to distinguish new URLs from re-enabled ones.
 pub async fn subscription_urls_for_chat(db: &Db, chat_id: &str) -> anyhow::Result<Vec<String>> {
     let rows = sqlx::query("SELECT feed_url FROM subscriptions WHERE chat_id = ?")
         .bind(chat_id)
@@ -59,8 +48,6 @@ pub async fn subscription_urls_for_chat(db: &Db, chat_id: &str) -> anyhow::Resul
         .collect())
 }
 
-/// All subscription URLs across the channels owned by `user_id`
-/// (`chats.added_by`). Drives the per-user total / platform-source caps.
 pub async fn subscription_urls_for_user_owner(
     db: &Db,
     user_id: i64,
@@ -81,8 +68,6 @@ pub async fn subscription_urls_for_user_owner(
 }
 
 pub async fn list_chats(db: &Db, user_id: i64) -> anyhow::Result<Vec<ChatRow>> {
-    // Pure ownership isolation: everyone (including admins) only sees the
-    // channels whose added_by is themselves.
     let rows = sqlx::query_as::<_, ChatRow>(
         "SELECT chat_id, chat_type, title, username, added_by, enabled FROM chats WHERE enabled = 1 AND added_by = ? ORDER BY title",
     )
@@ -92,11 +77,6 @@ pub async fn list_chats(db: &Db, user_id: i64) -> anyhow::Result<Vec<ChatRow>> {
     Ok(rows)
 }
 
-/// Insert (or re-activate) a subscription and mark its current entries as
-/// sent in one transaction. /sub uses this so a failure can neither leave a
-/// partially-marked subscription nor roll back a pre-existing (re-enabled)
-/// row: the previous two-step add + mark + delete-on-error flow deleted the
-/// user's original subscription when the mark step failed.
 pub async fn add_subscription_with_sent(
     db: &Db,
     chat_id: &str,
@@ -105,12 +85,6 @@ pub async fn add_subscription_with_sent(
     entry_ids: &[String],
 ) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
-    // /sub resolves the target chat and fetches the feed before reaching this
-    // call; the bot can be removed from the chat in that window, and purge_chat
-    // then deletes the chats row. An orphan subscription would be invisible:
-    // the due query INNER JOINs chats, and ownership resolution reads chats
-    // too, so no command could list, edit or unsubscribe it. Re-check inside
-    // the transaction and fail the add instead of persisting the orphan.
     let chat_exists: Option<(i64,)> =
         sqlx::query_as("SELECT 1 FROM chats WHERE chat_id = ? AND enabled = 1")
             .bind(chat_id)
@@ -145,19 +119,11 @@ pub async fn add_subscription_with_sent(
         .execute(&mut *tx)
         .await?;
     }
-    // Re-enabling through /sub must clear the auto-disable notification edge
-    // flag, exactly like the panel resume paths. Otherwise a later failure
-    // that reaches the threshold stays silent because the stale flag remains.
     clear_auto_disable_notified(&mut tx, chat_id, feed_url).await?;
     tx.commit().await?;
     Ok(())
 }
 
-/// Ask both dedup tables about one entry in a single query. The scheduler
-/// rechecks this immediately before sending: the batch snapshots taken before
-/// the fetch can go stale while an overlapping outbox retry finishes the same
-/// entry, and a duplicate push is worse than one extra indexed lookup.
-/// Returns (already_sent, queued_in_outbox). Callers must fail closed on Err.
 pub async fn entry_dedup_state(
     db: &Db,
     chat_id: &str,
@@ -181,10 +147,6 @@ pub async fn entry_dedup_state(
 }
 
 pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
-    // Drop pending outbox retries for this subscription first (while the
-    // subscriptions row still exists so the correlated lookup works).
-    // Wrapped in a transaction: outbox cleanup and subscription deletion are
-    // atomic, avoiding intermediate states.
     let mut tx = db.begin().await?;
     sqlx::query(
         "DELETE FROM outbox WHERE EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = ? AND s.chat_id = outbox.chat_id AND s.feed_url = outbox.feed_url)",
@@ -192,14 +154,7 @@ pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
     .bind(sub_id)
     .execute(&mut *tx)
     .await?;
-    // Cascade-clean the per-feed settings keys (media_dl_fail /
-    // auto_disable_notified / stale_zero) while the subscriptions row still
-    // exists so the correlated lookups work.
     cleanup_feed_settings_keys(&mut tx, sub_id).await?;
-    // Drop per-feed config overrides in the same transaction: a later
-    // re-subscribe must start from channel defaults instead of reviving stale
-    // interval/content/filter settings (previously this ran outside the
-    // transaction and a failure silently kept the old row).
     sqlx::query(
         "DELETE FROM feed_configs WHERE EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = ? AND s.chat_id = feed_configs.chat_id AND s.feed_url = feed_configs.feed_url)",
     )
@@ -215,19 +170,12 @@ pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
 }
 
 pub async fn delete_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<u64> {
-    // Drop pending outbox retries for this chat (before subscriptions vanish).
-    // Wrapped in a transaction: outbox cleanup and subscription deletion are
-    // atomic, avoiding intermediate states.
     let mut tx = db.begin().await?;
     sqlx::query("DELETE FROM outbox WHERE chat_id = ?")
         .bind(chat_id)
         .execute(&mut *tx)
         .await?;
-    // Cascade-clean every per-chat settings key family (same list as
-    // purge_chat via the shared helper).
     cleanup_chat_settings_keys(&mut tx, chat_id).await?;
-    // Drop per-feed config overrides for this chat as well (same contract as
-    // single unsubscribe: a later re-subscribe starts from defaults).
     sqlx::query("DELETE FROM feed_configs WHERE chat_id = ?")
         .bind(chat_id)
         .execute(&mut *tx)
@@ -240,7 +188,6 @@ pub async fn delete_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<
     Ok(result.rows_affected())
 }
 
-/// Column list shared by every `SubRow` query (keep in sync with the struct).
 const SUB_COLUMNS: &str = "id, chat_id, feed_url, feed_title, title_overridden, original_title, active, error_count, last_fetch_at, last_error, http_etag, http_last_modified, auto_disabled, disabled_at";
 
 pub async fn get_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<Vec<SubRow>> {
@@ -275,22 +222,8 @@ pub async fn get_subscription_by_url(
     Ok(row)
 }
 
-/// Rename a subscription manually. Sets the override flag so the scheduler
-/// stops auto-syncing the feed title.
-///
-/// Smart reset (v1.3.3): if the new title equals the recorded original title,
-/// the override is cleared (title_overridden=0, original_title=NULL) — the
-/// source resumes following feed title updates and the "original name" display
-/// disappears. This makes "rename back to original" a true reset.
-///
-/// NOTE: SET clause order matters — SQLite evaluates left-to-right and later
-/// expressions see already-updated values. original_title must be computed
-/// before feed_title is overwritten.
 pub async fn rename_subscription(db: &Db, sub_id: i64, new_title: &str) -> anyhow::Result<()> {
     sqlx::query(
-        // `IS` (not `=`) so a NULL original_title is compared correctly; the
-        // right-hand expressions all read the pre-update row, matching the
-        // single-statement semantics.
         "UPDATE subscriptions SET
            title_overridden = CASE WHEN ? IS original_title THEN 0 ELSE 1 END,
            original_title = CASE WHEN ? IS original_title THEN NULL ELSE COALESCE(original_title, feed_title) END,
@@ -306,7 +239,6 @@ pub async fn rename_subscription(db: &Db, sub_id: i64, new_title: &str) -> anyho
     Ok(())
 }
 
-/// Auto-update feed title from RSS without setting title_overridden.
 pub async fn rename_subscription_auto(db: &Db, sub_id: i64, new_title: &str) -> anyhow::Result<()> {
     sqlx::query("UPDATE subscriptions SET feed_title = ? WHERE id = ? AND title_overridden = 0")
         .bind(new_title)
@@ -316,15 +248,11 @@ pub async fn rename_subscription_auto(db: &Db, sub_id: i64, new_title: &str) -> 
     Ok(())
 }
 
-/// Effective config for one subscription (chat defaults + feed overrides).
 pub async fn get_effective_config(
     db: &Db,
     chat_id: &str,
     feed_url: &str,
 ) -> anyhow::Result<EffectiveConfig> {
-    // Build from a one-row base so a missing chat_configs row does not hide
-    // feed_configs overrides. This is the same precedence as the due query
-    // below: feed override > channel config > DEFAULT_*.
     let row = sqlx::query(
         r#"SELECT ?1 AS chat_id, ?2 AS feed_url,
                   COALESCE(f.interval_minutes, c.interval_minutes, 30) AS interval_minutes,
@@ -345,8 +273,6 @@ pub async fn get_effective_config(
     .bind(feed_url)
     .fetch_optional(db)
     .await?;
-    // Defensive: the base row means a row should always exist, but keep a
-    // defaults fallback if SQLite behavior changes.
     let Some(row) = row else {
         return Ok(EffectiveConfig {
             chat_id: chat_id.to_string(),
@@ -379,20 +305,7 @@ pub async fn get_effective_config(
     })
 }
 
-/// Manual pause/resume (bot button). Manual operations set auto_disabled=0,
-/// guaranteeing that a source the user actively stopped is never auto-restored
-/// by the self-heal job.
-///
-/// Resuming (active=true) also mirrors the auto-heal recovery: it resets the
-/// failure counter and clears the auto-disable notification dedup flag, so a
-/// source the user manually resumes starts from a clean slate. Without this,
-/// a manual resume left the stale error_count in place, so the very next
-/// failure could immediately re-trigger auto-disable — and because the
-/// notified flag was still set, that re-disable was silent (the user perceives
-/// the resume button as "not working"). Pausing leaves the counters untouched.
-/// Returns false when the (id, chat_id) pair no longer exists. The chat_id
-/// condition closes the TOCTOU window between the callback ownership guard and
-/// this update: an id recreated for another chat can never be toggled here.
+// The UPDATE must also match chat_id: closes the TOCTOU window between the callback ownership guard and this write.
 pub async fn set_subscription_active(
     db: &Db,
     sub_id: i64,
@@ -412,9 +325,6 @@ pub async fn set_subscription_active(
             tx.commit().await?;
             return Ok(false);
         }
-        // Clear the per-feed auto-disable notification dedup flag (exact key
-        // match, same shape as the unsubscribe cascade) so the next genuine
-        // disable can notify again.
         sqlx::query(
             "DELETE FROM settings WHERE key = (SELECT 'auto_disable_notified:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ? AND chat_id = ?)",
         )
@@ -422,8 +332,6 @@ pub async fn set_subscription_active(
         .bind(chat_id)
         .execute(&mut *tx)
         .await?;
-        // A manual resume is a fresh start for send failures too; otherwise a
-        // single new failure would immediately hit the threshold again.
         sqlx::query(
             "DELETE FROM settings WHERE key = (SELECT 'send_fail:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ? AND chat_id = ?)",
         )
@@ -448,15 +356,7 @@ pub async fn set_subscription_active(
     Ok(true)
 }
 
-/// System auto-disable (consecutive failures reached the threshold): sets
-/// auto_disabled=1 and records the disable moment so the self-heal job can
-/// auto-recover it after the cooldown.
-/// The `active = 1` guard closes the race against a manual pause made during
-/// the fetch round: the scheduler decides from a round-start snapshot, so
-/// without the guard a just-paused (auto_disabled=0) source would be flipped
-/// to auto-disabled and resurrected by the self-heal cooldown, overriding the
-/// user's intent. Returns whether a row was actually disabled (false = the
-/// user already paused it this round, caller should skip the notification).
+// The active = 1 guard is required: without it an auto-disable can override a manual pause made during the fetch round.
 pub async fn auto_disable_subscription(db: &Db, sub_id: i64) -> anyhow::Result<bool> {
     let res = sqlx::query(
         "UPDATE subscriptions SET active = 0, auto_disabled = 1, disabled_at = datetime('now') WHERE id = ? AND active = 1",
@@ -467,14 +367,8 @@ pub async fn auto_disable_subscription(db: &Db, sub_id: i64) -> anyhow::Result<b
     Ok(res.rows_affected() == 1)
 }
 
-/// Self-heal: re-enable sources that are "auto-disabled and past the cooldown"
-/// and reset their error counts to zero. Returns the number of recovered
-/// sources. Manually paused (auto_disabled=0) sources are not affected.
 pub async fn reenable_due_auto_disabled(db: &Db, cooldown_hours: i64) -> anyhow::Result<u64> {
     let mut tx = db.begin().await?;
-    // A source retired by repeated send failures must start with a fresh
-    // streak; keeping the old count would make its first post-heal failure
-    // re-disable it immediately.
     sqlx::query(
         r#"DELETE FROM settings WHERE key IN (
              SELECT 'send_fail:' || chat_id || ':' || feed_url FROM subscriptions
@@ -500,9 +394,6 @@ pub async fn reenable_due_auto_disabled(db: &Db, cooldown_hours: i64) -> anyhow:
     Ok(res.rows_affected())
 }
 
-/// One-click enable all disabled sources under a channel (manual operation):
-/// resets error counts and auto-disable flags. Returns the number of enabled
-/// sources.
 pub async fn resume_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<u64> {
     let mut tx = db.begin().await?;
     let res = sqlx::query(
@@ -513,9 +404,6 @@ pub async fn resume_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<
     .bind(chat_id)
     .execute(&mut *tx)
     .await?;
-    // Clear the per-feed auto-disable notification dedup flags so a source
-    // that fails again before any success can notify the owner (same cleanup
-    // as the single-subscription resume path).
     sqlx::query("DELETE FROM settings WHERE key LIKE ?")
         .bind(format!("auto_disable_notified:{}:%", chat_id))
         .execute(&mut *tx)
@@ -529,9 +417,6 @@ pub async fn resume_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<
 }
 
 pub async fn increment_error_count(db: &Db, sub_id: i64, error_msg: &str) -> anyhow::Result<i64> {
-    // Wrap UPDATE+SELECT in a transaction: guarantees we read the value after
-    // this increment. fetch_optional: the subscription may have been deleted
-    // during fetch, in which case return 0 instead of erroring.
     let mut tx = db.begin().await?;
     sqlx::query(
         "UPDATE subscriptions SET error_count = error_count + 1, last_error = ?, last_fetch_at = datetime('now') WHERE id = ?",
@@ -556,8 +441,6 @@ pub async fn reset_error_count(db: &Db, sub_id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Flat row combining subscription + effective-config columns for
-/// `get_due_subscriptions` (avoids manual per-column `row.get` mapping).
 #[derive(Debug, sqlx::FromRow)]
 struct DueRow {
     #[sqlx(flatten)]
@@ -566,14 +449,8 @@ struct DueRow {
     cfg: EffectiveConfig,
 }
 
-/// Maximum subscriptions processed in one fetch cycle. The rest stay due and
-/// are picked up by the next cycle (ordered oldest-first), which prevents a
-/// backlog of thousands of due rows from monopolizing memory and upstream
-/// connections in one round.
 pub const MAX_DUE_PER_CYCLE: i64 = 200;
 
-/// Count all subscriptions that are currently due (unbounded). Used only for
-/// the cycle summary log (`due_total` vs `selected`).
 pub async fn count_due_subscriptions(db: &Db) -> anyhow::Result<i64> {
     let (n,): (i64,) = sqlx::query_as(
         r#"SELECT COUNT(*)
@@ -589,13 +466,7 @@ pub async fn count_due_subscriptions(db: &Db) -> anyhow::Result<i64> {
     Ok(n)
 }
 
-/// Get due subscriptions for one fetch cycle (at most MAX_DUE_PER_CYCLE).
-/// Ordering: never-fetched sources first, then oldest `last_fetch_at`, then id
-/// for a stable tie-break. Sources beyond the cap remain due and rotate in on
-/// later cycles instead of starving.
 pub async fn get_due_subscriptions(db: &Db) -> anyhow::Result<Vec<(SubRow, EffectiveConfig)>> {
-    // The COALESCE fallback defaults must stay in sync with the DEFAULT_*
-    // constants (asserted by test_default_constants).
     let rows = sqlx::query_as::<_, DueRow>(
         r#"SELECT s.id, s.chat_id, s.feed_url, s.feed_title, s.title_overridden, s.original_title, s.active, s.error_count, s.last_fetch_at, s.last_error,
                   s.http_etag, s.http_last_modified, s.auto_disabled, s.disabled_at,
@@ -625,9 +496,6 @@ pub async fn get_due_subscriptions(db: &Db) -> anyhow::Result<Vec<(SubRow, Effec
     Ok(rows.into_iter().map(|r| (r.sub, r.cfg)).collect())
 }
 
-/// Save the HTTP negotiation headers (ETag / Last-Modified) of this fetch
-/// response for the next conditional request; passing None means the response
-/// did not carry that header (keep the old value, do not overwrite).
 pub async fn update_fetch_headers(
     db: &Db,
     sub_id: i64,
@@ -637,9 +505,6 @@ pub async fn update_fetch_headers(
     if etag.is_none() && last_modified.is_none() {
         return Ok(());
     }
-    // One statement: committing the two negotiation headers separately could
-    // pair this response's ETag with the previous Last-Modified on a partial
-    // failure and make the next conditional request inconsistent.
     sqlx::query(
         "UPDATE subscriptions
             SET http_etag = COALESCE(?, http_etag),

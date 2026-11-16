@@ -1,34 +1,15 @@
-//! Pure scheduling decisions extracted from `scheduler.rs`.
-//!
-//! These helpers contain no I/O and no AppState/Bot references, so the
-//! branch-heavy parts of the fetch cycle can be tested directly.
-
-/// Media-only download failure cap (per entry, in fetch rounds).
 pub(super) const MEDIA_DL_MAX_RETRIES: i64 = 10;
-/// Normal-mode download failure deferral cap (including the degrading round).
 pub(super) const MEDIA_DL_MAX_DEFER_ROUNDS: i64 = 3;
 
-/// Next step after reading the `media_dl_fail:` counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MediaRetryStep {
-    /// No download failure: send normally and clear the counter.
     Proceed,
-    /// Reading the counter failed: defer the entry, keep the old negotiation
-    /// headers, and do not write a counter this round.
     ReadError,
-    /// Record the incremented counter and defer the entry.
     Retry { fail_count: i64, notify: bool },
-    /// MediaOnly cap reached: notify the owner and mark the entry sent.
     Abandon { fail_count: i64 },
-    /// Normal-mode cap reached: delete the counter and send the entry with the
-    /// media that survived.
     Degrade { fail_count: i64 },
 }
 
-/// Decide the next media-download retry step.
-///
-/// `stored` is the parsed counter; `Err(())` means the DB read failed. The
-/// caller owns the write/delete/notification side effects so this stays pure.
 pub(super) fn media_retry_step(
     media_only: bool,
     download_failed: bool,
@@ -64,19 +45,14 @@ pub(super) fn media_retry_step(
     }
 }
 
-/// Platform-health verdict for one round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlatformRound {
-    /// Not every active source was scheduled this round: no verdict.
     Skip,
     AllFailed,
     AllOk,
-    /// Mixed results (or no valid signal): reset the streak.
     Mixed,
 }
 
-/// Classify one platform's round from the scheduled/active source counts and
-/// the rounded ok/failed signals.
 pub(super) fn platform_round_verdict(
     seen: usize,
     active: usize,
@@ -95,9 +71,6 @@ pub(super) fn platform_round_verdict(
     }
 }
 
-/// Effective feed title for this round: a non-overridden subscription prefers
-/// the freshly fetched title, so a rename takes effect in the same round as
-/// the DB update. An empty fetched title falls back to the stored value.
 pub(super) fn effective_feed_title(
     title_overridden: bool,
     fetched: Option<&str>,
@@ -133,12 +106,10 @@ mod tests {
                 notify: true
             }
         );
-        // 10th failure abandons; `notify` is irrelevant on this branch.
         assert_eq!(
             media_retry_step(true, true, Ok(9), false),
             MediaRetryStep::Abandon { fail_count: 10 }
         );
-        // Saturating add keeps an absurd stored value bounded.
         assert_eq!(
             media_retry_step(true, true, Ok(i64::MAX), true),
             MediaRetryStep::Abandon {
@@ -215,7 +186,6 @@ mod tests {
             platform_round_verdict(2, 2, false, true),
             PlatformRound::AllFailed
         );
-        // No valid signal is a mixed round: reset the streak.
         assert_eq!(
             platform_round_verdict(2, 2, false, false),
             PlatformRound::Mixed
@@ -226,7 +196,6 @@ mod tests {
     fn effective_title_prefers_fetched_value_unless_overridden() {
         assert_eq!(effective_feed_title(false, Some("new"), Some("old")), "new");
         assert_eq!(effective_feed_title(true, Some("new"), Some("old")), "old");
-        // Missing or blank fetched title falls back to the stored title.
         assert_eq!(effective_feed_title(false, None, Some("old")), "old");
         assert_eq!(effective_feed_title(false, Some("  "), Some("old")), "old");
         assert_eq!(effective_feed_title(false, None, None), "");

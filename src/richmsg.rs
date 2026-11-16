@@ -1,15 +1,3 @@
-//! Minimal raw wrapper for Bot API `sendRichMessage`.
-//!
-//! teloxide 0.17 models Bot API 9.1 and has no `sendRichMessage` types, while
-//! the official API / local Bot API server already expose Bot API 10.x. The
-//! crate still exposes `Bot::client/token/api_url`, so this module performs
-//! the JSON/multipart request itself and keeps the new API surface isolated
-//! instead of forking or upgrading the whole framework.
-//!
-//! Only the subset needed by feed pushes is modelled here: rich HTML plus
-//! photo/video/document attachments. Rich media is an enhancement; callers
-//! must fall back to the normal send path when this module returns an error.
-
 use anyhow::Context;
 use reqwest_bot::multipart::{Form, Part};
 use serde::Deserialize;
@@ -17,11 +5,6 @@ use serde_json::{json, Map, Value};
 use teloxide::prelude::Bot;
 use teloxide::types::{Message, MessageId};
 
-/// Process-wide cooldown: a Bot API server that does not implement
-/// `sendRichMessage` answers 404/Not Found. Retrying every rich-eligible entry
-/// would upload the whole payload again for nothing, so the rich path is
-/// disabled for a while. A bare gateway 404 is often transient, so it uses a
-/// short cooldown instead of latching until the next restart.
 static RICH_UNSUPPORTED_UNTIL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -32,20 +15,15 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Cooldown after a rich-send failure that indicates the endpoint is
-/// unavailable. `None` means the error is not an availability signal.
 fn unsupported_cooldown(err_str: &str) -> Option<std::time::Duration> {
     let lower = err_str.to_ascii_lowercase();
     let method_missing = lower.contains("unknown method")
         || lower.contains("method not found")
         || (lower.contains("not found") && lower.contains("sendrichmessage"));
     if method_missing {
-        // The method does not exist on this Bot API version; re-probe once a
-        // day so an upgrade eventually restores the rich path.
         return Some(std::time::Duration::from_secs(24 * 3600));
     }
     if lower.contains("telegram api error 404") {
-        // A gateway/proxy 404 is frequently a temporary deployment issue.
         return Some(std::time::Duration::from_secs(30 * 60));
     }
     None
@@ -65,14 +43,10 @@ struct TelegramResponseParameters {
     retry_after: Option<u64>,
 }
 
-/// True while the endpoint is in a failure cooldown.
 pub fn is_unsupported() -> bool {
     now_ms() < RICH_UNSUPPORTED_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Record a rich-send failure and start a cooldown when the error means the
-/// endpoint is unavailable. Callers should only pass errors produced by this
-/// module.
 pub fn note_send_error(err_str: &str) {
     let Some(cooldown) = unsupported_cooldown(err_str) else {
         return;
@@ -92,10 +66,6 @@ pub fn note_send_error(err_str: &str) {
 async fn parse_response<T: for<'de> Deserialize<'de>>(
     response: reqwest_bot::Response,
 ) -> anyhow::Result<T> {
-    // Match the rest of the remote-read paths: a hijacked/misconfigured Bot
-    // API endpoint must not be able to make us buffer an unbounded response.
-    // Read chunk by chunk and abort as soon as the cap is exceeded, so the
-    // limit actually bounds memory instead of only gating the later parse.
     const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
     let status = response.status();
     let mut response = response;
@@ -148,24 +118,16 @@ fn method_url(bot: &Bot, method: &str) -> String {
     )
 }
 
-/// Where one rich-message media attachment comes from.
 #[derive(Debug, Clone)]
 pub enum RichMediaSource {
-    /// Reuse an already uploaded file id.
     FileId(String),
-    /// Local Bot API server reads this path from its own filesystem namespace
-    /// (shared mount). The value is already translated to the server prefix.
     FilePath(String),
-    /// Official API (or an untranslatable path): stream the local file through
-    /// multipart/form-data. The file is read chunk by chunk at send time, so a
-    /// large document does not occupy the equivalent heap memory.
     File {
         path: std::path::PathBuf,
         filename: String,
     },
 }
 
-/// Media type accepted by `InputRichMessageMedia`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RichMediaKind {
     Photo,
@@ -173,22 +135,15 @@ pub enum RichMediaKind {
     Document,
 }
 
-/// One media entry inside `InputRichMessage.media`.
 #[derive(Debug, Clone)]
 pub struct RichMedia {
-    /// Referenced from rich HTML as `tg://photo?id=<id>` /
-    /// `tg://video?id=<id>` / `tg://document?id=<id>`.
     pub id: String,
     pub kind: RichMediaKind,
     pub source: RichMediaSource,
-    /// Optional video/document thumbnail. Uploaded/prepared with the same
-    /// transport rules as the media itself.
     pub thumbnail: Option<RichMediaSource>,
     pub width: u32,
     pub height: u32,
     pub duration: Option<u32>,
-    /// Documents only: keep image documents (notably WebP) from being
-    /// re-detected as stickers, which cannot carry a caption.
     pub disable_content_type_detection: bool,
 }
 
@@ -208,18 +163,12 @@ async fn value_and_part(
                 .await
                 .with_context(|| format!("stat rich media file failed: {}", path.display()))?
                 .len();
-            // Known length keeps the multipart Content-Length deterministic;
-            // the file body itself is streamed by reqwest.
             let part = Part::stream_with_length(file, len).file_name(filename);
             Ok((format!("attach://{part_name}"), Some(part)))
         }
     }
 }
 
-/// Build the nested `InputMedia*` object for one `InputRichMessageMedia`.
-/// Width/height/duration and streaming belong to videos; thumbnails are
-/// accepted by videos and documents; the content-type detection flag only
-/// applies to documents.
 fn rich_media_object(
     kind: RichMediaKind,
     media_value: &str,
@@ -268,9 +217,6 @@ fn rich_media_object(
     Value::Object(object)
 }
 
-/// Send one rich message. `html` must already be valid rich HTML; `media`
-/// contains photo/video/document attachments referenced by `tg://...?id=`
-/// links.
 pub async fn send_rich_message(
     bot: &Bot,
     chat_id: i64,
@@ -301,8 +247,6 @@ pub async fn send_rich_message(
             parts.push((id.clone(), part));
         }
 
-        // Thumbnails are supported by video and document media (photos have
-        // no thumbnail field in InputMediaPhoto).
         let thumbnail_value = match (kind, thumbnail) {
             (RichMediaKind::Video | RichMediaKind::Document, Some(thumb)) => {
                 let thumb_name = format!("thumb_{id}");
@@ -315,9 +259,6 @@ pub async fn send_rich_message(
             _ => None,
         };
 
-        // InputRichMessageMedia = { id, media: InputMedia* }. The media type
-        // and its properties belong to the nested `media` object, not to the
-        // outer item.
         let media_object = rich_media_object(
             kind,
             &media_value,
@@ -343,8 +284,6 @@ pub async fn send_rich_message(
 
     let url = method_url(bot, "sendRichMessage");
     if parts.is_empty() {
-        // JSON branch: consume `rich` directly instead of cloning the whole
-        // HTML/media tree into a second payload value.
         let mut payload = Map::new();
         payload.insert("chat_id".to_string(), json!(chat_id));
         payload.insert("rich_message".to_string(), rich);
@@ -361,11 +300,6 @@ pub async fn send_rich_message(
             .json(&payload)
             .send()
             .await
-            // Keep the reqwest error as the anyhow source chain: the A1
-            // ambiguity classification in push.rs matches on transport-level
-            // details (timeout / connection reset / closed) that only survive
-            // if the chain is attached, not Display-interpolated away.
-            // without_url() strips the bot token from the URL before logging.
             .map_err(|e| e.without_url())
             .context("rich message request failed")?;
         return parse_response::<Message>(response).await;
@@ -390,18 +324,11 @@ pub async fn send_rich_message(
         Err(e) => {
             let e = e.without_url();
             if e.is_body() {
-                // A request-body stream failure means a local file could not
-                // be read to completion. The multipart payload was truncated,
-                // so Telegram cannot have delivered the message; mark it as
-                // explicitly undelivered instead of the generic ambiguous
-                // "request or response body error".
                 return Err(anyhow::anyhow!(
                     "rich media upload body read failed: {:#}",
                     e
                 ));
             }
-            // Same chain-preserving wrap as the JSON path above; late-upload
-            // transport failures are exactly the ambiguous case A1 must catch.
             return Err(anyhow::Error::new(e).context("rich message upload failed"));
         }
     };
@@ -578,7 +505,6 @@ mod tests {
         assert_eq!(value["duration"], 42);
         assert_eq!(value["supports_streaming"], true);
         assert_eq!(value["thumbnail"], "thumb-id");
-        // The document-only flag must not leak into video media.
         assert!(value.get("disable_content_type_detection").is_none());
     }
 
@@ -639,7 +565,6 @@ mod tests {
             assert!(request.contains("\"chat_id\":42"));
             assert!(request.contains("\"html\":\"hello\""));
             assert!(request.contains("\"id\":\"m0\""));
-            // InputRichMessageMedia.media is an InputMediaPhoto object.
             assert!(request.contains("\"media\":{\"media\":\"file-id\",\"type\":\"photo\"}"));
             assert!(request.contains("\"reply_parameters\""));
             assert!(request.contains("\"message_id\":9"));
@@ -704,9 +629,6 @@ mod tests {
 
     #[test]
     fn teloxide_message_parses_rich_message_response() {
-        // teloxide 0.17 has no rich-message types. The response is still a
-        // normal Message envelope; unknown rich fields must be ignored and the
-        // message id/chat must remain usable for /find, polls and links.
         let body = r#"{
             "message_id": 42,
             "date": 1770000000,

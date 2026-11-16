@@ -1,3 +1,4 @@
+//! Fetch/outbox scheduling, auto-disable/self-heal and platform health.
 mod pending;
 mod policy;
 mod send_effects;
@@ -20,33 +21,18 @@ use crate::push::{self, ContentMode};
 use crate::sendpolicy;
 use crate::state::AppState;
 
-/// Consecutive send failures for one source before it is auto-disabled.
-/// Fetch failures already have their own counter; this covers the
-/// "fetch succeeds, every send fails" case (removed from channel, missing
-/// posting rights), which previously kept enqueueing until the 72h abandon.
 const MAX_SEND_FAILURES: i64 = 3;
 
-/// Upper bound of queued outbox rows per (chat, feed). Reaching it disables
-/// the source instead of letting an unreachable chat grow the queue without
-/// bound.
 const OUTBOX_PER_FEED_LIMIT: i64 = 20;
 
-/// Fixed scheduler polling tick. Actual fetch intervals still come from each
-/// source/channel's `interval_minutes`.
 const SCHEDULER_INTERVAL_MINUTES: u64 = 5;
 
-/// Register the RSS fetch job on the scheduler.
 pub async fn register_fetch_job(
     sched: &JobScheduler,
     state: AppState,
     bot: Bot,
 ) -> anyhow::Result<()> {
     let interval = SCHEDULER_INTERVAL_MINUTES;
-    // The cron minute field only accepts steps of 1-59: large intervals (such
-    // as the 3/6/12-hour options in the panel) cannot be written directly as
-    // */180 — that is an invalid expression. A fixed 5-minute tick is used;
-    // whether each source is due is decided precisely by the
-    // get_due_subscriptions SQL using its own interval.
     let expr = format!("0 */{} * * * *", interval);
 
     sched
@@ -69,16 +55,7 @@ pub async fn register_fetch_job(
     Ok(())
 }
 
-/// Register the auto-heal job: periodically re-enable subscriptions that were
-/// auto-disabled by consecutive fetch failures, once the cooldown has passed.
-/// A network-wide outage (proxy down, firewall blocking, etc.) causes all
-/// sources to be auto-disabled one after another; once the network recovers,
-/// this job brings them back automatically with no manual intervention.
-/// Manually paused sources (auto_disabled=0) are unaffected. Silent when
-/// healthy — only writes logs.
 pub async fn register_heal_job(sched: &JobScheduler, state: AppState) -> anyhow::Result<()> {
-    // Check once at the top of every hour; cooldown is 3 hours (see
-    // AUTO_HEAL_COOLDOWN_HOURS).
     const AUTO_HEAL_COOLDOWN_HOURS: i64 = 3;
     let expr = "0 0 * * * *";
 
@@ -105,14 +82,7 @@ pub async fn register_heal_job(sched: &JobScheduler, state: AppState) -> anyhow:
     Ok(())
 }
 
-/// Read the platform hysteresis streak counter (positive = failure streak,
-/// negative = success streak). Returns Some(n) for a valid stored value (or
-/// 0 when the key is absent — that genuinely means "no streak yet"), or None
-/// on a transient DB read error. Callers must NOT write the streak back when
-/// this returns None: collapsing a read error to 0 and then writing 0 would
-/// reset an accumulated streak on a single DB hiccup (a DB read error must
-/// not unwrap_or to a neutral value — for counters, skip the round instead). A missing key still yields Some(0) so the normal
-/// "first failure → 1" flow proceeds.
+// read_streak returns None on a transient DB error; callers must not write 0 back and reset the streak.
 async fn read_streak(state: &AppState, key: &str, platform: &'static str) -> Option<i64> {
     match db::get_setting(&state.db, key).await {
         Ok(v) => Some(v.and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -123,42 +93,16 @@ async fn read_streak(state: &AppState, key: &str, platform: &'static str) -> Opt
     }
 }
 
-/// Consecutive full-body fetches that parsed zero entries before the stale-zero
-/// warn fires. Default fetch interval is 30 min, so 20 rounds ≈ 10 hours of
-/// complete silence — long enough that even a low-activity feed with a healthy
-/// parser rarely trips it, short enough to catch a page redesign within a day.
 const STALE_ZERO_WARN_ROUNDS: i64 = 20;
 
-/// Pure next-step computation of the stale-zero streak (unit-testable):
-/// returns (new_streak, should_warn). Warn fires on every exact multiple of
-/// the threshold while the streak persists — not once per edge — so a
-/// source that stays broken keeps reminding without per-round spam.
 fn stale_zero_next(prev: i64) -> (i64, bool) {
     let next = prev.saturating_add(1);
     (next, next % STALE_ZERO_WARN_ROUNDS == 0)
 }
 
-/// Structure-independent "silence detector" for a successful fetch round.
-///
-/// The per-platform zero-entry warns (weibo cards non-empty / X non-cursor
-/// entries present / telegram blocks present) all require the platform's
-/// response structure to still be recognized. If a redesign removes or renames
-/// the container keys, the parser reports a *legitimately* empty result: those
-/// warns never fire, the round counts as success, and the source goes silent
-/// with zero log lines. This guard needs nothing from the response shape: an
-/// HTTP-200-class fetch (not a 304) that yields zero entries repeatedly is the
-/// only evidence it uses.
-///
-/// Behavior: streak persisted in settings (`stale_zero:<chat>:<feed>`); a
-/// round with entries clears it; a DB read error skips the round rather than
-/// collapsing to 0 (same counter contract as read_streak / media_dl_fail).
-/// Log-only — no user notification: a genuinely quiet source (rarely-posting
-/// account, emptied feed) is legitimate, so paging a human on false positives
-/// would train everyone to ignore it.
 async fn note_zero_entry_round(state: &AppState, sub: &db::SubRow, round_zero: bool) {
     let key = db::setting_key::stale_zero(&sub.chat_id, &sub.feed_url);
     if !round_zero {
-        // Source produced entries again — streak restarts from scratch.
         if let Err(e) = db::delete_setting(&state.db, &key).await {
             warn!(feed = %sub.feed_url, error = %e, "stale-zero streak clear failed");
         }
@@ -189,35 +133,16 @@ async fn note_zero_entry_round(state: &AppState, sub: &db::SubRow, round_zero: b
     }
 }
 
-/// Per-round platform-level stats (global — no longer isolated per owner
-/// since cookies were globalized). Bundled into a struct to avoid too many
-/// arguments on process_feed (clippy too_many_arguments).
 #[derive(Default)]
 struct PlatRoundStats {
-    /// Platforms scheduled this round and how many of their sources ran
-    /// (regardless of success/failure).
     seen: tokio::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
-    /// Platforms that had failures this round
     failed: tokio::sync::Mutex<std::collections::HashSet<&'static str>>,
-    /// Platforms that had successes this round
     ok: tokio::sync::Mutex<std::collections::HashSet<&'static str>>,
-    /// Last error message (for display in anomaly notifications)
     last_err: tokio::sync::Mutex<std::collections::HashMap<&'static str, String>>,
-    /// Number of active sources per platform. A platform-level health verdict
-    /// is only valid when every active source was scheduled this round; with
-    /// mixed per-source intervals a single due source is not a whole-platform
-    /// sample.
     active_counts: std::collections::HashMap<&'static str, usize>,
 }
 
-/// One full fetch cycle: find due subscriptions, fetch, push new entries.
-/// Media/pipeline warnings notify the channel owner immediately
-/// (notify_owner_html) instead of being batched until the end of the cycle.
 async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
-    // If the previous round has not finished (a round can exceed the trigger
-    // interval when media downloads are slow), skip this tick to avoid two
-    // concurrent rounds both passing the is_entry_sent check and pushing the
-    // same entry twice.
     if state
         .fetch_cycle_active
         .compare_exchange(
@@ -233,18 +158,12 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     }
     let _guard = crate::state::ActiveFlagGuard(state.fetch_cycle_active.clone());
 
-    // At most MAX_DUE_PER_CYCLE sources are processed per round; the rest
-    // stay due and are picked up by later rounds (oldest-first rotation).
-    // `total_due` is the unbounded count for observability only.
     let total_due = db::count_due_subscriptions(&state.db).await?;
     let due = db::get_due_subscriptions(&state.db).await?;
     if due.is_empty() {
         return Ok(());
     }
     let selected_due = due.len();
-    // Cycle-level timing + totals, reported by the summary log at the end of
-    // the round (see below). Kept local to run_fetch_cycle — no signature
-    // change to process_feed.
     let cycle_started = std::time::Instant::now();
     info!(
         count = due.len(),
@@ -253,16 +172,6 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         "fetch cycle: due subscriptions selected"
     );
 
-    // Per-round platform-level stats: seen = platforms scheduled this round,
-    // failed = platforms with failures this round, ok = platforms with
-    // successes, last_err = last error message.
-    // Used for whole-round hysteresis decisions, avoiding anomaly/recovery
-    // notification spam caused by single-round jitter.
-    // Criterion: a round counts as a failure round only if ALL sources failed,
-    // and as a success round only if ALL succeeded (mixed rounds reset the
-    // streak), preventing one permanently failing source (when an owner has
-    // multiple sources) from dragging the whole platform into a persistent
-    // down state that never recovers.
     let active_counts = match db::active_subscription_urls(&state.db).await {
         Ok(urls) => {
             let mut counts: std::collections::HashMap<&'static str, usize> =
@@ -284,27 +193,11 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         ..PlatRoundStats::default()
     });
 
-    // Separate platform sources (weibo/X) from plain RSS sources:
-    // platform sources run serially with random gaps (reducing the chance of
-    // triggering risk control); plain sources run in parallel.
     let (platform_subs, rss_subs): (Vec<_>, Vec<_>) = due
         .into_iter()
         .partition(|(sub, _)| platform_of_url(&sub.feed_url).is_some());
 
-    // Plain RSS sources: the fetch request itself is bounded by
-    // `state.fetch_semaphore` inside fetcher::fetch_feed
-    // (config::FETCH_CONCURRENCY, which also covers /sub and /test).
-    // `process_sem` bounds the whole per-source processing (fetch + media
-    // downloads + sends): a task keeps its parsed FeedResult alive until its
-    // last entry is pushed, so without this cap the retained memory would
-    // scale with the number of due subscriptions instead of a fixed limit.
-    // Platform sources stay serial and are deliberately not gated so they keep
-    // their priority.
     let process_sem = std::sync::Arc::new(Semaphore::new(crate::config::FETCH_CONCURRENCY));
-    // Each handle is paired with a copy of the feed_url: once sub is moved
-    // into the spawn closure, the source identifier can no longer be obtained
-    // at the join site and failure logs would lose their locator info
-    // (added in v1.10.7).
     let mut handles: Vec<(String, tokio::task::JoinHandle<anyhow::Result<FeedStatus>>)> =
         Vec::new();
     for (idx, (sub, cfg)) in rss_subs.into_iter().enumerate() {
@@ -316,10 +209,6 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         handles.push((
             feed_url,
             tokio::spawn(async move {
-                // Staggered start: avoid all sources hitting their respective
-                // servers/proxies concurrently at the same instant, forming a
-                // momentary burst (inspired by rsstt's sharded staggered
-                // scheduling, simplified to sequential delays at this scale).
                 if idx > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(600 * idx as u64)).await;
                 }
@@ -329,16 +218,10 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         ));
     }
 
-    // Platform sources (weibo/X): strictly serial + random 3-8 second wait
-    // before each request. Weibo risk control is sensitive to burst
-    // concurrency; serial execution + random gaps effectively lowers the 403
-    // probability.
     let mut first_platform = true;
     let mut plat_ok = 0usize;
     let mut plat_fail = 0usize;
     for (sub, cfg) in platform_subs {
-        // Non-first platform source: random 3-8 second delay (pseudo-random
-        // via nanosecond modulo, no rand dependency needed)
         if !first_platform {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -348,8 +231,6 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
         first_platform = false;
-        // sub is moved into process_feed; failure logs need the source
-        // identifier, so extract it first (v1.10.7).
         let feed_url = sub.feed_url.clone();
         let chat_id = sub.chat_id.clone();
         match process_feed(state, bot, sub, cfg, &stats).await {
@@ -362,13 +243,11 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         }
     }
 
-    // Wait for the plain-source tasks to finish
     let mut rss_ok = 0usize;
     let mut rss_fail = 0usize;
     for (feed_url, handle) in handles {
         match handle.await {
             Ok(Ok(FeedStatus::Ok)) => rss_ok += 1,
-            // The failure was already logged and handled inside process_feed.
             Ok(Ok(FeedStatus::Failed)) => rss_fail += 1,
             Ok(Err(e)) => {
                 rss_fail += 1;
@@ -381,13 +260,6 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         }
     }
 
-    // One-line cycle summary at info level. Rationale: the individual
-    // per-feed failures above each already emit their own error!, but there
-    // was no aggregate view — an operator looking at logs after the fact
-    // could not tell at a glance "how many subs ran, how many succeeded, how
-    // long did the round take". This is the cheapest place to expose that
-    // (counters already collected above; no extra DB or platform queries).
-    // Deliberately NOT logging per-feed success info! lines to avoid volume.
     info!(
         due = total_due,
         selected = selected_due,
@@ -399,31 +271,12 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         "fetch cycle: summary"
     );
 
-    // Platform-level health hysteresis (whole-round view, serial so no race,
-    // global per platform):
-    // report an anomaly only after 2 consecutive all-failure rounds; report
-    // recovery only after 2 consecutive all-success rounds.
-    // This avoids "anomaly → recovery" notification spam caused by single-round
-    // network jitter.
-    // Criterion (v1.4.3 fix): a "failure round" = all of this platform's
-    // sources failed this round; a "success round" = all succeeded; mixed
-    // rounds reset the streak. Previously any single source failure marked the
-    // round as failed, so with multiple sources one permanently failing source
-    // (e.g. account deleted) would drag the whole platform into a persistent
-    // down state that the other healthy sources could never pull back.
-    // v1.11.0: after cookies were globalized, the health stats were globalized
-    // accordingly (no longer isolated per owner); anomaly/recovery
-    // notifications go to the single admin (v1.11.3).
     const HYSTERESIS_ROUNDS: i64 = 2;
     let seen = stats.seen.lock().await.clone();
     let failed = stats.failed.lock().await.clone();
     let ok_set = stats.ok.lock().await.clone();
     let last_err = stats.last_err.lock().await.clone();
     for (&p, &seen_count) in &seen {
-        // Only judge a platform when every active source was scheduled this
-        // round. With mixed per-source intervals, a single due source (which
-        // happens to fail) is not evidence that the whole platform is down.
-        // If the active-count query failed, fall back to the due sample.
         let active_count = stats.active_counts.get(p).copied().unwrap_or(seen_count);
         let verdict = policy::platform_round_verdict(
             seen_count,
@@ -448,20 +301,12 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         );
 
         if verdict == policy::PlatformRound::AllFailed {
-            // All failed this round: increment the failure streak counter
-            // (positive = failure streak, starting from 1; if the previous
-            // direction was success (negative), reset to 1).
-            // On a transient read error (None), skip both the write-back and
-            // the down-notification this round — the next round re-reads and
-            // continues accumulating, preserving the streak value.
             if let Some(prev) = read_streak(state, &streak_key, p).await {
                 let streak = if prev > 0 { prev + 1 } else { 1 };
                 if let Err(e) = db::set_setting(&state.db, &streak_key, &streak.to_string()).await {
                     warn!(platform = p, error = %e, "streak write failed");
                 }
 
-                // Hysteresis threshold reached and not currently down: report
-                // the anomaly (notify the single admin)
                 if streak >= HYSTERESIS_ROUNDS && !is_down {
                     let err = last_err
                         .get(&p)
@@ -471,10 +316,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 }
             }
         } else if verdict == policy::PlatformRound::AllOk {
-            // All succeeded this round: increment the success streak counter.
-            // Same "defer on read error" rule as the failure branch.
             if let Some(streak) = read_streak(state, &streak_key, p).await {
-                // The success direction counts with negative numbers (-1, -2, ...)
                 let ok_streak = if streak < 0 { streak - 1 } else { -1 };
                 if let Err(e) =
                     db::set_setting(&state.db, &streak_key, &ok_streak.to_string()).await
@@ -482,15 +324,11 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     warn!(platform = p, error = %e, "streak write failed");
                 }
 
-                // Hysteresis threshold reached and currently down: report recovery
-                // (notify the single admin)
                 if ok_streak <= -HYSTERESIS_ROUNDS && is_down {
                     maybe_notify_platform_recovered(bot, state, p).await;
                 }
             }
         } else {
-            // Mixed round (both successes and failures): reset the streak,
-            // leave the health state unchanged.
             if let Err(e) = db::set_setting(&state.db, &streak_key, "0").await {
                 warn!(platform = p, error = %e, "streak reset failed");
             }
@@ -500,30 +338,13 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Cooperative deadline for processing a single source (seconds). After the
-/// timeout, no new entry starts processing; remaining entries are left to the
-/// next round (not marked sent, so the next round's re-fetch naturally picks
-/// them up). This is "cooperative" rather than a hard cancellation: an entry
-/// already being processed is allowed to finish (its internal download/send
-/// each have their own timeout bounds), avoiding cutting off an in-flight
-/// send and causing a duplicate push. The main purpose is protecting platform
-/// sources' sliding windows — one stuck source slows the whole round, and if
-/// it drags on long enough, other sources' entries roll out of the sliding
-/// window, which is the real permanent loss.
 const FEED_DEADLINE_SECS: u64 = 240;
 
-/// Outcome of processing one feed. The failure branch handles errors and
-/// notifications internally, so the cycle summary can count real successes
-/// instead of treating every handled error as a success.
 enum FeedStatus {
     Ok,
     Failed,
 }
 
-/// True when another sender already owns this entry: either it was delivered
-/// (possibly by the outbox retry, after the batch snapshot was taken) or it is
-/// queued in the outbox, which has sole retry authority. A DB error is an
-/// error, never "not handled": the caller must defer rather than send.
 async fn entry_already_handled(
     state: &AppState,
     chat_id: &str,
@@ -534,14 +355,9 @@ async fn entry_already_handled(
     Ok(sent || queued)
 }
 
-/// What the entry loop should do after a send failure was handled.
 enum SendFailureAction {
-    /// Entry handled (queued, migrated, serialized fallback); continue.
     Continue,
-    /// Defer the current entry but keep processing later entries.
     DeferContinue,
-    /// Defer and stop this feed's remaining entries (source disabled or
-    /// outbox queue full).
     DeferBreak,
 }
 
@@ -566,9 +382,6 @@ struct SendFailureCtx<'a> {
     error: &'a anyhow::Error,
 }
 
-/// Handle one entry send failure: supergroup migration, source/queue
-/// disabling, and outbox enqueue. Extracted from `process_feed` so the entry
-/// loop keeps only the success path.
 async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFailureAction> {
     let state = ctx.state;
     let bot = ctx.bot;
@@ -589,10 +402,6 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
     let meta = ctx.meta;
     let e = ctx.error;
 
-    // Group upgraded to a supergroup: migrate every chat-scoped row and skip
-    // the outbox insert; the next fetch uses the new chat id. Without this, the
-    // old subscription would keep failing into outbox until abandoned after
-    // 72h.
     if let Some(new_id) = migrated_chat_id_from_error(e) {
         match db::migrate_chat_id(&state.db, &cfg.chat_id, &new_id).await {
             Ok(()) => {
@@ -611,17 +420,10 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
             ),
         }
     }
-    // A broken chat (bot removed / no posting rights) would otherwise succeed
-    // at fetching forever while every entry is queued and abandoned after 72h.
-    // Count consecutive send failures and disable the source or chat once the
-    // threshold is reached.
     if record_send_failure(bot, state, sub, cfg, lang, feed_title, e).await {
         return Ok(SendFailureAction::DeferBreak);
     }
 
-    // Per-source queue cap: even intermittent failures can accumulate rows
-    // indefinitely. Stop fetching before the queue grows without bound; the
-    // source is auto-disabled and can be resumed after fixing it.
     let queued = match db::outbox_count_for_feed(&state.db, &cfg.chat_id, &cfg.feed_url).await {
         Ok(n) => n,
         Err(err) => {
@@ -656,13 +458,7 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
     }
 
     warn!(feed = %cfg.feed_url, error = %e, "send failed, queuing to outbox");
-    // Push failed: write into the outbox persistent retry queue (exponential
-    // backoff, abandon at 72h). `entry_json` is the sole source for
-    // deserialization on retry: if serialization failed and an empty string
-    // were enqueued, the retry would fail to deserialize, only delete the row
-    // without mark_sent, and the entry would be permanently lost once it rolls
-    // out of the window. So on failure we take the "enqueue failed" branch
-    // (mark_sent + notify owner), leaving no hidden hazard.
+    // entry_json is the sole retry source; never enqueue an empty string (the row would be deleted without mark_sent).
     let entry_json = match serde_json::to_string(entry) {
         Ok(j) => j,
         Err(se) => {
@@ -681,11 +477,7 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
             return Ok(SendFailureAction::Continue);
         }
     };
-    // A media_json failure degrades to an empty array (the retry proceeds as
-    // text without media); a meta_json failure degrades to no meta (the retry
-    // loses the poll/prerendered markers) — neither loses the entry.
     let media_json = serde_json::to_string(media_items).unwrap_or_default();
-    // Sidecar: serialize EntryMeta so it can be restored on retry.
     let meta_json = meta
         .map(|m| serde_json::to_string(m).unwrap_or_default())
         .unwrap_or_default();
@@ -712,7 +504,6 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
     .await
     {
         Ok(true) => {
-            // Newly enqueued: notify the owner (only on the first failure).
             let msg = push_fail_msg(
                 lang,
                 i18n::t(lang, "notif_queued"),
@@ -722,9 +513,6 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
                 &entry_link,
             );
             notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-            // Download-failure/oversized-video alerts are not persisted: send
-            // them at enqueue time, otherwise these alerts would be lost once
-            // the outbox retry succeeds.
             if !notify_warnings.is_empty() {
                 notify_download_failed(
                     bot,
@@ -755,14 +543,9 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
             }
         }
         Ok(false) => {
-            // Already in the queue (enqueued by a previous fetch round): do
-            // not notify again, avoiding the same notice every round during a
-            // persistent outage.
             debug!(feed = %cfg.feed_url, entry_id = %eid, "already in outbox, skipping notice");
         }
         Err(insert_err) => {
-            // outbox write failed: fall back to marking sent (prevents
-            // infinite retries).
             error!(feed = %cfg.feed_url, error = %insert_err, "outbox insert failed, marking sent");
             db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, eid).await?;
             let msg = push_fail_msg(
@@ -780,11 +563,8 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
 }
 
 enum MediaGateAction {
-    /// Entry handled (skipped/marked sent); continue with the next entry.
     Continue,
-    /// Defer the current entry (keep conditional headers stale).
     DeferContinue,
-    /// Proceed to send, carrying the degrade-after-retries note.
     Proceed { dl_retry_note: String },
 }
 
@@ -802,8 +582,6 @@ struct MediaGateCtx<'a> {
     mode: ContentMode,
 }
 
-/// Apply the MediaOnly skip rules and the cross-round download retry ledger.
-/// Returns whether the entry should be skipped, deferred or sent.
 async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
     let state = ctx.state;
     let bot = ctx.bot;
@@ -815,18 +593,11 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
     let entry = ctx.entry;
     let eid = ctx.entry_id;
     let prepared = ctx.prepared;
-    // Owner-facing warning texts. Per-file oversized skips are muted when
-    // NOTIFY_OVERSIZED_MEDIA=false; the raw warning list still drives MediaOnly
-    // retry / mark-sent control flow, so the gate never changes delivery.
     let notify_warnings = prepared.notify_warnings(state.config.notify_oversized_media);
     let has_download_warnings = !prepared.warnings.is_empty();
     let notify_oversized = state.config.notify_oversized_media;
     let oversized = &prepared.oversized_videos;
 
-    // Media-only mode: silently skip when there is no media. Mark as sent only
-    // when the entry itself has no media at all (no download warnings);
-    // otherwise leave it for the next round's retry. Retry cap is 10: once
-    // exceeded, mark as sent and notify the owner.
     if ctx.mode == ContentMode::MediaOnly && prepared.items.is_empty() {
         let entry_link = fetcher::entry_link(entry).unwrap_or_default();
         if notify_oversized {
@@ -846,8 +617,6 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
         }
         if has_download_warnings {
             let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, eid);
-            // On a DB read error, do NOT treat the counter as 0: that would
-            // reset the failure streak and defeat the cap. Defer the round.
             let stored = match db::get_setting(&state.db, &retry_key).await {
                 Ok(v) => v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
                 Err(e) => {
@@ -873,8 +642,6 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
                         &entry_link,
                     );
                     notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-                    // Clear the counter before marking sent: a failed mark
-                    // (`?`) must not leave the key to re-trigger this branch.
                     db::delete_setting(&state.db, &retry_key).await.ok();
                     db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, eid).await?;
                 }
@@ -912,9 +679,6 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
     }
 
     let mut dl_retry_note = String::new();
-    // Other modes: a download error is usually transient; defer and re-download
-    // instead of immediately losing media. Deterministic warnings alone do not
-    // defer (`download_failed` is only set on a real error).
     if ctx.mode != ContentMode::MediaOnly && prepared.download_failed {
         let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, eid);
         let stored = match db::get_setting(&state.db, &retry_key).await {
@@ -945,7 +709,6 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
         }
     }
 
-    // Entry is sent this round: clear any stale retry counter.
     if ctx.mode == ContentMode::MediaOnly || !prepared.download_failed {
         let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, eid);
         db::delete_setting(&state.db, &retry_key).await.ok();
@@ -953,8 +716,6 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
     Ok(MediaGateAction::Proceed { dl_retry_note })
 }
 
-/// Handle one feed fetch failure: platform round stats, cookie-expiry flag,
-/// error counter, auto-disable and the first-disable owner notification.
 async fn handle_fetch_failure(
     state: &AppState,
     bot: &Bot,
@@ -966,20 +727,11 @@ async fn handle_fetch_failure(
     let err_msg = format!("{:#}", e);
     warn!(feed = %sub.feed_url, error = %err_msg, "fetch failed");
 
-    // Record that this platform had a failure this round + save the last error
-    // message (for whole-round hysteresis evaluation).
     if let Some(p) = platform_of_url(&sub.feed_url) {
         stats.failed.lock().await.insert(p);
         stats.last_err.lock().await.insert(p, err_msg.clone());
     }
 
-    // Cookie-expired flag (for the /cookies panel status display): set
-    // immediately (global); this is NOT a push notification. The admin alert
-    // follows the platform-health hysteresis (two consecutive all-failed
-    // rounds), so one jitter round stays quiet. Detection is typed first
-    // (PlatformError::AuthExpired); the legacy "cookie" substring is kept as a
-    // fallback for "cookie not configured" messages that predate the typed
-    // error.
     let auth_expired = e.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<crate::platforms::PlatformError>(),
@@ -997,11 +749,6 @@ async fn handle_fetch_failure(
     let count = db::increment_error_count(&state.db, sub.id, &err_msg).await?;
 
     if count >= state.config.max_fetch_errors && sub.active == 1 {
-        // Auto-disable (marked as system-auto-disabled; the self-heal job
-        // auto-recovers it after the cooldown). The UPDATE carries an
-        // `active = 1` guard closing the manual-pause race: the round-start
-        // snapshot may be stale if the user paused the source mid-round, in
-        // which case the disable is skipped (rows_affected = 0).
         if !db::auto_disable_subscription(&state.db, sub.id).await? {
             info!(
                 feed = %sub.feed_url,
@@ -1010,9 +757,6 @@ async fn handle_fetch_failure(
             return Ok(());
         }
         info!(feed = %sub.feed_url, errors = count, "subscription auto-disabled");
-        // Edge deduplication: no duplicate notification when the same source
-        // goes disable → self-heal → fail again. A successful fetch clears the
-        // flag so the next failure can notify again.
         let notify_key = db::setting_key::auto_disable_notified(&sub.chat_id, &sub.feed_url);
         let already_notified = db::get_setting(&state.db, &notify_key)
             .await
@@ -1057,9 +801,6 @@ struct EntryPrep {
     oversized: Vec<crate::media::OversizedVideo>,
 }
 
-/// Prepare one entry for sending: media download, MediaOnly/defer gate and the
-/// final pre-send dedup recheck. Returns an action when the entry should be
-/// skipped/deferred instead of sent.
 #[allow(clippy::too_many_arguments)]
 async fn prepare_entry_for_send(
     state: &AppState,
@@ -1078,7 +819,6 @@ async fn prepare_entry_for_send(
     storage_notice_sent: &mut bool,
 ) -> anyhow::Result<Result<EntryPrep, EntryPrepAction>> {
     let eid = entry_id;
-    // Sidecar: structured metadata by entry_id (empty for RSS).
     let meta = fr.metas.get(eid);
     let prepared = if opts.mode.skip_media() {
         crate::media::PreparedMedia::empty()
@@ -1095,10 +835,6 @@ async fn prepare_entry_for_send(
         )
         .await
     };
-    // The media root/year-level directory could not be created. This is an
-    // environment failure, not "the entry has no media": defer the entry so
-    // nothing is marked sent as text, keep the negotiation headers stale, and
-    // notify the owner once for this feed.
     if prepared.setup_failed {
         if !*storage_notice_sent {
             *storage_notice_sent = true;
@@ -1136,8 +872,6 @@ async fn prepare_entry_for_send(
     let notify_oversized = state.config.notify_oversized_media;
     let oversized = prepared.oversized_videos.clone();
 
-    // Final pre-send dedup recheck: media preparation can take minutes, long
-    // enough for an overlapping outbox retry to deliver the same entry.
     match entry_already_handled(state, &cfg.chat_id, &cfg.feed_url, eid).await {
         Ok(true) => return Ok(Err(EntryPrepAction::Continue)),
         Ok(false) => {}
@@ -1188,7 +922,6 @@ struct SendAndHandleCtx<'a> {
     transport: &'a crate::media::MediaTransport,
 }
 
-/// Send one prepared entry and apply success side effects or failure recovery.
 async fn send_and_handle(ctx: &SendAndHandleCtx<'_>) -> anyhow::Result<EntrySendAction> {
     let state = ctx.state;
     let bot = ctx.bot;
@@ -1211,9 +944,6 @@ async fn send_and_handle(ctx: &SendAndHandleCtx<'_>) -> anyhow::Result<EntrySend
     let transport = ctx.transport;
 
     let author = fetcher::entry_author(entry);
-    // No whole-entry retry for sending: the segment/op-level resume inside
-    // the push functions already avoids replaying delivered parts; persistent
-    // failures go to the outbox.
     let result: anyhow::Result<push::SendOutcome> = if prepared.items.is_empty() {
         push::send_text_only(
             bot,
@@ -1311,9 +1041,6 @@ struct FeedOwnerCtx {
     allow_trusted_private: bool,
 }
 
-/// Resolve the owner, notification language, trusted-private permission and
-/// record the platform as scheduled this round. Returns None when the owner is
-/// no longer whitelisted (the feed is skipped).
 async fn resolve_feed_owner(
     state: &AppState,
     sub: &db::SubRow,
@@ -1356,14 +1083,10 @@ async fn resolve_feed_owner(
 }
 
 enum FeedFetchError {
-    /// The pre-fetch sent-entry snapshot query failed; defer the feed.
     Deferred,
-    /// The actual fetch failed (already retried once for transient RSS errors).
     Failed(anyhow::Error),
 }
 
-/// Fetch one feed with the RSS transient debounce and the Weibo enrichment
-/// snapshot. The snapshot is bounded and released as soon as fetching ends.
 async fn fetch_feed_with_retry(
     state: &AppState,
     sub: &db::SubRow,
@@ -1406,7 +1129,6 @@ async fn fetch_feed_with_retry(
     };
     let result = fetcher::fetch_feed(state, &sub.feed_url, &fetch_opts).await;
     let result = match result {
-        // `{:#}` preserves the reqwest source chain for is_net_error.
         Err(ref e) if is_rss_source && sendpolicy::is_net_error(&format!("{:#}", e)) => {
             warn!(
                 feed = %sub.feed_url,
@@ -1422,13 +1144,6 @@ async fn fetch_feed_with_retry(
     result.map_err(FeedFetchError::Failed)
 }
 
-/// Process a single source: fetch + push new entries in chronological order.
-/// Parallel across sources, serial within a source.
-/// All failure notifications are sent immediately, no longer batched until the
-/// end of the cycle.
-/// `stats` records this round's platform-level scheduling and success/failure
-/// outcomes, for run_fetch_cycle to perform hysteresis evaluation after the
-/// whole round ends.
 async fn process_feed(
     state: &AppState,
     bot: &Bot,
@@ -1451,40 +1166,22 @@ async fn process_feed(
 
     match result {
         Ok(fr) => {
-            // Reset error count on success (a 304 "source not updated" also
-            // counts as success).
-            // Do not use `?`: a single DB hiccup should not invalidate the
-            // whole round's fetch results (otherwise this round's entries
-            // would all go unpushed and health stats would be missing); a
-            // failed reset merely leaves a trace and is retried next round.
             if let Err(e) = db::reset_error_count(&state.db, sub.id).await {
                 warn!(feed = %sub.feed_url, error = %e, "reset error count failed");
             }
-            // After a successful fetch, clear the disable-notification flag so
-            // the next failure can notify again (#9 fix)
             let notify_key = db::setting_key::auto_disable_notified(&sub.chat_id, &sub.feed_url);
             db::delete_setting(&state.db, &notify_key).await.ok();
 
-            // Record that this platform had a success this round (for the
-            // whole-round hysteresis all-success/mixed criterion).
             if let Some(p) = platform_of_url(&sub.feed_url) {
                 stats.ok.lock().await.insert(p);
             }
 
-            // 304 Not Modified: the source has no updates, nothing to push
             if fr.not_modified {
                 return Ok(FeedStatus::Ok);
             }
 
-            // Stale-zero detector (structure-independent): a 200 full-body
-            // fetch that parses to zero entries extends the streak; any entry
-            // produced clears it. A 304 round above never touches it (an
-            // unchanged source is neither evidence of staleness nor health).
             note_zero_entry_round(state, &sub, fr.entries.is_empty()).await;
 
-            // Backfill/refresh feed title when not manually overridden.
-            // Covers subscriptions added while fetching was broken (title fell
-            // back to the raw URL) and feeds whose title changes later.
             if sub.title_overridden == 0 {
                 if let Some(t) = &fr.feed_title {
                     if Some(t.as_str()) != sub.feed_title.as_deref() {
@@ -1495,10 +1192,6 @@ async fn process_feed(
                 }
             }
 
-            // Push new entries (skip already-sent). Use the title from this
-            // fetch when the subscription is not manually overridden, so the
-            // round that discovers a rename already renders the new title
-            // instead of lagging one cycle behind the DB update above.
             let feed_title = policy::effective_feed_title(
                 sub.title_overridden != 0,
                 fr.feed_title.as_deref(),
@@ -1514,15 +1207,10 @@ async fn process_feed(
             let chat_id: i64 = match cfg.chat_id.parse() {
                 Ok(id) => id,
                 Err(_) => {
-                    // chat_id is not numeric (e.g. legacy dirty data): silently
-                    // sending to chat 0 would fail forever and be hard to
-                    // debug, so warn explicitly and skip this subscription's
-                    // push for this round.
                     warn!(chat_id = %cfg.chat_id, feed = %cfg.feed_url, "invalid chat_id, skipping subscription");
                     return Ok(FeedStatus::Ok);
                 }
             };
-            // Channel title for notices (owner already resolved at function top).
             let chat_title = db::get_chat(&state.db, &cfg.chat_id)
                 .await
                 .ok()
@@ -1530,11 +1218,7 @@ async fn process_feed(
                 .and_then(|c| c.title)
                 .unwrap_or_else(|| cfg.chat_id.clone());
 
-            // Content filter config (feed level): takes effect when the switch
-            // is on and the keywords are non-empty. A DB error must not be
-            // treated as "no filter": that would push blocked content and mark
-            // it sent, making the blocklist silently lose an entry. Defer the
-            // whole feed this round, consistent with the sent/outbox reads.
+            // A filter-config DB error is not "no filter": defer the entry instead of pushing blocked content.
             let filter_cfg = match db::get_feed_filter(&state.db, &cfg.chat_id, &cfg.feed_url).await
             {
                 Ok(cfg) => cfg,
@@ -1543,24 +1227,8 @@ async fn process_feed(
                     return Ok(FeedStatus::Failed);
                 }
             };
-            // Parse the keyword list once per feed, not once per entry.
             let filter_keywords = filter_cfg.keyword_list();
 
-            // First filter out unsent entries, then push in ascending order of
-            // publish time (old → new). RSS feeds are mostly "newest first";
-            // pushing in the original order would invert the timeline of the
-            // channel's message stream.
-            // Cross-cycle double-send guard: an entry queued in the outbox but
-            // not yet in sent_entries must be skipped — the outbox has sole
-            // retry authority. These sets are queried again after the fetch:
-            // the pre-fetch snapshot is only for enrichment and may be stale
-            // (an overlapping outbox retry can finish while the fetch runs).
-            // Sent ids are queried with a chunked IN over the current feed
-            // window; only matching rows are read, so memory is bounded by the
-            // fetched entry count instead of the subscription's entire
-            // (never-pruned) sent history.
-            // A read error must fail closed and leave the headers untouched,
-            // so the whole feed is retried next round instead of being pushed.
             let wanted_ids: Vec<String> = fr.entries.iter().map(fetcher::entry_id).collect();
             let known_sent = match db::sent_entry_ids_in_window(
                 &state.db,
@@ -1592,16 +1260,9 @@ async fn process_feed(
                         return Ok(FeedStatus::Failed);
                     }
                 };
-            // Cooperative deadline covers filtering too: a 20MB feed can hold
-            // tens of thousands of entries, and the old code created the
-            // deadline only after the filter loop.
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(FEED_DEADLINE_SECS);
-            // One storage-failure notice per feed per round: a global volume
-            // outage would otherwise send one notice per media entry.
             let mut storage_notice_sent = false;
-            // Dedup/filter/deadline/sort live in a pure helper; the caller
-            // still owns the sent/outbox queries and the mark-sent writes.
             let selection = pending::select_pending(
                 &fr.entries,
                 &known_sent,
@@ -1619,25 +1280,13 @@ async fn process_feed(
             }
             let mut deferred = selection.deferred;
             for eid in &selection.filtered_ids {
-                // Content-filtered entries are marked sent directly (never
-                // pushed), avoiding repeated checks every round.
                 db::mark_entry_sent(&state.db, &cfg.chat_id, &cfg.feed_url, eid).await?;
             }
             let pending = selection.entries;
-            // The filter sets are not needed during the (much slower) send
-            // loop; release them now instead of holding a long-lived
-            // subscription's history for the whole entry-processing phase.
             drop(known_sent);
             drop(outbox_ids);
 
-            // True when an entry loop was cut short (filtering or pushing).
-            // The response's negotiation headers are only saved when everything
-            // drained fully (see after the loop): saving them while some
-            // entries were deferred would let the next round's conditional
-            // request return 304 and permanently swallow the unpushed entries.
-            // A `?` abort returns before this point too, so headers stay at
-            // the previous round's value and the next round re-fetches the
-            // full body (sent_entries dedup prevents double-push).
+            // Save ETag/Last-Modified only when all entries drained; a premature 304 permanently swallows deferred entries.
             for entry in pending {
                 if tokio::time::Instant::now() >= deadline {
                     warn!(
@@ -1648,11 +1297,6 @@ async fn process_feed(
                     break;
                 }
                 let eid = fetcher::entry_id(entry);
-                // Recheck right before doing any work: the batch sets were
-                // queried after the fetch but an overlapping outbox retry can
-                // still finish between that query and this entry. Skipping a
-                // delivered/queued entry is safe; a DB error is not, because
-                // sending without dedup could double-post.
                 match entry_already_handled(state, &cfg.chat_id, &cfg.feed_url, &eid).await {
                     Ok(true) => {
                         debug!(feed = %cfg.feed_url, entry_id = %eid, "entry already handled, skipping");
@@ -1740,17 +1384,8 @@ async fn process_feed(
                         break;
                     }
                 }
-                // Send rate limiting is handled by the push module's ChatPacer,
-                // which queues uniformly per channel (≥2s/message); no extra
-                // sleep is needed here.
             }
 
-            // Save this response's negotiation headers for the next
-            // conditional request — but only when every entry in this round
-            // was fully processed. On deadline deferral (or a `?` abort that
-            // skips this code) the headers stay stale, forcing the next round
-            // to re-fetch the full body and pick up the leftovers (sent_entries
-            // dedup keeps already-pushed entries from being re-pushed).
             if !deferred {
                 db::update_fetch_headers(
                     &state.db,
@@ -1776,23 +1411,11 @@ async fn process_feed(
     })
 }
 
-/// Determine which platform (weibo / x / telegram) a feed_url belongs to;
-/// returns None for non-platform sources. Registry-driven (platform_for_url),
-/// so adding a new platform requires no changes to this file.
 fn platform_of_url(feed_url: &str) -> Option<&'static str> {
     crate::platforms::platform_for_url(feed_url).map(|p| p.id)
 }
 
-/// Platform-level health detection (failure direction): called after the
-/// hysteresis evaluation in run_fetch_cycle. The atomic flip guarantees a
-/// single notification on ok → down only; no repeat while persistently down.
-/// v1.11.0: after cookies were globalized, notifications go to the single admin (v1.11.3).
 async fn maybe_notify_platform_down(bot: &Bot, state: &AppState, platform: &str, err_msg: &str) {
-    // Atomic edge trigger: returns true only when the state flips from
-    // non-down to down. DB errors and "already down" are handled differently:
-    // errors log a warn and leave a trace (it will be retried next round if
-    // the streak still meets the threshold, so it self-heals), instead of
-    // being silently swallowed and letting the alert vanish without a trace.
     let health_key = db::setting_key::platform_health(platform);
     let flipped = match db::flip_setting_once(&state.db, &health_key, "down").await {
         Ok(f) => f,
@@ -1802,16 +1425,13 @@ async fn maybe_notify_platform_down(bot: &Bot, state: &AppState, platform: &str,
         }
     };
     if !flipped {
-        return; // Already down, do not notify again
+        return;
     }
 
     let label = crate::platforms::find_platform(platform)
         .map(|p| p.label)
         .unwrap_or(platform);
 
-    // Unified format: title + detailed error wrapped in a blockquote.
-    // Whether it is folded is decided by the unified rule inside
-    // notify_user_html (fold when >200 characters).
     let delivered = notify_admins_html(bot, state, |lang| {
         i18n::t(lang, "notif_platform_down")
             .replacen("{}", label, 1)
@@ -1819,9 +1439,6 @@ async fn maybe_notify_platform_down(bot: &Bot, state: &AppState, platform: &str,
     })
     .await;
     if !delivered {
-        // The health bit was flipped before delivery; without reverting it,
-        // this edge would never fire again and the alert would be lost for
-        // the whole outage. Restore "ok" so the next qualifying round retries.
         if let Err(e) = db::set_setting(&state.db, &health_key, "ok").await {
             warn!(platform = platform, error = %e, "failed to restore health bit after undelivered alert");
         } else {
@@ -1833,17 +1450,8 @@ async fn maybe_notify_platform_down(bot: &Bot, state: &AppState, platform: &str,
     }
 }
 
-/// Platform-level health detection (recovery direction): called by
-/// run_fetch_cycle at the end of the whole round, triggered only when all of
-/// this platform's sources succeeded this round (avoiding flapping where a
-/// partial success reports recovery). Edge-triggered: notify only on
-/// down → ok; also clears the cookie-expired flag.
-/// v1.11.0: after cookies were globalized, notifications go to the single admin (v1.11.3).
 async fn maybe_notify_platform_recovered(bot: &Bot, state: &AppState, platform: &str) {
     let health_key = db::setting_key::platform_health(platform);
-    // Pre-check: attempt recovery only when clearly in the down state.
-    // Avoids mistakenly sending a "recovered" notification on a fresh install
-    // (key does not exist).
     let was_down = matches!(
         db::get_setting(&state.db, &health_key).await,
         Ok(Some(v)) if v == "down"
@@ -1852,9 +1460,6 @@ async fn maybe_notify_platform_recovered(bot: &Bot, state: &AppState, platform: 
         return;
     }
 
-    // Atomic edge trigger: returns true only when the state flips from non-ok
-    // to ok. DB errors log a warn and leave a trace (retried next round if
-    // everything still succeeds); not silently swallowed.
     let flipped = match db::flip_setting_once(&state.db, &health_key, "ok").await {
         Ok(f) => f,
         Err(e) => {
@@ -1866,8 +1471,6 @@ async fn maybe_notify_platform_recovered(bot: &Bot, state: &AppState, platform: 
         return;
     }
 
-    // Clear the cookie-expired flag (the /cookies panel no longer shows
-    // "expired")
     db::set_setting(
         &state.db,
         &db::setting_key::cookie_expired_notified(platform),
@@ -1885,11 +1488,6 @@ async fn maybe_notify_platform_recovered(bot: &Bot, state: &AppState, platform: 
     .await;
 }
 
-// ===== Outbox retry (persistent retry queue for failed sends) =====
-
-/// Register the outbox retry job: runs every 5 minutes, retries failed sends
-/// with exponential backoff (capped at 2h intervals), and abandons after 72h
-/// from the first actual retry attempt (never-attempted rows are not abandoned).
 pub async fn register_outbox_retry_job(
     sched: &JobScheduler,
     state: AppState,
@@ -1912,37 +1510,22 @@ pub async fn register_outbox_retry_job(
     Ok(())
 }
 
-/// Exponential backoff intervals (seconds) for outbox retries.
-/// Index = attempts (0-based after first failure). Capped at 2h.
 fn outbox_backoff_secs(attempts: i64) -> i64 {
     match attempts {
-        0 => 60,   // 1 min
-        1 => 300,  // 5 min
-        2 => 900,  // 15 min
-        3 => 1800, // 30 min
-        4 => 3600, // 1 hour
-        _ => 7200, // 2 hours (cap)
+        0 => 60,
+        1 => 300,
+        2 => 900,
+        3 => 1800,
+        4 => 3600,
+        _ => 7200,
     }
 }
 
-/// Total elapsed time before abandoning an outbox entry (72 hours), measured
-/// from the first real retry attempt (not from enqueue time). Rows that never
-/// received a turn during a long backlog are retried instead of being silently
-/// abandoned.
 const OUTBOX_ABANDON_SECS: i64 = 72 * 3600;
-/// Hard cap for rows whose attempts counter never advanced (persistent DB
-/// write failures). Without it, `attempts <= 0` made the 72h abandon guard
-/// unreachable and the row was retried every cron tick forever.
 const OUTBOX_UNATTEMPTED_MAX_SECS: i64 = 7 * 24 * 3600;
 
-/// Rows fetched per retry round (every 5 minutes). Raised from 10 to 25 so a
-/// long Telegram outage cannot leave the oldest rows permanently at the back
-/// of the queue.
 const OUTBOX_BATCH_LIMIT: i64 = 25;
 
-/// Extract the new supergroup id from a send failure. The typed teloxide
-/// variant is preferred; media paths stringify errors, so the Display text
-/// ("migrated to a supergroup with ID #-100…") is the fallback.
 fn migrated_chat_id_from_error(e: &anyhow::Error) -> Option<String> {
     if let Some(teloxide::RequestError::MigrateToChatId(id)) =
         e.downcast_ref::<teloxide::RequestError>()
@@ -1959,8 +1542,6 @@ fn migrated_chat_id_from_error(e: &anyhow::Error) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
-/// Record one send failure for a source. Returns true when the caller must not
-/// enqueue the current entry (the source/chat has just been disabled).
 async fn record_send_failure(
     bot: &Bot,
     state: &AppState,
@@ -1988,11 +1569,6 @@ async fn record_send_failure(
     }
 
     let err_str = format!("{:#}", err);
-    // A permanent chat error (bot removed / no rights / chat gone) cannot be
-    // fixed by retrying this source, but disabling the chat row would also
-    // hide it from `/set` and block the owner from inspecting/resuming after
-    // fixing permissions. Disable only this source; a real bot removal is
-    // handled by my_chat_member (which soft-disables the whole chat).
     let permanent = sendpolicy::is_permanent_chat_error(&err_str);
     match db::auto_disable_subscription(&state.db, sub.id).await {
         Ok(true) => {
@@ -2030,14 +1606,6 @@ async fn clear_send_failure(state: &AppState, chat_id: &str, feed_url: &str) {
     }
 }
 
-/// Whether a queue row is past its 72h retry window. The clock starts at the
-/// first actual attempt, not at enqueue time; a row that has never been tried
-/// is never abandoned (it may simply have been behind a long backlog). Legacy
-/// rows without `first_attempt_at` fall back to `created_at`, matching the old
-/// behavior for rows that had already been attempted.
-///
-/// Do not anchor at the most recent attempt: continuous retries would refresh
-/// the anchor forever and the row would never be abandoned.
 fn outbox_abandon_due(
     created_at: i64,
     first_attempt_at: Option<i64>,
@@ -2045,22 +1613,12 @@ fn outbox_abandon_due(
     now: i64,
 ) -> bool {
     if attempts <= 0 {
-        // A never-attempted row is usually behind a backlog and should not be
-        // abandoned early. But if the attempts update itself keeps failing,
-        // this branch would otherwise be permanent; apply a long hard cap.
         return now - created_at >= OUTBOX_UNATTEMPTED_MAX_SECS;
     }
     let anchor = first_attempt_at.unwrap_or(created_at);
     now - anchor >= OUTBOX_ABANDON_SECS
 }
 
-/// Abandon one outbox entry: notify the owner + mark sent + delete the queue
-/// row. Shared by the 72h-timeout abandonment and the MediaOnly media-expiry
-/// abandonment (reason_key is the i18n key for the blockquote copy).
-/// Marking sent prevents the entry from being re-pushed by the next fetch
-/// while it is still in the source's sliding window, which would form an
-/// infinite loop of "re-push → fail → re-enqueue → abandon again" and
-/// duplicate notifications.
 async fn abandon_outbox_row(bot: &Bot, state: &AppState, row: &db::OutboxRow, reason_key: &str) {
     let lang = match db::get_chat_owner(&state.db, &row.chat_id).await {
         Ok(Some(owner)) => owner_lang(state, owner).await,
@@ -2078,10 +1636,6 @@ async fn abandon_outbox_row(bot: &Bot, state: &AppState, row: &db::OutboxRow, re
     notify_owner_html(bot, state, &row.chat_id, &msg).await;
     if let Err(e) = db::mark_entry_sent(&state.db, &row.chat_id, &row.feed_url, &row.entry_id).await
     {
-        // Keep the row: deleting it without the sent marker would let the
-        // next fetch re-push the entry, fail again, and re-enqueue it, turning
-        // the abandon path into a periodic notification loop. The next retry
-        // attempts the mark again before abandoning.
         warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to mark abandoned entry as sent; keeping the row");
         return;
     }
@@ -2093,11 +1647,6 @@ async fn abandon_outbox_row(bot: &Bot, state: &AppState, row: &db::OutboxRow, re
         .ok();
 }
 
-/// Notify the owner once when media files expired while an outbox row was
-/// waiting for retry. The flag is keyed by outbox row id: a persistent retry
-/// loop must not repeat this notice every backoff, and the row is deleted at
-/// 72h anyway. A DB read/write error skips/sends without dedup rather than
-/// hiding the loss; both paths leave a warn.
 async fn maybe_notify_outbox_media_lost(
     bot: &Bot,
     state: &AppState,
@@ -2143,9 +1692,6 @@ async fn maybe_notify_outbox_media_lost(
 }
 
 async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
-    // Reentrancy protection: one retry round can exceed the 5-minute cron
-    // interval due to large media uploads; without a lock, the next tick
-    // would concurrently pick up the same batch of rows and double-send.
     if state
         .outbox_retry_active
         .compare_exchange(
@@ -2183,8 +1729,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     let transport = crate::media::MediaTransport::new(&state.config);
 
     for id in due_ids {
-        // Fetch only this row: a batch of full rows can carry very large
-        // entry_json values, so the id list is the only shared batch state.
         let row = match db::outbox_get(&state.db, id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -2197,14 +1741,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 continue;
             }
         };
-        // Dedup guard first: if the entry was already delivered via the normal
-        // fetch path (e.g. network recovered and the next cycle re-pushed it),
-        // drop the queued copy instead of double-posting. Checking this before
-        // the 72h-abandon branch avoids a false "abandoned" notice for an entry
-        // that was actually delivered while sitting in the queue.
-        // Fail-closed: when the DB query errors, skip this round (keep the
-        // queue and re-check next round); do not treat a transient error as
-        // "not sent" and keep sending (prevents double-sends).
         match db::is_entry_sent(&state.db, &row.chat_id, &row.feed_url, &row.entry_id).await {
             Ok(true) => {
                 info!(entry_id = %row.entry_id, feed = %row.feed_url, "outbox entry already sent, dropping");
@@ -2222,12 +1758,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             }
         }
 
-        // Check if 72h elapsed since the first actual attempt -> abandon.
-        // Measuring from created_at silently abandoned rows that sat behind a
-        // long outage backlog and were never retried even once. Use a per-row
-        // clock: a batch of large uploads can outlive several backoff steps,
-        // and the round-start timestamp would make the next retry look due
-        // immediately.
         let row_now = chrono::Utc::now().timestamp();
         if outbox_abandon_due(row.created_at, row.first_attempt_at, row.attempts, row_now) {
             warn!(
@@ -2241,7 +1771,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             continue;
         }
 
-        // Deserialize entry
         let entry: feed_rs::model::Entry = match serde_json::from_str(&row.entry_json) {
             Ok(e) => e,
             Err(e) => {
@@ -2254,7 +1783,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             }
         };
 
-        // Deserialize media items (filter out files that no longer exist)
         let all_media: Vec<crate::media::MediaItem> = if row.media_json.trim().is_empty() {
             warn!(entry_id = %row.entry_id, "outbox: media_json is empty");
             Vec::new()
@@ -2270,10 +1798,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             all_media.into_iter().filter(|m| m.path.exists()).collect();
         let media_lost = had_media && media_items.len() < original_count;
 
-        // Reconstruct render opts BEFORE the MediaOnly check: content_mode is
-        // a legacy-tolerant string (`MediaOnly`/`mediaonly`), so a raw string
-        // compare here would bypass the abandon guard for older rows.
-        // Owner language drives user-visible fallbacks (missing title).
         let lang = match db::get_chat_owner(&state.db, &row.chat_id).await {
             Ok(Some(owner)) => owner_lang(state, owner).await,
             _ => Lang::En,
@@ -2283,15 +1807,9 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             source: push::SourceDisplay::from_str(&row.source_display),
             link_preview: row.link_preview,
             lang,
-            // Persistent retries stay on the proven standard path. A rich
-            // failure must never be repeated on every outbox backoff.
             allow_rich: false,
         };
 
-        // MediaOnly mode with no sendable media left (files cleaned up, or a
-        // legacy/corrupt media_json): the text renderer returns None for this
-        // mode, so send_text_only would report a silent success and the entry
-        // would be marked sent without delivering anything. Abandon instead.
         if opts.mode == ContentMode::MediaOnly && media_items.is_empty() {
             let reason = if had_media {
                 "notif_media_expired"
@@ -2325,19 +1843,12 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     "outbox retry: all media files expired, sending as text"
                 );
             }
-            // The enqueue-time notice only covered the original send failure;
-            // losing files while queued is a separate degradation and must be
-            // visible to the owner. One-shot per outbox row (a retry loop can
-            // run for 72h); the flag is removed on success/abandon and swept
-            // by cleanup if the row is removed elsewhere.
             maybe_notify_outbox_media_lost(bot, state, &row, original_count, media_items.len())
                 .await;
         }
         let chat_id: i64 = match row.chat_id.parse() {
             Ok(id) => id,
             Err(_) => {
-                // chat_id is not numeric: this entry can never be delivered,
-                // delete it to avoid infinite retries.
                 warn!(chat_id = %row.chat_id, entry_id = %row.entry_id, "outbox: invalid chat_id, dropping entry");
                 if let Err(e) = db::outbox_delete(&state.db, row.id).await {
                     warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete entry");
@@ -2348,11 +1859,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         };
         let author = row.author.as_deref();
 
-        // Second dedup check: the fetch cycle may have pushed the same entry
-        // between fetch_due and this row (check-then-act window); querying
-        // once more right before sending shrinks the window.
-        // Likewise fail-closed: on a DB error, skip this round rather than
-        // risking a send.
         match db::is_entry_sent(&state.db, &row.chat_id, &row.feed_url, &row.entry_id).await {
             Ok(true) => {
                 info!(entry_id = %row.entry_id, feed = %row.feed_url, "outbox entry sent between fetch and send, dropping");
@@ -2370,10 +1876,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             }
         }
 
-        // Sidecar: the meta for outbox retries comes from the
-        // meta_json column. An empty string or a deserialization failure is
-        // treated as no meta (compatibility with historical rows; behavior
-        // degrades to pure text).
         let outbox_meta: Option<crate::entrymeta::EntryMeta> = if row.meta_json.is_empty() {
             None
         } else {
@@ -2381,12 +1883,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         };
         let meta_ref = outbox_meta.as_ref();
 
-        // Attempt send
         let result = if media_items.is_empty() {
-            // The pure-text path uniformly goes through send_text_only; it was
-            // converged with the main push path into a single function because
-            // the poll-resend logic had previously been fixed twice due to
-            // dual-path drift (v1.9.3/v1.9.6).
             push::send_text_only(
                 bot,
                 chat_id,
@@ -2421,8 +1918,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             Ok(send_outcome) => {
                 info!(entry_id = %row.entry_id, feed = %row.feed_url, "outbox retry succeeded");
                 sent += 1;
-                // Resolve the owner-facing context only when a notice is
-                // actually needed; a successful retry usually needs none.
                 let needs_notice = send_outcome.text_partial
                     || send_outcome.media_failed
                     || send_outcome.uncertain;
@@ -2529,7 +2024,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Extract entry link from serialized entry JSON (best-effort).
 fn extract_entry_link_from_json(entry_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(entry_json).ok()?;
     v.get("links")
@@ -2547,8 +2041,6 @@ mod tests {
     #[test]
     fn outbox_abandon_requires_an_attempt_and_uses_first_attempt() {
         let now = 1_000_000_000;
-        // Never attempted: held for a long grace period, then hard-capped so a
-        // persistently failing attempts update cannot retry forever.
         assert!(!outbox_abandon_due(now - 5 * 24 * 3600, None, 0, now));
         assert!(outbox_abandon_due(
             now - OUTBOX_UNATTEMPTED_MAX_SECS,
@@ -2556,34 +2048,27 @@ mod tests {
             0,
             now
         ));
-        // First attempt past 72h, even if retries kept happening since:
-        // this is the regression the last_attempt_at anchor missed.
         assert!(outbox_abandon_due(
             now - 10 * 24 * 3600,
             Some(now - OUTBOX_ABANDON_SECS - 1),
             5,
             now
         ));
-        // First attempt recent even though enqueued long ago: still retried.
         assert!(!outbox_abandon_due(
             now - 10 * 24 * 3600,
             Some(now - 3600),
             2,
             now
         ));
-        // Legacy row (attempts>0, no first_attempt_at): use created_at.
         assert!(outbox_abandon_due(now - OUTBOX_ABANDON_SECS, None, 1, now));
     }
 
     #[test]
     fn stale_zero_counts_up_and_warns_on_multiples() {
-        // First round: no warn (streak 1 of 20).
         assert_eq!(stale_zero_next(0), (1, false));
         assert_eq!(stale_zero_next(18), (19, false));
-        // Exactly the threshold warns, then every 20 consecutive silent rounds.
         assert_eq!(stale_zero_next(STALE_ZERO_WARN_ROUNDS - 1), (20, true));
         assert_eq!(stale_zero_next(39), (40, true));
-        // Between the multiples, counting continues silently.
         assert_eq!(stale_zero_next(40), (41, false));
         assert_eq!(stale_zero_next(60), (61, false));
     }

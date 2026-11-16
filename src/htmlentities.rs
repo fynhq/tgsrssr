@@ -1,8 +1,3 @@
-//! HTML5 named-character reference table (all `&name;` references).
-//!
-//! Generated from Python's `html.entities.html5` (semicolon forms only); used
-//! for visible-text decoding. Unknown names are left literal by the caller.
-
 pub(crate) fn named(name: &str) -> Option<&'static str> {
     Some(match name {
         "AElig" => "\u{C6}",

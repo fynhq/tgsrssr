@@ -1,33 +1,17 @@
-//! Shared command-path fetch flow.
-//!
-//! `/sub` and `/test` both resolve a target chat, reject self-feeds, check the
-//! platform cookie, take the command-path platform semaphore and fetch with a
-//! no-conditional-request option set. Keeping the flow here removes the
-//! duplicated validation blocks and gives `/sub` a single place to opt out of
-//! Weibo detail/vote enrichment.
-
 use crate::db;
 use crate::fetcher::{self, Enrichment, FetchOptions, FetchResult};
 use crate::i18n::{self, Lang};
 use crate::platforms;
 use crate::state::AppState;
 
-/// User-facing failure classes shared by `/sub` and `/test`.
 pub(super) enum CommandFetchError {
-    /// Platform source requires an admin-configured cookie.
     PlatformClosed(&'static str),
-    /// The target channel's own Telegram preview is the source.
     SelfSource,
-    /// `is_self_telegram_source` DB lookup failed.
     CheckFailed(anyhow::Error),
-    /// The command-path platform semaphore is closed.
     Busy,
-    /// The feed/platform fetch failed.
     FetchFailed(anyhow::Error),
 }
 
-/// Resolve validation + fetch for one URL. The caller maps the error to its
-/// own command's copy (`/sub` uses HTML blockquotes; `/test` uses plain text).
 pub(super) async fn fetch_command_feed(
     state: &AppState,
     chat_id: &str,
@@ -40,9 +24,6 @@ pub(super) async fn fetch_command_feed(
     fetch_command_feed_unchecked(state, url, lang, allow_trusted_private, enrichment).await
 }
 
-/// Pre-fetch validation shared by `/sub` and `/test`: platform cookie and
-/// self-feed checks. `/test` runs this before sending its progress message so
-/// validation failures still arrive as a direct reply.
 pub(super) async fn validate_command_source(
     state: &AppState,
     chat_id: &str,
@@ -61,7 +42,6 @@ pub(super) async fn validate_command_source(
     }
 }
 
-/// Semaphore-guarded fetch without the pre-checks above.
 pub(super) async fn fetch_command_feed_unchecked(
     state: &AppState,
     url: &str,
@@ -70,8 +50,6 @@ pub(super) async fn fetch_command_feed_unchecked(
     enrichment: Enrichment,
 ) -> Result<FetchResult, CommandFetchError> {
     let is_platform = platforms::platform_for_url(url).is_some();
-    // Platform fetches share a capacity-2 command semaphore; plain RSS fetches
-    // are already bounded by the fetch semaphore inside fetch_feed.
     let _permit = if is_platform {
         Some(
             state
@@ -97,7 +75,6 @@ pub(super) async fn fetch_command_feed_unchecked(
         .map_err(CommandFetchError::FetchFailed)
 }
 
-/// `/sub` copy for a command fetch failure.
 pub(super) fn sub_error_text(lang: Lang, err: CommandFetchError) -> String {
     match err {
         CommandFetchError::PlatformClosed(label) => {
@@ -120,7 +97,6 @@ pub(super) fn sub_error_text(lang: Lang, err: CommandFetchError) -> String {
     }
 }
 
-/// `/test` copy for a command fetch failure.
 pub(super) fn test_error_text(lang: Lang, err: CommandFetchError) -> String {
     match err {
         CommandFetchError::PlatformClosed(label) => {
@@ -139,9 +115,6 @@ pub(super) fn test_error_text(lang: Lang, err: CommandFetchError) -> String {
     }
 }
 
-/// Reject subscribing a public Telegram channel to its own web preview. The
-/// preview contains the bot's own posts, and every push creates a new msgid
-/// that the next fetch sees as a new entry, forming an endless self-feed.
 async fn is_self_telegram_source(
     state: &AppState,
     chat_id: &str,
@@ -175,8 +148,6 @@ mod tests {
         assert!(closed.contains("Weibo"));
         assert!(closed.contains("unavailable"));
 
-        // Compare against the locale value to avoid duplicating user copy in
-        // the source tree.
         assert_eq!(
             sub_error_text(Lang::Zh, CommandFetchError::SelfSource),
             i18n::t(Lang::Zh, "sub_self_channel")
@@ -212,8 +183,6 @@ mod tests {
             Lang::En,
             CommandFetchError::FetchFailed(anyhow::anyhow!("bad <tag> & value")),
         );
-        // /test result messages are sent without parse mode, so the error is
-        // shown verbatim rather than HTML-escaped.
         assert!(fetch.contains("bad <tag> & value"));
         assert!(!fetch.contains("&lt;"));
 

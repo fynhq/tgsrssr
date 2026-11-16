@@ -1,12 +1,7 @@
-//! Chat- and feed-level delivery configuration.
-
 use super::*;
 
 pub async fn ensure_chat_config(db: &Db, chat_id: &str) -> anyhow::Result<()> {
-    // New channels default to a 30-minute fetch interval. The immutable
-    // baseline DDL (001_init.sql) still declares DEFAULT 10, so every insert
-    // path must pass 30 explicitly; the value must match
-    // DEFAULT_INTERVAL_MINUTES (asserted by test_default_constants).
+    // New channels default to 30 minutes; the immutable DDL default is 10, so every insert path must pass 30 explicitly.
     sqlx::query("INSERT OR IGNORE INTO chat_configs (chat_id, interval_minutes) VALUES (?, 30)")
         .bind(chat_id)
         .execute(db)
@@ -24,12 +19,6 @@ pub async fn get_chat_config(db: &Db, chat_id: &str) -> anyhow::Result<Option<Ch
     Ok(row)
 }
 
-/// Write-side whitelist for enum-valued chat/feed config fields. Callback
-/// data is client-controlled; an unknown value would otherwise be persisted
-/// verbatim (readers fall back to defaults, so this was never a crash, but
-/// dirty values lingered in the DB and were copied into outbox snapshots).
-/// Canonical snake_case only — legacy camel-case spellings are still accepted
-/// by readers for old rows, but writers always produce the canonical form.
 fn validate_config_value(field: &str, value: &str) -> anyhow::Result<()> {
     let allowed: &[&str] = match field {
         "content_mode" => &[
@@ -55,13 +44,7 @@ pub async fn set_chat_config_field(
     field: &str,
     value: &str,
 ) -> anyhow::Result<()> {
-    // Callers usually opened the settings page first, but do not rely on it:
-    // an UPDATE on a missing row affects zero rows and silently returns Ok,
-    // and the DDL default for a new interval is still 10. Create the row with
-    // the documented 30-minute default before updating the requested field.
     ensure_chat_config(db, chat_id).await?;
-    // The column name is a compile-time constant, so this does not violate
-    // the no-dynamic-SQL convention.
     let sql = match field {
         "interval_minutes" => "UPDATE chat_configs SET interval_minutes = ?, updated_at = datetime('now') WHERE chat_id = ?",
         "content_mode" => "UPDATE chat_configs SET content_mode = ?, updated_at = datetime('now') WHERE chat_id = ?",
@@ -71,9 +54,6 @@ pub async fn set_chat_config_field(
         _ => anyhow::bail!("unknown field: {}", field),
     };
     if field == "interval_minutes" {
-        // Defense: ensure the value bound to an INTEGER column is a valid
-        // number (callers usually validate already, but the db layer should
-        // not assume so).
         let v: i64 = value
             .parse()
             .map_err(|_| anyhow::anyhow!("interval_minutes must be numeric, got '{}'", value))?;
@@ -92,8 +72,6 @@ pub async fn set_chat_config_field(
     Ok(())
 }
 
-// ===== Feed configs =====
-
 pub async fn set_feed_config_field(
     db: &Db,
     chat_id: &str,
@@ -102,7 +80,6 @@ pub async fn set_feed_config_field(
     value: Option<&str>,
 ) -> anyhow::Result<()> {
     if value.is_none() {
-        // Reset to inherit: set column to NULL.
         let sql = match field {
             "interval_minutes" => "UPDATE feed_configs SET interval_minutes = NULL, updated_at = datetime('now') WHERE chat_id = ? AND feed_url = ?",
             "content_mode" => "UPDATE feed_configs SET content_mode = NULL, updated_at = datetime('now') WHERE chat_id = ? AND feed_url = ?",
@@ -116,12 +93,6 @@ pub async fn set_feed_config_field(
             .bind(feed_url)
             .execute(db)
             .await?;
-        // If all fields are NULL, delete the row.
-        // The three filter columns are NOT NULL DEFAULT (0/'blacklist'/'') and
-        // are never NULL, so we must judge by "filter completely unconfigured":
-        // as long as the user ever touched the filter (enabled the switch or
-        // stored keywords) keep the whole row, otherwise resetting other fields
-        // would silently lose the content-filter config.
         sqlx::query(
             "DELETE FROM feed_configs WHERE chat_id = ? AND feed_url = ? AND interval_minutes IS NULL AND content_mode IS NULL AND source_display IS NULL AND caption_above_media IS NULL AND link_preview IS NULL AND filter_enabled = 0 AND filter_keywords = '' AND filter_mode = 'blacklist'",
         )
@@ -139,8 +110,6 @@ pub async fn set_feed_config_field(
             _ => anyhow::bail!("unknown field: {}", field),
         };
         if field == "interval_minutes" {
-            // Defense: ensure the value bound to an INTEGER column is a valid
-            // number.
             let n: i64 = v
                 .parse()
                 .map_err(|_| anyhow::anyhow!("interval_minutes must be numeric, got '{}'", v))?;

@@ -1,30 +1,6 @@
-//! Internationalization module.
-//!
-//! Language detection: Telegram `language_code` field.
-//! - `zh-hans` / `zh-hant` / `zh` -> Chinese
-//! - Everything else -> English
-//!
-//! Storage: settings table key `lang:<user_id>` = "zh" | "en".
-//! Switch: /set panel language button.
-//!
-//! UI strings live in `locales/zh.conf` and `locales/en.conf` (one
-//! `key=value` line per key) and are embedded into the binary at compile time.
-//! `\n`, `\r`, `\t`, `\"` and `\\` escapes are decoded when a language map is
-//! first used.
-//!
-//! To add a language: add a variant, extend `db_value`, `Lang::ALL`,
-//! `source()` and the `strings()` map, then add `locales/<code>.conf`.
-//! The file must define its own `language.<code>` key (the language's
-//! self-name) plus every `cmd_menu.*` key; menu registration and the language
-//! picker iterate `Lang::ALL`, so no per-language match arms elsewhere are
-//! needed. The `t()` fallback routes every non-English language to English.
-//! The locale tests iterate `Lang::ALL`, so the new file is covered
-//! automatically.
-
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// Supported languages.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lang {
     Zh,
@@ -32,13 +8,8 @@ pub enum Lang {
 }
 
 impl Lang {
-    /// All supported languages, in UI cycle/picker order. Keep in sync with the
-    /// enum variants.
     pub const ALL: [Self; 2] = [Self::Zh, Self::En];
 
-    /// Parse from Telegram `language_code` (e.g. "zh-hans", "en", "ru").
-    /// A language matches its base code and any regional subtag of it, so
-    /// `zh-hans` -> Zh and `ja-JP` -> Ja.
     pub fn from_language_code(code: Option<&str>) -> Self {
         let Some(code) = code else {
             return Lang::En;
@@ -57,7 +28,6 @@ impl Lang {
         Lang::En
     }
 
-    /// Parse a stored or callback language code strictly.
     pub fn from_code(code: &str) -> Option<Self> {
         Self::ALL
             .iter()
@@ -65,12 +35,10 @@ impl Lang {
             .find(|lang| lang.db_value() == code)
     }
 
-    /// Parse from stored DB value.
     pub fn from_db_value(v: &str) -> Self {
         Self::from_code(v).unwrap_or(Lang::En)
     }
 
-    /// DB storage value.
     pub fn db_value(self) -> &'static str {
         match self {
             Lang::Zh => "zh",
@@ -78,21 +46,14 @@ impl Lang {
         }
     }
 
-    /// Settings key for a user.
     pub fn setting_key(user_id: i64) -> String {
         format!("lang:{user_id}")
     }
 
-    /// Locale key for this language's display name (`language.<code>`).
-    /// Derived from `db_value` so the language picker does not need a
-    /// per-language match arm; only the language's own locale file defines
-    /// this key.
     pub fn label_key(self) -> String {
         format!("language.{}", self.db_value())
     }
 
-    /// The language's own display name, read from its own locale file so a
-    /// picker option is never translated by the current UI language.
     pub fn label(self) -> &'static str {
         t(self, &self.label_key())
     }
@@ -114,10 +75,6 @@ impl Lang {
     }
 }
 
-/// Translate a static string by key.
-/// A missing non-English key falls back to the English text; a missing English
-/// key returns the "[?]" marker. The locale tests compare all files and scan
-/// every literal key used in the crate.
 pub fn t(lang: Lang, key: &str) -> &'static str {
     if let Some(value) = lang.strings().get(key) {
         return value.as_str();
@@ -147,8 +104,6 @@ fn parse(source: &'static str) -> HashMap<&'static str, String> {
     strings
 }
 
-/// Decode the small escape set used by the locale files. Unknown escapes are
-/// kept verbatim so a typo is visible instead of silently dropping a character.
 fn unescape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars();
@@ -173,12 +128,7 @@ fn unescape(value: &str) -> String {
     out
 }
 
-/// Fill `{}` placeholders in a single left-to-right pass.
-///
-/// Values are inserted verbatim and are never rescanned: a user-controlled
-/// value containing `{}` (a channel title, feed title, URL or error chain)
-/// cannot shift or swallow the following placeholders. Extra placeholders are
-/// left as literal `{}` and extra values are ignored.
+// Placeholder values are inserted verbatim and never rescanned; user text containing {} must not shift placeholders.
 pub fn fill(template: &str, values: &[&str]) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -264,7 +214,6 @@ mod tests {
 
     #[test]
     fn language_picker_labels_are_self_names() {
-        // Escapes keep source files outside the CJK allowlist free of CJK.
         assert_eq!(Lang::Zh.label(), "\u{4e2d}\u{6587}");
         assert_eq!(Lang::En.label(), "English");
     }
@@ -342,10 +291,6 @@ mod tests {
         }
     }
 
-    /// Keys passed to `i18n::t` through a variable rather than a literal at the
-    /// call site. Keep this list in sync with those call sites; a new dynamic
-    /// key that is missing here is reported by `locale_files_have_no_unused_keys`,
-    /// and a stale entry fails the quoted-literal check below.
     const DYNAMIC_KEYS: &[&str] = &[
         "back",
         "chpage_back",
@@ -379,10 +324,6 @@ mod tests {
         let source = source_text();
         let re = regex::Regex::new(r#"i18n::t\s*\(\s*[^,]+,\s*"([a-z0-9_.]+)""#).unwrap();
         let mut keys: HashSet<String> = DYNAMIC_KEYS.iter().map(|key| (*key).to_string()).collect();
-        // Language-picker labels are looked up through `Lang::label()` /
-        // `label_key()` rather than a literal `i18n::t` call; register every
-        // supported key so a new language's missing `language.<code>` fails
-        // the key-set test.
         for lang in Lang::ALL {
             keys.insert(lang.label_key());
         }

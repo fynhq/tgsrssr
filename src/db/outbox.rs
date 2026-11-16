@@ -1,12 +1,6 @@
-//! Persistent retry queue (outbox) storage.
-
 use super::*;
 use sqlx::Row;
 
-// next_retry_at/last_error are only used in SQL WHERE/UPDATE and never read
-// directly on the Rust side — kept to preserve the complete mapping of the
-// database schema. `first_attempt_at` is read by the retry loop to measure the
-// 72h abandonment window from the first actual attempt instead of enqueue time.
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OutboxRow {
@@ -17,8 +11,6 @@ pub struct OutboxRow {
     pub feed_title: String,
     pub entry_json: String,
     pub media_json: String,
-    /// Sidecar: serialized EntryMeta JSON (empty string means no
-    /// metadata).
     pub meta_json: String,
     pub content_mode: String,
     pub source_display: String,
@@ -28,14 +20,10 @@ pub struct OutboxRow {
     pub attempts: i64,
     pub next_retry_at: i64,
     pub created_at: i64,
-    /// Unix seconds of the first real retry attempt; NULL until the first
-    /// attempt (legacy rows may also be NULL).
     pub first_attempt_at: Option<i64>,
     pub last_error: Option<String>,
 }
 
-/// Insert a failed entry into the outbox for later retry.
-/// Uses INSERT OR IGNORE to avoid duplicates (same entry already queued).
 #[allow(clippy::too_many_arguments)]
 pub async fn outbox_insert(
     db: &Db,
@@ -73,18 +61,9 @@ pub async fn outbox_insert(
     .bind(created_at)
     .execute(db)
     .await?;
-    // INSERT OR IGNORE: rows_affected=0 means the entry is already in the
-    // queue (duplicate enqueue is ignored).
     Ok(result.rows_affected() > 0)
 }
 
-/// Ids of outbox rows due for retry (oldest first). Rows belonging to a
-/// paused/disabled subscription or a disabled chat are held: pausing a source
-/// must stop queued deliveries too, and a removed bot must not keep retrying
-/// into a chat it can no longer reach.
-///
-/// The caller fetches each full row one at a time, so a batch of large
-/// `entry_json` values is never loaded into memory at once.
 pub async fn outbox_due_ids(db: &Db, now_ts: i64, limit: i64) -> anyhow::Result<Vec<i64>> {
     let rows = sqlx::query_scalar::<_, i64>(
         r#"SELECT o.id
@@ -104,8 +83,6 @@ pub async fn outbox_due_ids(db: &Db, now_ts: i64, limit: i64) -> anyhow::Result<
     Ok(rows)
 }
 
-/// Number of queued outbox rows for one (chat, feed). Used by the enqueue path
-/// to stop an unavailable chat from growing an unbounded 72h retry queue.
 pub async fn outbox_count_for_feed(db: &Db, chat_id: &str, feed_url: &str) -> anyhow::Result<i64> {
     let count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM outbox WHERE chat_id = ? AND feed_url = ?",
@@ -117,9 +94,6 @@ pub async fn outbox_count_for_feed(db: &Db, chat_id: &str, feed_url: &str) -> an
     Ok(count)
 }
 
-/// Drop every queued outbox row for a chat. Called when the bot is removed or
-/// permanently loses posting rights: keeping the rows would either hold them
-/// forever (disabled chat) or flood the channel on re-add.
 pub async fn delete_outbox_for_chat(db: &Db, chat_id: &str) -> anyhow::Result<u64> {
     let result = sqlx::query("DELETE FROM outbox WHERE chat_id = ?")
         .bind(chat_id)
@@ -128,8 +102,6 @@ pub async fn delete_outbox_for_chat(db: &Db, chat_id: &str) -> anyhow::Result<u6
     Ok(result.rows_affected())
 }
 
-/// Fetch one complete outbox row by id. Returns None when the row was removed
-/// between the id listing and this lookup.
 pub async fn outbox_get(db: &Db, id: i64) -> anyhow::Result<Option<OutboxRow>> {
     let row = sqlx::query_as::<_, OutboxRow>(
         "SELECT id, chat_id, feed_url, entry_id, feed_title, entry_json, media_json, meta_json, content_mode, source_display, link_preview, caption_above_media, author, attempts, next_retry_at, created_at, first_attempt_at, last_error FROM outbox WHERE id = ?",
@@ -140,9 +112,6 @@ pub async fn outbox_get(db: &Db, id: i64) -> anyhow::Result<Option<OutboxRow>> {
     Ok(row)
 }
 
-/// Stream every media_json value still referenced by the outbox (one narrow
-/// column, no limit). Used by the media cleanup pass to build the "protected
-/// paths" set without holding every row's JSON string in memory at once.
 pub fn outbox_media_json_stream(
     db: &Db,
 ) -> impl futures_util::Stream<Item = sqlx::Result<String>> + '_ {
@@ -152,7 +121,6 @@ pub fn outbox_media_json_stream(
     .fetch(db)
 }
 
-/// Update outbox entry after a failed retry attempt.
 pub async fn outbox_update_retry(
     db: &Db,
     id: i64,
@@ -161,8 +129,7 @@ pub async fn outbox_update_retry(
     attempt_at: i64,
     last_error: &str,
 ) -> anyhow::Result<()> {
-    // COALESCE keeps the first attempt timestamp: the 72h abandonment window
-    // is a bounded retry budget, not a timer reset by every retry.
+    // COALESCE keeps the first-attempt anchor: the 72h window is a bounded retry budget, not a per-retry timer.
     sqlx::query(
         "UPDATE outbox SET attempts = ?, next_retry_at = ?, first_attempt_at = COALESCE(first_attempt_at, ?), last_error = ? WHERE id = ?",
     )
@@ -176,7 +143,6 @@ pub async fn outbox_update_retry(
     Ok(())
 }
 
-/// Remove an outbox entry (after successful send or abandonment).
 pub async fn outbox_delete(db: &Db, id: i64) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM outbox WHERE id = ?")
         .bind(id)
@@ -185,11 +151,6 @@ pub async fn outbox_delete(db: &Db, id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Batch form of the per-entry outbox check for one subscription. The fetch
-/// cycle skips entries the outbox already owns (the outbox has sole retry
-/// authority). Callers must fail closed: a query error means the outbox state
-/// is unknown, so the feed is deferred to the next round instead of treating
-/// the set as empty.
 pub async fn outbox_entry_ids(
     db: &Db,
     chat_id: &str,

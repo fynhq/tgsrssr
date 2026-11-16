@@ -1,18 +1,10 @@
-//! Manual redirect following shared by the feed fetch (fetcher.rs) and the
-//! media download (media.rs) paths.
-//!
-//! Both paths disable client auto-redirects and must re-run the SSRF target
-//! policy on every hop; the loop shape (Location parsing, hop cap, error
-//! copy) was duplicated verbatim before this module existed.
+//! Manual redirect following with per-hop SSRF checks.
 
 use anyhow::Context;
 
 use crate::state::AppState;
 
-/// Same-origin check (scheme + host + effective port). Used to keep the
-/// RSS_TRUSTED_PRIVATE_HOSTS bypass scoped to media served by the feed
-/// itself: a public feed embedding `http://rsshub:1200/...` must not inherit
-/// the admin's trusted-host bypass, including after a redirect.
+// The trusted-private-host bypass must not survive a redirect or embedded URL to another authority.
 pub(crate) fn same_origin(a: &str, b: &str) -> bool {
     let (Ok(ua), Ok(ub)) = (url::Url::parse(a), url::Url::parse(b)) else {
         return false;
@@ -22,19 +14,6 @@ pub(crate) fn same_origin(a: &str, b: &str) -> bool {
         && ua.port_or_known_default() == ub.port_or_known_default()
 }
 
-/// Manually follow up to `max_redirects` hops on a GET-like request.
-///
-/// `build_request` runs for every hop with the client selected for that
-/// hop's URL and the hop index (0 = the original request), so callers can
-/// attach per-hop headers while keeping one-shot headers (conditional
-/// requests) on the first hop only. The target policy is re-checked before
-/// each request, including the first, against the URL actually requested —
-/// a direct URL cannot redirect to a private literal IP / private DNS
-/// answer with the checks skipped.
-///
-/// A 304 Not Modified is returned as-is: it is a 3xx status but not a
-/// redirect, and treating it as one falsely reports a missing Location
-/// header.
 pub(crate) async fn get_follow_redirects<F>(
     state: &AppState,
     start_url: &str,
@@ -50,14 +29,8 @@ where
     let mut cur_url = start_url.to_string();
     let mut hops = 0u32;
     loop {
-        // The trusted-private bypass is per-hop and, when an origin is given,
-        // limited to that origin. A redirect from a trusted origin to a
-        // different (even allowlisted) host is re-checked as normal traffic.
         let allow_trusted = allow_trusted_private
             && trusted_origin.is_none_or(|origin| same_origin(&cur_url, origin));
-        // Substring contract: "dns resolve failed" (produced on the direct
-        // route) is matched by sendpolicy::is_net_error as a transient
-        // network error.
         state.check_target(&cur_url, allow_trusted, scope).await?;
         let client = state.media_client_for_url_trusted(&cur_url, allow_trusted);
         let resp = build_request(client, &cur_url, hops)

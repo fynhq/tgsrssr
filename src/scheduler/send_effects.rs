@@ -1,10 +1,3 @@
-//! Shared post-send side effects.
-//!
-//! Both the fetch cycle and the outbox retry path consume a `SendOutcome` and
-//! must emit the same owner notices / persistence updates. Keeping this in one
-//! place prevents the two paths from drifting (the outbox path previously had
-//! no `uncertain` handling, and the chat-title/language lookups were repeated).
-
 use teloxide::prelude::*;
 use tracing::warn;
 
@@ -14,7 +7,6 @@ use crate::notify::{notify_download_failed, notify_oversized_video, notify_owner
 use crate::push;
 use crate::state::AppState;
 
-/// Common context for owner-facing post-send effects.
 pub(super) struct SendSuccessCtx<'a> {
     pub bot: &'a Bot,
     pub state: &'a AppState,
@@ -25,8 +17,6 @@ pub(super) struct SendSuccessCtx<'a> {
     pub lang: Lang,
 }
 
-/// Inputs that only the fetch path has. The outbox path passes empty slices,
-/// `notify_oversized = false`, and `outbox_row_id = Some(..)`.
 pub(super) struct SendSuccessExtras<'a> {
     pub owner_id: Option<i64>,
     pub feed_title: &'a str,
@@ -35,12 +25,9 @@ pub(super) struct SendSuccessExtras<'a> {
     pub oversized: &'a [crate::media::OversizedVideo],
     pub notify_oversized: bool,
     pub dl_retry_note: &'a str,
-    /// Some(row id) on the outbox retry path; None on the fetch path.
     pub outbox_row_id: Option<i64>,
 }
 
-/// One post-send step. The plan is data so both send paths can be asserted to
-/// emit the same sequence; the executor performs the I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SendSuccessEffect {
     NotifyUncertain,
@@ -54,9 +41,6 @@ pub(super) enum SendSuccessEffect {
     ClearOutboxMediaLost,
 }
 
-/// Ordered post-send effects. The fetch path's historical order is the
-/// golden order; the outbox path uses the same plan plus its two row-only
-/// steps. Keeping this pure prevents the two paths from drifting again.
 pub(super) fn success_effect_plan(
     outcome: &push::SendOutcome,
     extras: &SendSuccessExtras<'_>,
@@ -130,9 +114,6 @@ fn media_failed_msg(
 }
 
 impl SendSuccessCtx<'_> {
-    /// A1 policy: a rich message may have been delivered even though the API
-    /// call reported an error. The entry is still marked sent (no outbox, no
-    /// duplicate), but the owner is asked to verify the channel.
     pub(super) async fn notify_uncertain(&self, outcome: &push::SendOutcome) {
         if !outcome.uncertain {
             return;
@@ -141,8 +122,6 @@ impl SendSuccessCtx<'_> {
         notify_owner_html(self.bot, self.state, self.chat_id, &msg).await;
     }
 
-    /// The first text chunk was delivered but later chunks were not. The entry
-    /// is stopped rather than replayed as a whole.
     pub(super) async fn notify_text_partial(&self, outcome: &push::SendOutcome) {
         if !outcome.text_partial {
             return;
@@ -156,7 +135,6 @@ impl SendSuccessCtx<'_> {
         notify_owner_html(self.bot, self.state, self.chat_id, &msg).await;
     }
 
-    /// The text was delivered but the media was not (failed or expired).
     pub(super) async fn notify_media_failed(&self, outcome: &push::SendOutcome) {
         if !outcome.media_failed {
             return;
@@ -170,10 +148,6 @@ impl SendSuccessCtx<'_> {
         notify_owner_html(self.bot, self.state, self.chat_id, &msg).await;
     }
 
-    /// Register the delivered message for `/find` and mark the entry sent.
-    /// A persistence failure after Telegram delivery is best-effort + warn:
-    /// returning an error would make the caller replay an already-delivered
-    /// entry.
     pub(super) async fn record_and_mark_sent(
         &self,
         outcome: &push::SendOutcome,
@@ -199,9 +173,6 @@ impl SendSuccessCtx<'_> {
     }
 }
 
-/// Execute the ordered post-send effects. This is the single success path for
-/// both the fetch cycle and the outbox retry; `mark_log` keeps each caller's
-/// existing diagnostic wording.
 pub(super) async fn apply_send_success(
     ctx: &SendSuccessCtx<'_>,
     outcome: &push::SendOutcome,
@@ -297,8 +268,6 @@ mod tests {
             None,
             Some("https://example.com/post"),
         );
-        // Unicode escapes keep literal CJK out of the public source tree while
-        // still asserting the exact Chinese locale output.
         assert!(zh.contains("\u{6b63}\u{6587}\u{5206}\u{6bb5}\u{53d1}\u{9001}\u{5931}\u{8d25}"));
         assert!(zh.contains("\n\u{6761}\u{76ee}\u{ff1a}https://example.com/post"));
         assert!(!zh.contains("Message:"));

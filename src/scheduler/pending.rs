@@ -1,10 +1,3 @@
-//! Pending-entry selection for the fetch cycle.
-//!
-//! Extracted from `process_feed` so the dedup/filter/deadline/sort rules can be
-//! tested without a database or Telegram client. The caller still owns the
-//! sent/outbox queries and the async `mark_entry_sent` writes; this function is
-//! pure apart from the cooperative deadline clock.
-
 use std::collections::HashSet;
 
 use feed_rs::model::Entry;
@@ -13,29 +6,12 @@ use crate::db;
 use crate::fetcher;
 use crate::i18n::Lang;
 
-/// Result of selecting this round's pending entries.
 pub(super) struct PendingSelection<'a> {
-    /// Entries to push this round, in push order (oldest first when all have
-    /// timestamps).
     pub entries: Vec<&'a Entry>,
-    /// Entry ids rejected by the content filter. The caller marks these sent
-    /// so the same blocked entry does not consume the window every round.
     pub filtered_ids: Vec<String>,
-    /// True when the cooperative deadline stopped the scan; the caller keeps
-    /// the previous conditional-request headers so the next round re-fetches.
     pub deferred: bool,
 }
 
-/// Select unsent entries for one source.
-///
-/// Rules kept identical to `process_feed`:
-/// - repeated entry ids within one response are deduped;
-/// - entries already in `known_sent` (64-bit marker hash) or in the outbox are
-///   skipped (the outbox has sole retry authority);
-/// - content-filtered entries are returned separately for mark-sent;
-/// - the deadline is checked every 256 entries; a hit defers the rest;
-/// - pending entries are sorted oldest-first only when every entry has a
-///   timestamp (sources with missing timestamps keep their original order).
 pub(super) fn select_pending<'a>(
     entries: &'a [Entry],
     known_sent: &HashSet<String>,
@@ -207,7 +183,6 @@ mod tests {
     fn pending_is_sorted_oldest_first_when_all_have_timestamps() {
         let old = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let new = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
-        // Feed order is newest-first (the fetch layer sorts that way).
         let entries = vec![
             entry("new", "new", Some(new)),
             entry("old", "old", Some(old)),

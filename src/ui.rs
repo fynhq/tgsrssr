@@ -1,8 +1,3 @@
-//! Shared panel rendering and delivery: page targets, keyboard helpers,
-//! pagination, error pages, and the panels reused by both command and
-//! callback handlers. Rendering lives here so commands do not depend on the
-//! callback dispatcher.
-
 use teloxide::prelude::*;
 use teloxide::types::{
     CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode,
@@ -14,25 +9,12 @@ use crate::i18n::{self, Lang};
 use crate::push::{no_preview, ContentMode, SourceDisplay};
 use crate::state::AppState;
 
-/// Items per page for the channel list and the per-channel source list.
 pub(crate) const PAGE_SIZE: usize = 10;
 
-/// Chat display title with fallback: when the title is absent, show the raw
-/// chat id instead, so panels/headers never render an empty name. Exactly
-/// matches the previous inline `…and_then(|c| c.title)…unwrap_or(chat_id)`
-/// pattern (no extra trimming/empty-string handling) to keep behaviour
-/// unchanged. (Previously six sites repeated it inline.)
 pub(crate) fn chat_display_title(title: Option<&str>, chat_id: &str) -> String {
     title.unwrap_or(chat_id).to_string()
 }
 
-/// Clamp a requested page to the actual page count and compute the
-/// `[start, end)` slice bounds for a PAGE_SIZE-sized window. Returns
-/// `(total_pages, clamped_page, start, end)`. `total_pages` is at least 1
-/// so an empty list still renders one blank page (never zero — that would
-/// underflow `total_pages - 1` when clamping). Previously three sites
-/// (render_channel_list / render_channel_page / render_unsub_panel) each
-/// re-typed these four lines verbatim.
 pub(crate) fn paginate(len: usize, page: usize) -> (usize, usize, usize, usize) {
     let total_pages = len.div_ceil(PAGE_SIZE).max(1);
     let page = page.min(total_pages - 1);
@@ -41,10 +23,6 @@ pub(crate) fn paginate(len: usize, page: usize) -> (usize, usize, usize, usize) 
     (total_pages, page, start, end)
 }
 
-/// Build a row containing only the shared Close button. Panels that need to
-/// push a plain close row into a multi-row keyboard use this instead of
-/// re-typing the button construction. `close_kb` (empty-state pages) uses it
-/// to build a single-row Markup.
 pub(crate) fn close_row(lang: Lang) -> Vec<InlineKeyboardButton> {
     vec![InlineKeyboardButton::callback(
         i18n::t(lang, "close"),
@@ -52,9 +30,6 @@ pub(crate) fn close_row(lang: Lang) -> Vec<InlineKeyboardButton> {
     )]
 }
 
-/// Build a `[back, close]` row. Panels that repeat this pair (with a
-/// domain-specific back label key + callback data) use this helper instead
-/// of hand-writing the two-button vector at every site.
 pub(crate) fn back_close_row(
     lang: Lang,
     back_key: &'static str,
@@ -66,9 +41,6 @@ pub(crate) fn back_close_row(
     ]
 }
 
-/// Build the pagination nav row (prev / indicator / next). Three call sites
-/// duplicated this exact logic; only the callback URL differs, supplied via
-/// `mk_url`. Returns None when there is only one page.
 pub(crate) fn nav_row(
     page: usize,
     total_pages: usize,
@@ -98,25 +70,16 @@ pub(crate) fn nav_row(
     Some(nav)
 }
 
-/// Where a rendered page should go: a brand-new message, an in-place edit of
-/// the message the callback button was pressed on, or an in-place edit of an
-/// explicitly addressed message (used by flows outside a callback, e.g. the
-/// rename reply refreshing the source page it came from).
 pub(crate) enum PageTarget<'a> {
     Send(ChatId),
     Edit(&'a CallbackQuery),
     EditMessage(ChatId, teloxide::types::MessageId),
 }
 
-/// #15: Fallback keyboard for empty-state/error pages — at least provide a "Close" button,
-/// so users are not left facing a dead buttonless message they cannot exit.
 pub(crate) fn close_kb(lang: Lang) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![close_row(lang)])
 }
 
-/// Deliver an HTML page to the target. For `Edit`/`EditMessage`, edits the
-/// original message in place; falls back to sending a new message when the
-/// original can no longer be edited (e.g. too old).
 pub(crate) async fn deliver(
     bot: &Bot,
     target: &PageTarget<'_>,
@@ -151,9 +114,6 @@ pub(crate) async fn deliver(
     Ok(())
 }
 
-/// Render a generic error page (escaped message + close button).
-/// `err_display` is the already-formatted error text (callers may use
-/// `{:#}` for anyhow error chains); escaping happens here.
 pub(crate) async fn deliver_error_page(
     bot: &Bot,
     target: &PageTarget<'_>,
@@ -169,8 +129,6 @@ pub(crate) async fn deliver_error_page(
     .await
 }
 
-/// Edit a message in place; fall back to sending a new message when the
-/// original can no longer be edited (too old / inaccessible).
 pub(crate) async fn edit_or_send(
     bot: &Bot,
     chat: ChatId,
@@ -188,11 +146,6 @@ pub(crate) async fn edit_or_send(
     match req.await {
         Ok(_) => {}
         Err(e) => {
-            // Content identical — nothing to update. Prefer matching the typed
-            // ApiError::MessageNotModified; keep the substring check as a
-            // fallback in case the error surfaces without the typed variant, so
-            // an edit-to-identical-content never falls through to sending a
-            // duplicate panel message (spamming on every paginate/toggle).
             if matches!(
                 e,
                 teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)
@@ -200,7 +153,6 @@ pub(crate) async fn edit_or_send(
             {
                 return Ok(());
             }
-            // Original message can't be edited (too old / inaccessible): send new.
             let mut s = bot
                 .send_message(chat, text)
                 .parse_mode(ParseMode::Html)
@@ -214,16 +166,6 @@ pub(crate) async fn edit_or_send(
     Ok(())
 }
 
-/// Render the /cookies panel: title + one button per platform showing
-/// cookie status (not configured / configured / expired). Global (admin-configured).
-/// The header text is always the plain title — after a cookie update the
-/// confirmation is carried by the retired prompt message, so the panel
-/// itself only needs its button statuses refreshed.
-///
-/// Lang is resolved by the caller (same convention as render_channel_list):
-/// re-resolving here with `None` would drop the Telegram client language_code
-/// hint and force English on never-configured users while adjacent panels
-/// render Chinese.
 pub(crate) async fn render_cookies_panel(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -236,8 +178,6 @@ pub(crate) async fn render_cookies_panel(
 
     for p in crate::platforms::PLATFORMS {
         if !p.needs_cookie {
-            // Cookie-less platforms (e.g. Telegram web preview): listed
-            // read-only, no configuration flow.
             buttons.push(vec![InlineKeyboardButton::callback(
                 i18n::t(lang, "ck_no_config").replacen("{}", p.label, 1),
                 wire::cookies(p.id),
@@ -245,7 +185,6 @@ pub(crate) async fn render_cookies_panel(
             continue;
         }
         let current = state.get_cookie(p.id).await;
-        // Status determination: not configured → expired (settings flag) → configured
         let status = if current.is_none() {
             i18n::t(lang, "ck_not_set")
         } else {
@@ -275,7 +214,6 @@ pub(crate) async fn render_cookies_panel(
     Ok(())
 }
 
-/// Render the channel list page (paginated, PAGE_SIZE items per page).
 pub(crate) async fn render_channel_list(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -284,12 +222,6 @@ pub(crate) async fn render_channel_list(
     page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
-    // Lang is resolved by the caller: the callback top-level and the command
-    // path both run it through resolve_lang *with the Telegram client
-    // language_code*, so the list page can no longer diverge from sibling
-    // panels (previously this function re-resolved with None, which dropped
-    // the client hint and forced English on never-configured users while
-    // adjacent panels rendered Chinese).
     let chats = match db::list_chats(&state.db, user_id).await {
         Ok(c) => c,
         Err(e) => {
@@ -311,8 +243,6 @@ pub(crate) async fn render_channel_list(
 
     let (total_pages, page, start, end) = paginate(chats.len(), page);
 
-    // Buttons-only list: per-item text lines duplicated the buttons, so each
-    // channel is now directly a clickable button.
     let text = if total_pages > 1 {
         let page_s = (page + 1).to_string();
         let pages_s = total_pages.to_string();
@@ -324,11 +254,6 @@ pub(crate) async fn render_channel_list(
     } else {
         i18n::t(lang, "chlist_single").replacen("{}", &chats.len().to_string(), 1)
     };
-    // Per-channel subscription counts for button labels. A DB failure must not
-    // masquerade as "every channel has 0 subscriptions" — fall back to an
-    // explicit "?" placeholder per chat in that case. Missing keys in a
-    // successful result legitimately mean 0 (GROUP BY only returns chats with
-    // at least one subscription).
     let sub_counts: Option<std::collections::HashMap<String, i64>> =
         match db::count_subscriptions_per_chat(&state.db).await {
             Ok(m) => Some(m),
@@ -347,8 +272,6 @@ pub(crate) async fn render_channel_list(
             Some(m) => m.get(&chat.chat_id).copied().unwrap_or(0).to_string(),
             None => "?".to_string(),
         };
-        // The 4th segment passes through the channel-list page number so the channel page's
-        // "back to channel list" button can restore the original page.
         row.push(InlineKeyboardButton::callback(
             format!(
                 "{}（{}）",
@@ -367,7 +290,6 @@ pub(crate) async fn render_channel_list(
     if let Some(nav) = nav_row(page, total_pages, lang, wire::channel_list) {
         buttons.push(nav);
     }
-    // Language picker entry (shows current language; opens the picker on tap)
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "lang_btn"),
         wire::op_prefix(wire::CallbackOp::Language),
@@ -379,10 +301,6 @@ pub(crate) async fn render_channel_list(
     Ok(())
 }
 
-/// Render the language picker. Every supported language is one button, always
-/// labelled with that language's own name; the current one is marked with a
-/// check. Selecting a language writes the user preference and returns to the
-/// channel list in that language.
 pub(crate) async fn render_language_picker(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -407,8 +325,6 @@ pub(crate) async fn render_language_picker(
     .await
 }
 
-/// Render the channel page (subscription list + management buttons).
-/// The source list is paginated, PAGE_SIZE items per page.
 pub(crate) async fn render_channel_page(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -453,12 +369,6 @@ pub(crate) async fn render_channel_page(
 
     let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
 
-    // Each source is directly a button opening its feed page. Paused sources
-    // get a ⏸ marker; error counts stay off the list (see feed page).
-    // Sequence numbers stay global (not reset per page) for stable reference.
-    // The trailing chlist_page keeps the channel-list position alive across the
-    // whole feed/unsub round trip (fix: without it, "back" buttons defaulted
-    // the channel list to page 0).
     for (offset, sub) in subs[start..end].iter().enumerate() {
         let name = sub.feed_title.as_deref().unwrap_or(&sub.feed_url);
         let flag = if sub.active == 0 { " ⏸" } else { "" };
@@ -489,9 +399,6 @@ pub(crate) async fn render_channel_page(
             wire::unsub_page(chat_id, 0, page, chlist_page),
         ),
     ]);
-    // When paused sources exist, offer a one-click enable-all (reset error counts and resume fetching immediately)
-    // Layout: c|resumeall|<chat_id>|<chlist_page>|<ch_page> — ch_page preserves the source-list page
-    // across the re-render, chlist_page preserves the channel-list page for its own "back" button.
     if paused_count > 0 {
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "chpage_resume_all").replacen("{}", &paused_count.to_string(), 1),
@@ -511,9 +418,6 @@ pub(crate) async fn render_channel_page(
     Ok(())
 }
 
-/// Render the channel settings page (rsstt-style option buttons).
-/// Loads the subscription; when it doesn't exist or the query errors, delivers an error page to the target and returns None.
-/// Boilerplate shared by render_feed_page / render_feed_filter / load_feed_ctx.
 pub(crate) async fn load_sub_or_deliver(
     bot: &Bot,
     target: &PageTarget<'_>,
@@ -540,12 +444,6 @@ pub(crate) async fn load_sub_or_deliver(
     }
 }
 
-/// Render the per-source (feed) page: status, effective config with override
-/// markers, and management buttons (pause/resume, rename, feed-level overrides).
-///
-/// Public entry point kept for the command path (rename-reply refresh).
-/// PendingOp stores both page positions now, so the refresh preserves the
-/// channel-list page instead of resetting it.
 pub(crate) async fn render_feed_page(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -558,8 +456,6 @@ pub(crate) async fn render_feed_page(
     render_feed_page_impl(bot, target, sub_id, state, ch_page, chlist_page, lang).await
 }
 
-/// Internal feed page renderer carrying `chlist_page` (the channel-list page the
-/// user came from) through every button's callback data.
 async fn render_feed_page_impl(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -589,15 +485,11 @@ async fn render_feed_page_impl(
     };
 
     let url_attr = crate::push::escape_attr(&sub.feed_url);
-    // Panels are sent/edited as one message; an unbounded feed title or long
-    // URL would make both edit and send fail with "message is too long",
-    // leaving the source page permanently unreachable.
     let name_html = crate::push::escape_html(&crate::htmltext::truncate_text(name, 200));
     let mut text = i18n::fill(
         i18n::t(lang, "feed_header"),
         &[&url_attr, &name_html, status],
     );
-    // Show original title when manually renamed
     if sub.title_overridden == 1 {
         if let Some(orig) = &sub.original_title {
             let orig = crate::htmltext::truncate_text(orig, 200);
@@ -639,7 +531,6 @@ async fn render_feed_page_impl(
 
     let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
 
-    // Pause / resume
     if sub.active == 1 {
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "feed_pause"),
@@ -652,16 +543,11 @@ async fn render_feed_page_impl(
         )]);
     }
 
-    // Rename / reset name
     buttons.push(vec![InlineKeyboardButton::callback(
         i18n::t(lang, "feed_rename"),
         wire::source_action(wire::CallbackOp::SourceRename, sub_id, ch_page, chlist_page),
     )]);
 
-    // Feed-level overrides: interval/mode/source open second-level pages;
-    // caption/link preview toggle in place (mirrors the channel settings
-    // layout). Labels show the effective value; override state is shown in the
-    // summary above.
     if let Some(c) = &cfg {
         buttons.push(vec![InlineKeyboardButton::callback(
             i18n::t(lang, "feed_interval").replacen(
@@ -732,12 +618,8 @@ async fn render_feed_page_impl(
                 chlist_page,
             ),
         )]);
-        // Note: under Approach A, picking a value identical to the channel automatically clears
-        // the override, so no global reset button is needed; each sub-page still keeps the
-        // "↩️ 🔗 follow channel" button.
     }
 
-    // Content filter button (shows status when active)
     {
         let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await {
             Ok(fc) => fc,
@@ -787,8 +669,6 @@ pub(crate) fn fmt_interval(lang: Lang, min: i64) -> String {
 }
 
 pub(crate) fn fmt_content_mode(lang: Lang, m: &str) -> &'static str {
-    // Normalize through the same legacy-tolerant parser used by rendering, so
-    // an old `TitleSummary`/`MediaOnly` value does not display as Title+Link.
     match ContentMode::from_str(m) {
         ContentMode::TitleSummary => i18n::t(lang, "mode_title_summary"),
         ContentMode::TitleContent => i18n::t(lang, "mode_title_content"),
@@ -807,11 +687,6 @@ pub(crate) fn fmt_source_display(lang: Lang, s: &str) -> &'static str {
     }
 }
 
-/// Second-level page: content filter settings for a feed.
-///
-/// Public entry point kept for the command path (filter-keyword reply refresh).
-/// PendingOp stores both page positions now, so the refresh preserves the
-/// channel-list page instead of resetting it.
 pub(crate) async fn render_feed_filter(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -824,7 +699,6 @@ pub(crate) async fn render_feed_filter(
     render_feed_filter_impl(bot, target, sub_id, state, ch_page, chlist_page, lang).await
 }
 
-/// Internal filter renderer carrying `chlist_page` through every button.
 async fn render_feed_filter_impl(
     bot: &Bot,
     target: PageTarget<'_>,
@@ -848,8 +722,6 @@ async fn render_feed_filter_impl(
     let status = if fc.is_active() {
         i18n::t(lang, "filter_on")
     } else if fc.enabled {
-        // The switch is on but no keywords are configured: say so instead of
-        // claiming "off" while the toggle button says "disable".
         i18n::t(lang, "filter_on_no_keywords")
     } else {
         i18n::t(lang, "filter_off")

@@ -1,5 +1,3 @@
-//! Settings key-value store and stale-key cleanup.
-
 use super::*;
 use sqlx::Row;
 
@@ -31,12 +29,6 @@ pub async fn delete_setting(db: &Db, key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Atomically flip a state bit in settings: writes `to` only when the current
-/// value != `to`. Returns true when this call performed the flip (the caller
-/// sends an edge notification based on it). Used for platform health state
-/// (ok/down): when multiple sources fail concurrently only the first flip
-/// succeeds, eliminating duplicate notifications (a read-check-write sequence
-/// has a race window under concurrency).
 pub async fn flip_setting_once(db: &Db, key: &str, to: &str) -> anyhow::Result<bool> {
     let res = sqlx::query(
         r#"INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, datetime('now'))
@@ -50,16 +42,10 @@ pub async fn flip_setting_once(db: &Db, key: &str, to: &str) -> anyhow::Result<b
     Ok(res.rows_affected() > 0)
 }
 
-/// Get all settings whose key starts with the given prefix.
-/// Returns a Result: a transient DB error must not be treated as "no data"
-/// (consistent with the project's fail-closed principle); the caller decides
-/// explicitly (startup cleanup / cookie-loading scenarios log a warn and skip).
 pub async fn get_settings_by_prefix(
     db: &Db,
     prefix: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    // `instr` instead of LIKE: key prefixes such as `platform_health:` contain
-    // `_`, which LIKE treats as a single-character wildcard.
     let rows = sqlx::query("SELECT key, value FROM settings WHERE instr(key, ?) = 1")
         .bind(prefix)
         .fetch_all(db)
@@ -70,10 +56,6 @@ pub async fn get_settings_by_prefix(
         .collect())
 }
 
-/// Get the owner (added_by) of a chat.
-/// Ok(None) = chat does not exist or has no owner; Err = DB query failed
-/// (callers must log it and must not silently treat it as "no owner" —
-/// otherwise owner notifications would be silently lost).
 pub async fn get_chat_owner(db: &Db, chat_id: &str) -> anyhow::Result<Option<i64>> {
     Ok(get_chat(db, chat_id)
         .await?

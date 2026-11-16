@@ -1,13 +1,7 @@
-//! Typed callback-data parsing and the single op → ownership-guard mapping.
-//!
-//! The wire format stays `c|<op>|...` so panels already in Telegram chats keep
-//! working. Only known ops parse; unknown or oversized data is rejected before
-//! dispatch (fail closed). The handler still consumes the raw segments for
-//! page/value parsing; this module owns the protocol identity and guard tier.
+//! Only known, bounded callback ops parse; unknown or oversized data must fail closed before dispatch.
 
 use super::GuardTarget;
 
-/// All callback operations the bot understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallbackOp {
     Channel,
@@ -132,11 +126,8 @@ impl CallbackOp {
         })
     }
 
-    /// Ownership-guard tier for this op. This is the only mapping; the
-    /// dispatcher no longer maintains a parallel op list.
     pub(super) fn guard_target(self) -> GuardTarget {
         match self {
-            // chat level: args[0] is the chat_id
             Self::Channel
             | Self::Config
             | Self::ConfigInterval
@@ -151,7 +142,6 @@ impl CallbackOp {
             | Self::UnsubPage
             | Self::UnsubAllAsk
             | Self::UnsubAll => GuardTarget::Chat,
-            // sub level: args[0] is the sub_id
             Self::Source
             | Self::SourcePause
             | Self::SourceResume
@@ -169,7 +159,6 @@ impl CallbackOp {
             | Self::SourceModeValue
             | Self::SourceSourceValue
             | Self::Unsub => GuardTarget::Sub,
-            // explicitly no target channel involved
             Self::ChannelList | Self::Language | Self::Cookies | Self::CancelOp | Self::Page => {
                 GuardTarget::None
             }
@@ -177,15 +166,12 @@ impl CallbackOp {
     }
 }
 
-/// Parsed callback: typed op plus the raw argument segments after it.
 pub(super) struct CallbackData<'a> {
     pub op: CallbackOp,
     pub args: Vec<&'a str>,
 }
 
 impl<'a> CallbackData<'a> {
-    /// Parse `c|<op>[|arg...]`. Telegram caps callback data at 64 bytes; ops
-    /// with at most five arguments exist, so anything larger is malformed.
     pub(super) fn parse(raw: &'a str) -> Option<Self> {
         if raw.len() > 64 {
             return None;

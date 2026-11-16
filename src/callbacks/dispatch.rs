@@ -1,7 +1,4 @@
-//! Dispatch handlers for callback config/source operations.
-//!
-//! Split out of `callbacks/mod.rs` so the router stays small. The ctx aliases
-//! keep the original branch bodies unchanged.
+//! Callback config/source operations.
 
 use super::data::CallbackOp;
 use super::*;
@@ -32,7 +29,6 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
 
     match ctx.op {
         CallbackOp::Config => {
-            // c|cfg|<chat_id>|<ch_page>|<chlist_page> — open settings page
             if let Some(cid) = parts.get(2) {
                 let ch_page = parts
                     .get(3)
@@ -121,7 +117,6 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::ConfigLinkPreview => {
-            // Toggle link preview (chat-level only)
             if let Some(cid) = parts.get(2) {
                 let ch_page = parts
                     .get(3)
@@ -131,9 +126,6 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     .get(4)
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
-                // Strict baseline read: a transient DB error aborts the toggle
-                // with a toast instead of flipping from a wrong default and
-                // persisting a contradictory override.
                 let cfg = match load_chat_config_checked(&state.db, cid).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -171,8 +163,6 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::ConfigCaption => {
-            // Toggle caption position (chat-level): Telegram's
-            // show_caption_above_media only applies to photo/video/animation.
             if let Some(cid) = parts.get(2) {
                 let ch_page = parts
                     .get(3)
@@ -223,7 +213,6 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::ResumeAll => {
-            // c|resumeall|<chat_id>|<chlist_page>[|<ch_page>] — re-enable all paused sources under this channel in one click
             if let Some(cid) = parts.get(2) {
                 let chlist_page = parts
                     .get(3)
@@ -240,8 +229,6 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                             .text(i18n::t(lang, "resumeall_ok").replacen("{}", &n.to_string(), 1))
                             .await
                             .ok();
-                        // Keep the source-list page (ch_page) instead of resetting to 0, so the
-                        // "enable all" action does not jump the user back to the first page.
                         render_channel_page(
                             bot,
                             PageTarget::Edit(q),
@@ -267,7 +254,6 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
         CallbackOp::ConfigIntervalValue
         | CallbackOp::ConfigModeValue
         | CallbackOp::ConfigSourceValue => {
-            // c|cfgiv|<chat_id>|<value>|<ch_page>|<chlist_page>
             if let (Some(cid), Some(val)) = (parts.get(2), parts.get(3)) {
                 let ch_page = parts
                     .get(4)
@@ -282,11 +268,7 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     "cfgmv" => "content_mode",
                     _ => "source_display",
                 };
-                // Range guard for the fetch interval: a forged/edge callback
-                // with 0 or a negative value would make the due check
-                // (now-last_fetch)*1440 >= interval always true, so the channel
-                // is fetched on every 5-minute tick — easily tripping source
-                // rate limits / IP bans. Clamp to a sane minimum (1 minute).
+                // Clamp forged/edge intervals: 0 or negative makes the due check always true (rate-limit / IP-ban risk).
                 if field == "interval_minutes" {
                     let ok = val
                         .parse::<i64>()
@@ -363,11 +345,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
 
     match ctx.op {
         CallbackOp::Source => {
-            // c|src|<sub_id>[|<ch_page>[|<chlist_page>]] — feed (source) page.
-            // ch_page is the source-list page on the channel page the user came
-            // from; chlist_page is the channel-list page. Both are passed back
-            // through the "back to channel" button so a full round trip keeps
-            // the user's position.
             if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
                 let ch_page = parts
                     .get(3)
@@ -400,10 +377,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
                 let active = parts[1] == "srcresume";
-                // Fail closed when the guard could not resolve an owner (the
-                // subscription did not exist at guard time). The update also
-                // carries chat_id, so an id recreated between the guard SELECT
-                // and this UPDATE cannot be toggled.
                 let Some(expected_chat) = guard_chat_id else {
                     bot.answer_callback_query(qid.clone())
                         .text(i18n::t(lang, "sub_not_found"))
@@ -443,9 +416,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceRename => {
-            // Ask for a new name via plain text prompt; the reply is handled in
-            // commands. Both page positions are stored so the post-rename
-            // refresh keeps the channel-list page too.
             if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
                 let ch_page = parts
                     .get(3)
@@ -457,8 +427,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     .unwrap_or(0);
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
                     let chat = q.message.as_ref().map(|m| m.chat().id);
-                    // The feed page this button lives on; refreshed in place
-                    // after a successful rename.
                     let panel_msg_id = q.message.as_ref().map(|m| m.id().0).unwrap_or(0);
                     if let Some(chat) = chat {
                         let user_id = q.from.id.0 as i64;
@@ -490,7 +458,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                 }
             }
         }
-        // Second-level feed pages.
         CallbackOp::SourceIntervalPage => {
             if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
                 let ch_page = parts
@@ -558,8 +525,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceCaption => {
-            // Toggle feed-level caption position directly (mirrors channel cfgcp).
-            // Approach A: when the toggled value equals the channel default, clear the override (marker goes back to 🔗).
             if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
                 let ch_page = parts
                     .get(3)
@@ -635,8 +600,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceLinkPreview => {
-            // Toggle feed-level link preview directly (mirrors channel cfglp).
-            // Approach A: when the toggled value equals the channel default, clear the override (marker goes back to 🔗).
             if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
                 let ch_page = parts
                     .get(3)
@@ -647,11 +610,7 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
-                    // Read the current baseline strictly: a transient DB error
-                    // must abort (with a toast, spinner cleared) rather than
-                    // toggle from a wrong default and persist an override that
-                    // contradicts the user's actual setting. A missing override
-                    // row still yields the effective-config default normally.
+                    // A transient DB read error must abort a toggle; toggling from the default persists a wrong override.
                     let (cfg, chat_cfg) = match (
                         db::get_effective_config(&state.db, &sub.chat_id, &sub.feed_url).await,
                         load_chat_config_checked(&state.db, &sub.chat_id).await,
@@ -745,10 +704,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
-                    // Strict baseline read (same contract as cfglp/srcflp): a
-                    // transient DB error must abort the toggle instead of
-                    // flipping from the FilterConfig::default() and persisting
-                    // a state that contradicts what the user actually set.
                     let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await
                     {
                         Ok(fc) => fc,
@@ -805,9 +760,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
-                    // Strict baseline read (see srcftoggle): abort on a DB
-                    // error rather than persisting a mode flipped from a
-                    // wrong default.
                     let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await
                     {
                         Ok(fc) => fc,
@@ -854,7 +806,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceFilterKeywords => {
-            // Open keyword-input flow (plain text prompt; reply handled in commands)
             if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
                 let ch_page = parts
                     .get(3)
@@ -869,9 +820,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     let panel_msg_id = q.message.as_ref().map(|m| m.id().0).unwrap_or(0);
                     if let Some(chat) = chat {
                         let user_id = q.from.id.0 as i64;
-                        // A failed read must abort the flow: showing the
-                        // default "(none)" baseline would make the user's
-                        // reply overwrite the real keywords.
                         let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url)
                             .await
                         {
@@ -885,10 +833,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                                 return Ok(());
                             }
                         };
-                        // Acknowledge only after the read succeeded, so the
-                        // failure branch's toast is the first answer Telegram
-                        // sees (subsequent answers to the same query are
-                        // ignored).
                         bot.answer_callback_query(qid.clone()).await.ok();
                         let current = if fc.keywords.is_empty() {
                             i18n::t(lang, "none").to_string()
@@ -921,11 +865,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
         CallbackOp::SourceIntervalValue
         | CallbackOp::SourceModeValue
         | CallbackOp::SourceSourceValue => {
-            // Feed-level overrides: c|srcfi|<sub_id>|<value>[|<ch_page>] etc.
-            // A value of "inherit" clears the override (NULL → fall back to channel).
-            // Approach A: when the selected value equals the channel default, the override is
-            // cleared automatically (marker goes back to 🔗); an override record (marker ✏️) is
-            // only written when the value truly differs from the channel.
             if let (Some(id), Some(val)) = (
                 parts.get(2).and_then(|s| s.parse::<i64>().ok()),
                 parts.get(3),
@@ -938,10 +877,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     .get(5)
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
-                // Range guard mirroring the chat-level cfgiv path: a forged or
-                // edge callback with a 0/negative interval makes the due check
-                // always true, hammering the source every tick (rate-limit /
-                // IP-ban risk). "inherit" clears the override and is allowed.
                 if parts[1] == "srcfi" && *val != "inherit" {
                     let ok = val
                         .parse::<i64>()
@@ -961,10 +896,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                         "srcfm" => "content_mode",
                         _ => "source_display",
                     };
-                    // Compare with the channel default: clear the override when equal, only write an override when different.
-                    // Strict baseline read (same contract as cfglp/srcflp): a
-                    // transient DB error aborts with a toast instead of
-                    // persisting an override computed from a wrong default.
                     let chat_cfg = match load_chat_config_checked(&state.db, &sub.chat_id).await {
                         Ok(c) => c,
                         Err(e) => {
@@ -997,7 +928,6 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     {
                         Ok(_) => {
                             info!(sub_id = id, field = field, value = %val, "feed config updated");
-                            // Return to the feed (source) page after a selection.
                             render_feed_page(
                                 bot,
                                 PageTarget::Edit(q),
