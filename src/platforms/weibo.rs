@@ -729,11 +729,9 @@ fn append_weibo_media(body: &mut String, mblog: &Value, owner_mid: &str) {
                 body.push_str(&img_tag(page_pic_url));
             }
         }
-    } else if page_info["type"].as_str() == Some("live") {
-        if !has_pics && !page_pic_url.is_empty() {
-            body.push_str(&img_tag(page_pic_url));
-        }
-    } else if !has_pics && page_info["type"].as_str() == Some("article") && !page_pic_url.is_empty()
+    } else if !has_pics
+        && !page_pic_url.is_empty()
+        && matches!(page_info["type"].as_str(), Some("live") | Some("article"))
     {
         body.push_str(&img_tag(page_pic_url));
     }
