@@ -1,5 +1,5 @@
 # ===== Build stage =====
-FROM rust:1.99-alpine3.24 AS builder
+FROM rust:1.100-alpine3.24 AS builder
 
 WORKDIR /app
 
