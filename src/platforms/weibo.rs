@@ -1322,6 +1322,37 @@ const EMOJI_MAP: &[(&str, &str)] = &[
     ("[骷髅]", "💀"),
     ("[嘘]", "🤫"),
     ("[闭嘴]", "🤐"),
+    ("[awsl]", "🫠"),
+    ("[丘比特]", "💘"),
+    ("[中国赞]", "👍"),
+    ("[举手]", "🙋"),
+    ("[互粉]", "🤝"),
+    ("[单身狗]", "🐶"),
+    ("[右哼哼]", "😤"),
+    ("[左哼哼]", "😤"),
+    ("[哇]", "😲"),
+    ("[坏笑]", "😏"),
+    ("[奶瓶]", "🍼"),
+    ("[委屈]", "🥺"),
+    ("[小丑]", "🤡"),
+    ("[开学季]", "🎒"),
+    ("[彩虹屁]", "🌈💨"),
+    ("[憧憬]", "🤩"),
+    ("[打脸]", "🤕"),
+    ("[抱一抱]", "🫂"),
+    ("[杰瑞]", "🐭"),
+    ("[求饶]", "🥺"),
+    ("[污]", "🙈"),
+    ("[汤姆]", "🐱"),
+    ("[烟花]", "🎆"),
+    ("[笑而不语]", "😏"),
+    ("[舔屏]", "🤤"),
+    ("[航天员]", "🧑‍🚀"),
+    ("[苦涩]", "🥲"),
+    ("[裂开]", "🤯"),
+    ("[费解]", "🤨"),
+    ("[雪花]", "❄️"),
+    ("[顶]", "🔝"),
 ];
 
 static RE_EMOJI_MARKER: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -1578,6 +1609,18 @@ mod tests {
         let html4 = r#"<img alt="[某平台专属表情]" src="https://face.t.sinajs.cn/x.png">"#;
         let out4 = strip_ui_icons(html4);
         assert_eq!(out4, "[某平台专属表情]");
+
+        let html5 = r#"<img alt="[awsl]" src="https://face.t.sinajs.cn/x.png">"#;
+        assert_eq!(strip_ui_icons(html5), "🫠");
+
+        let html6 = r#"<img alt="[彩虹屁]" src="https://face.t.sinajs.cn/x.png">"#;
+        assert_eq!(strip_ui_icons(html6), "🌈💨");
+
+        let html7 = r#"<img alt="[航天员]" src="https://face.t.sinajs.cn/x.png">"#;
+        assert_eq!(strip_ui_icons(html7), "🧑‍🚀");
+
+        let html8 = r#"<img alt="[揣手]" src="https://face.t.sinajs.cn/x.png">"#;
+        assert_eq!(strip_ui_icons(html8), "[揣手]");
     }
 
     #[test]
