@@ -27,7 +27,8 @@ PRIVATE_DOC = re.compile(
     r")"
 )
 ENV_NARRATION = re.compile(
-    r"(WSL|docker cp|workstation|local host|host PowerShell|Alpine builder|"
+    # Word boundaries keep Weibo marker text such as "[awsl]" from matching WSL.
+    r"(\bWSL\b|docker cp|workstation|local host|host PowerShell|Alpine builder|"
     r"musl-gcc|rustup|md5|parity)",
     re.IGNORECASE,
 )
