@@ -116,13 +116,23 @@ pub type PlatformFetchFn = for<'a> fn(
     Box<dyn Future<Output = anyhow::Result<crate::fetcher::FetchResult>> + Send + 'a>,
 >;
 
+pub type PlatformSelfSourceFn =
+    for<'a> fn(
+        &'a AppState,
+        &'a str,
+        &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<bool>> + Send + 'a>>;
+
 pub struct PlatformDef {
     pub id: &'static str,
     pub label: &'static str,
     pub needs_cookie: bool,
+    pub known_sent: bool,
+    pub enrichment: bool,
     pub match_url: fn(&str) -> bool,
     pub canonical_url: fn(&str) -> Option<String>,
     pub fetch: PlatformFetchFn,
+    pub self_source: Option<PlatformSelfSourceFn>,
 }
 
 pub const PLATFORMS: &[PlatformDef] = &[
@@ -130,33 +140,44 @@ pub const PLATFORMS: &[PlatformDef] = &[
         id: "weibo",
         label: "Weibo",
         needs_cookie: true,
+        known_sent: true,
+        enrichment: true,
         match_url: weibo::is_weibo_url,
         canonical_url: |url| {
             weibo::parse_uid(url).map(|uid| format!("https://weibo.com/u/{}", uid))
         },
         fetch: |state, url, opts| Box::pin(weibo::fetch_by_url(state, url, opts)),
+        self_source: None,
     },
     PlatformDef {
         id: "x",
         label: "X",
         needs_cookie: true,
+        known_sent: false,
+        enrichment: false,
         match_url: x::is_x_url,
         canonical_url: |url| {
             x::parse_screen_name(url)
                 .map(|name| format!("https://x.com/{}", name.to_ascii_lowercase()))
         },
         fetch: |state, url, opts| Box::pin(x::fetch_by_url(state, url, opts)),
+        self_source: None,
     },
     PlatformDef {
         id: "telegram",
         label: "Telegram",
         needs_cookie: false,
+        known_sent: false,
+        enrichment: false,
         match_url: telegram::is_telegram_url,
         canonical_url: |url| {
             telegram::parse_channel_name(url)
                 .map(|ch| format!("https://t.me/{}", ch.to_ascii_lowercase()))
         },
         fetch: |state, url, opts| Box::pin(telegram::fetch_by_url(state, url, opts)),
+        self_source: Some(|state, chat_id, url| {
+            Box::pin(telegram::is_self_source(state, chat_id, url))
+        }),
     },
 ];
 
@@ -294,7 +315,12 @@ pub fn cookie_setting_key(platform: &str) -> String {
 }
 
 pub async fn load_persisted_cookies(state: &AppState) {
-    let rows = match crate::db::get_settings_by_prefix(&state.db, "cookie:").await {
+    let rows = match crate::db::get_settings_by_prefix(
+        &state.db,
+        crate::db::setting_key::COOKIE_PREFIX,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "load_persisted_cookies: prefix query failed, cookies not loaded");
@@ -316,13 +342,16 @@ pub async fn load_persisted_cookies(state: &AppState) {
 }
 
 pub async fn migrate_legacy_cookies(state: &AppState) {
-    let rows = match crate::db::get_settings_by_prefix(&state.db, "cookie:").await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "migrate_legacy_cookies: prefix query failed");
-            return;
-        }
-    };
+    let rows =
+        match crate::db::get_settings_by_prefix(&state.db, crate::db::setting_key::COOKIE_PREFIX)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "migrate_legacy_cookies: prefix query failed");
+                return;
+            }
+        };
 
     let mut legacy: Vec<(i64, String, String)> = Vec::new();
     for (key, value) in &rows {
@@ -415,16 +444,18 @@ pub async fn migrate_legacy_cookies(state: &AppState) {
         }
     }
 
+    let known_platforms: Vec<&str> = PLATFORMS.iter().map(|p| p.id).collect();
     for prefix in [
-        "platform_health:",
-        "platform_streak:",
-        "cookie_expired_notified:",
+        crate::db::setting_key::PLATFORM_HEALTH_PREFIX,
+        crate::db::setting_key::PLATFORM_STREAK_PREFIX,
+        crate::db::setting_key::COOKIE_EXPIRED_NOTIFIED_PREFIX,
     ] {
         if let Ok(hrows) = crate::db::get_settings_by_prefix(&state.db, prefix).await {
             for (key, _) in &hrows {
                 let rest = &key[prefix.len()..];
-                if rest.contains(':') {
+                if rest.contains(':') || !known_platforms.contains(&rest) {
                     crate::db::delete_setting(&state.db, key).await.ok();
+                    tracing::info!(key = %key, "removed orphan settings key");
                 }
             }
         }

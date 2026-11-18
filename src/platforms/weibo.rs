@@ -28,6 +28,26 @@ fn status_id_str(mblog: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+// One priority list for every weibo video URL map (page_info and statuses/show).
+pub(crate) fn best_video_url(urls: &Value) -> Option<String> {
+    const URL_KEYS: &[&str] = &[
+        "ultra",
+        "hd",
+        "high",
+        "medium",
+        "mp4_4k_mp4",
+        "mp4_1080p_mp4",
+        "mp4_720p_mp4",
+        "hevc_mp4_hd",
+        "mp4_hd_mp4",
+        "mp4_ld_mp4",
+    ];
+    URL_KEYS
+        .iter()
+        .find_map(|k| urls[k].as_str().filter(|s| !s.is_empty()))
+        .map(|s| s.to_string())
+}
+
 static RE_MD_ANCHOR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?is)<a\b[^>]*>.*?</a>").unwrap());
 static RE_MD_INLINE_CODE: LazyLock<regex::Regex> =
@@ -665,25 +685,7 @@ fn append_weibo_media(body: &mut String, mblog: &Value, owner_mid: &str) {
             .filter(|s| !s.is_empty())
             .or_else(|| media_info["stream_url"].as_str().filter(|s| !s.is_empty()))
             .map(|s| s.to_string())
-            .or_else(|| {
-                const URL_KEYS: &[&str] = &[
-                    "mp4_4k_mp4",
-                    "mp4_1080p_mp4",
-                    "mp4_720p_mp4",
-                    "hevc_mp4_hd",
-                    "mp4_hd_mp4",
-                    "ultra",
-                    "hd",
-                    "high",
-                    "mp4_ld_mp4",
-                    "medium",
-                ];
-                let urls = &page_info["urls"];
-                URL_KEYS
-                    .iter()
-                    .find_map(|k| urls[k].as_str().filter(|s| !s.is_empty()))
-                    .map(|s| s.to_string())
-            })
+            .or_else(|| best_video_url(&page_info["urls"]))
             .unwrap_or_default();
         if !video_url.is_empty() {
             let owner_attr = if owner_mid.is_empty() {

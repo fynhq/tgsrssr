@@ -106,30 +106,6 @@ async fn main() -> anyhow::Result<()> {
     platforms::migrate_legacy_cookies(&state).await;
     platforms::load_persisted_cookies(&state).await;
 
-    {
-        let known_platforms: Vec<&str> = platforms::PLATFORMS.iter().map(|p| p.id).collect();
-        for prefix in [
-            "platform_health:",
-            "platform_streak:",
-            "cookie_expired_notified:",
-        ] {
-            let rows = match db::get_settings_by_prefix(&db_pool, prefix).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(prefix = %prefix, error = %e, "orphan-key cleanup: prefix query failed, skipping");
-                    continue;
-                }
-            };
-            for (key, _) in &rows {
-                let rest = &key[prefix.len()..];
-                if !rest.contains(':') && !known_platforms.contains(&rest) {
-                    db::delete_setting(&db_pool, key).await.ok();
-                    info!(key = %key, "removed orphan settings key");
-                }
-            }
-        }
-    }
-
     cleanup::run_startup_cleanup(&cfg, &db_pool).await;
     state.media_budget.invalidate();
 
@@ -312,7 +288,7 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
             .await;
             return Ok(());
         }
-        let expired = op.created_at().elapsed() > crate::state::PENDING_OP_TIMEOUT;
+        let expired = op.is_expired();
         let is_command = Command::parse(text, &state.bot_username).is_ok();
         let is_channel_forward = matches!(
             msg.forward_origin(),
@@ -449,7 +425,7 @@ async fn register_pending_ops_sweep_job(
                 let mut ops = state.pending_ops.lock().await;
                 let expired: Vec<((i64, i64), crate::state::PendingOp)> = ops
                     .iter()
-                    .filter(|(_, op)| op.created_at().elapsed() > crate::state::PENDING_OP_TIMEOUT)
+                    .filter(|(_, op)| op.is_expired())
                     .map(|(k, op)| (*k, op.clone()))
                     .collect();
                 for (key, _) in &expired {

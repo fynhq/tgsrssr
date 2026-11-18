@@ -204,6 +204,31 @@ async fn handle_set(
     Ok(())
 }
 
+async fn send_chunks(
+    bot: &Bot,
+    chat_id: teloxide::types::ChatId,
+    chunks: &[String],
+) -> ResponseResult<()> {
+    let mut first_msg: Option<teloxide::types::MessageId> = None;
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut req = bot
+            .send_message(chat_id, chunk)
+            .parse_mode(ParseMode::Html)
+            .link_preview_options(no_preview());
+        if let Some(first) = first_msg {
+            req = req.reply_parameters(teloxide::types::ReplyParameters::new(first));
+        }
+        let m = req.await?;
+        if first_msg.is_none() {
+            first_msg = Some(m.id);
+        }
+        if i + 1 < chunks.len() {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_list(
     bot: &Bot,
     msg: &Message,
@@ -211,7 +236,7 @@ async fn handle_list(
     args: &str,
     lang: Lang,
 ) -> ResponseResult<()> {
-    let target = match resolve_target_input(msg, args) {
+    let target = match resolve_target_input(args) {
         Some(t) => t,
         None => {
             bot.send_message(msg.chat.id, i18n::t(lang, "list_usage"))
@@ -300,23 +325,7 @@ async fn handle_list(
         chunks.push(current);
     }
 
-    let mut first_msg: Option<teloxide::types::MessageId> = None;
-    for (i, chunk) in chunks.iter().enumerate() {
-        let mut req = bot
-            .send_message(msg.chat.id, chunk)
-            .parse_mode(ParseMode::Html)
-            .link_preview_options(no_preview());
-        if let Some(rid) = first_msg {
-            req = req.reply_parameters(teloxide::types::ReplyParameters::new(rid));
-        }
-        let m = req.await?;
-        if first_msg.is_none() {
-            first_msg = Some(m.id);
-        }
-        if i < chunks.len() - 1 {
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        }
-    }
+    send_chunks(bot, msg.chat.id, &chunks).await?;
     Ok(())
 }
 
@@ -585,23 +594,7 @@ async fn handle_sub(
     } else {
         chunks
     };
-    let mut first_msg: Option<teloxide::types::MessageId> = None;
-    for (i, chunk) in chunks.iter().enumerate() {
-        let mut req = bot
-            .send_message(msg.chat.id, chunk)
-            .parse_mode(ParseMode::Html)
-            .link_preview_options(no_preview());
-        if let Some(first) = first_msg {
-            req = req.reply_parameters(teloxide::types::ReplyParameters::new(first));
-        }
-        let m = req.await?;
-        if first_msg.is_none() {
-            first_msg = Some(m.id);
-        }
-        if i + 1 < chunks.len() {
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        }
-    }
+    send_chunks(bot, msg.chat.id, &chunks).await?;
     Ok(())
 }
 
@@ -712,8 +705,8 @@ async fn handle_test(
 
     let fetch_started = std::time::Instant::now();
     let platform = crate::platforms::platform_for_url(&feed_url);
-    let is_weibo = platform.is_some_and(|p| p.id == "weibo");
-    let first_enrichment = if is_weibo {
+    let supports_target_enrichment = platform.is_some_and(|p| p.enrichment);
+    let first_enrichment = if supports_target_enrichment {
         fetcher::Enrichment::None
     } else {
         fetcher::Enrichment::Full
@@ -776,7 +769,7 @@ async fn handle_test(
             return Ok(());
         }
     };
-    if is_weibo {
+    if supports_target_enrichment {
         let enrich_started = std::time::Instant::now();
         match fetch::fetch_command_feed_unchecked(
             state,
@@ -1075,7 +1068,6 @@ async fn handle_test(
         media_count = prepared.items.len(),
         allow_rich = opts.allow_rich,
         caption_above_media = caption_above_media,
-        aspect_threshold = crate::config::LONG_IMAGE_ASPECT_RATIO,
         "/test: send start"
     );
     let result = push::send_entry_with_media(
@@ -1088,7 +1080,6 @@ async fn handle_test(
             author: author.as_deref(),
             opts,
             caption_above_media,
-            aspect_threshold: crate::config::LONG_IMAGE_ASPECT_RATIO,
             media: &prepared.items,
             meta,
         },
@@ -1663,7 +1654,7 @@ fn looks_like_chat_ref(s: &str) -> bool {
         || (s.starts_with('-') && s[1..].parse::<i64>().is_ok())
 }
 
-fn resolve_target_input(_msg: &Message, args: &str) -> Option<String> {
+fn resolve_target_input(args: &str) -> Option<String> {
     let args = args.trim();
     (!args.is_empty()).then(|| args.to_string())
 }

@@ -14,7 +14,7 @@ use crate::db;
 use crate::fetcher;
 use crate::i18n::{self, Lang};
 use crate::notify::{
-    notify_admins_html, notify_download_failed, notify_oversized_video, notify_owner_html,
+    notify_admins_html, notify_download_failed, notify_oversized_videos, notify_owner_html,
     owner_lang, push_fail_msg, push_line,
 };
 use crate::push::{self, ContentMode};
@@ -158,8 +158,7 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     }
     let _guard = crate::state::ActiveFlagGuard(state.fetch_cycle_active.clone());
 
-    let total_due = db::count_due_subscriptions(&state.db).await?;
-    let due = db::get_due_subscriptions(&state.db).await?;
+    let (total_due, due) = db::get_due_subscriptions(&state.db).await?;
     if due.is_empty() {
         return Ok(());
     }
@@ -355,12 +354,6 @@ async fn entry_already_handled(
     Ok(sent || queued)
 }
 
-enum SendFailureAction {
-    Continue,
-    DeferContinue,
-    DeferBreak,
-}
-
 struct SendFailureCtx<'a> {
     state: &'a AppState,
     bot: &'a Bot,
@@ -382,7 +375,7 @@ struct SendFailureCtx<'a> {
     error: &'a anyhow::Error,
 }
 
-async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFailureAction> {
+async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<policy::FlowAction> {
     let state = ctx.state;
     let bot = ctx.bot;
     let sub = ctx.sub;
@@ -410,7 +403,7 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
                     new_chat_id = %new_id,
                     "chat id migrated after send error; retrying on the next cycle"
                 );
-                return Ok(SendFailureAction::Continue);
+                return Ok(policy::FlowAction::Continue);
             }
             Err(me) => warn!(
                 old_chat_id = %cfg.chat_id,
@@ -421,14 +414,14 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
         }
     }
     if record_send_failure(bot, state, sub, cfg, lang, feed_title, e).await {
-        return Ok(SendFailureAction::DeferBreak);
+        return Ok(policy::FlowAction::DeferBreak);
     }
 
     let queued = match db::outbox_count_for_feed(&state.db, &cfg.chat_id, &cfg.feed_url).await {
         Ok(n) => n,
         Err(err) => {
             warn!(feed = %cfg.feed_url, error = %err, "outbox count failed, deferring entry");
-            return Ok(SendFailureAction::DeferContinue);
+            return Ok(policy::FlowAction::DeferContinue);
         }
     };
     if queued >= OUTBOX_PER_FEED_LIMIT {
@@ -454,7 +447,7 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
                 warn!(feed = %cfg.feed_url, error = %err, "outbox-full auto-disable failed")
             }
         }
-        return Ok(SendFailureAction::DeferBreak);
+        return Ok(policy::FlowAction::DeferBreak);
     }
 
     warn!(feed = %cfg.feed_url, error = %e, "send failed, queuing to outbox");
@@ -474,7 +467,7 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
                 &elink,
             );
             notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
-            return Ok(SendFailureAction::Continue);
+            return Ok(policy::FlowAction::Continue);
         }
     };
     let media_json = serde_json::to_string(media_items).unwrap_or_default();
@@ -527,19 +520,17 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
                 .await;
             }
             if notify_oversized {
-                for ov in oversized {
-                    notify_oversized_video(
-                        bot,
-                        lang,
-                        owner_id,
-                        chat_title,
-                        &entry_link,
-                        None,
-                        false,
-                        ov,
-                    )
-                    .await;
-                }
+                notify_oversized_videos(
+                    bot,
+                    lang,
+                    owner_id,
+                    chat_title,
+                    &entry_link,
+                    None,
+                    false,
+                    oversized,
+                )
+                .await;
             }
         }
         Ok(false) => {
@@ -559,7 +550,7 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<SendFai
             notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
         }
     }
-    Ok(SendFailureAction::Continue)
+    Ok(policy::FlowAction::Continue)
 }
 
 enum MediaGateAction {
@@ -601,19 +592,17 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
     if ctx.mode == ContentMode::MediaOnly && prepared.items.is_empty() {
         let entry_link = fetcher::entry_link(entry).unwrap_or_default();
         if notify_oversized {
-            for ov in oversized {
-                notify_oversized_video(
-                    bot,
-                    lang,
-                    owner_id,
-                    chat_title,
-                    &entry_link,
-                    None,
-                    false,
-                    ov,
-                )
-                .await;
-            }
+            notify_oversized_videos(
+                bot,
+                lang,
+                owner_id,
+                chat_title,
+                &entry_link,
+                None,
+                false,
+                oversized,
+            )
+            .await;
         }
         if has_download_warnings {
             let retry_key = db::setting_key::media_dl_fail(&cfg.chat_id, &cfg.feed_url, eid);
@@ -787,12 +776,6 @@ async fn handle_fetch_failure(
     Ok(())
 }
 
-enum EntryPrepAction {
-    Continue,
-    DeferContinue,
-    DeferBreak,
-}
-
 struct EntryPrep {
     prepared: crate::media::PreparedMedia,
     dl_retry_note: String,
@@ -817,7 +800,7 @@ async fn prepare_entry_for_send(
     allow_trusted_private: bool,
     entry_id: &str,
     storage_notice_sent: &mut bool,
-) -> anyhow::Result<Result<EntryPrep, EntryPrepAction>> {
+) -> anyhow::Result<Result<EntryPrep, policy::FlowAction>> {
     let eid = entry_id;
     let meta = fr.metas.get(eid);
     let prepared = if opts.mode.skip_media() {
@@ -847,7 +830,7 @@ async fn prepare_entry_for_send(
                 i18n::t(lang, "notif_media_storage").replacen("{}", &push::escape_html(name), 1);
             notify_owner_html(bot, state, &cfg.chat_id, &msg).await;
         }
-        return Ok(Err(EntryPrepAction::DeferContinue));
+        return Ok(Err(policy::FlowAction::DeferContinue));
     }
     let gate = media_gate(&MediaGateCtx {
         state,
@@ -864,8 +847,8 @@ async fn prepare_entry_for_send(
     })
     .await?;
     let dl_retry_note = match gate {
-        MediaGateAction::Continue => return Ok(Err(EntryPrepAction::Continue)),
-        MediaGateAction::DeferContinue => return Ok(Err(EntryPrepAction::DeferContinue)),
+        MediaGateAction::Continue => return Ok(Err(policy::FlowAction::Continue)),
+        MediaGateAction::DeferContinue => return Ok(Err(policy::FlowAction::DeferContinue)),
         MediaGateAction::Proceed { dl_retry_note } => dl_retry_note,
     };
     let notify_warnings = prepared.notify_warnings(state.config.notify_oversized_media);
@@ -873,7 +856,7 @@ async fn prepare_entry_for_send(
     let oversized = prepared.oversized_videos.clone();
 
     match entry_already_handled(state, &cfg.chat_id, &cfg.feed_url, eid).await {
-        Ok(true) => return Ok(Err(EntryPrepAction::Continue)),
+        Ok(true) => return Ok(Err(policy::FlowAction::Continue)),
         Ok(false) => {}
         Err(e) => {
             warn!(
@@ -882,7 +865,7 @@ async fn prepare_entry_for_send(
                 error = %e,
                 "pre-send dedup recheck failed, deferring remaining entries"
             );
-            return Ok(Err(EntryPrepAction::DeferBreak));
+            return Ok(Err(policy::FlowAction::DeferBreak));
         }
     }
     Ok(Ok(EntryPrep {
@@ -892,12 +875,6 @@ async fn prepare_entry_for_send(
         notify_oversized,
         oversized,
     }))
-}
-
-enum EntrySendAction {
-    Continue,
-    DeferContinue,
-    DeferBreak,
 }
 
 struct SendAndHandleCtx<'a> {
@@ -922,7 +899,7 @@ struct SendAndHandleCtx<'a> {
     transport: &'a crate::media::MediaTransport,
 }
 
-async fn send_and_handle(ctx: &SendAndHandleCtx<'_>) -> anyhow::Result<EntrySendAction> {
+async fn send_and_handle(ctx: &SendAndHandleCtx<'_>) -> anyhow::Result<policy::FlowAction> {
     let state = ctx.state;
     let bot = ctx.bot;
     let sub = ctx.sub;
@@ -966,7 +943,6 @@ async fn send_and_handle(ctx: &SendAndHandleCtx<'_>) -> anyhow::Result<EntrySend
                 author: author.as_deref(),
                 opts,
                 caption_above_media: cfg.caption_above_media,
-                aspect_threshold: crate::config::LONG_IMAGE_ASPECT_RATIO,
                 media: &prepared.items,
                 meta,
             },
@@ -1003,7 +979,7 @@ async fn send_and_handle(ctx: &SendAndHandleCtx<'_>) -> anyhow::Result<EntrySend
                 "mark_entry_sent failed after successful delivery (may re-push next cycle)",
             )
             .await;
-            Ok(EntrySendAction::Continue)
+            Ok(policy::FlowAction::Continue)
         }
         Err(e) => {
             let failure = SendFailureCtx {
@@ -1026,11 +1002,7 @@ async fn send_and_handle(ctx: &SendAndHandleCtx<'_>) -> anyhow::Result<EntrySend
                 meta,
                 error: &e,
             };
-            match handle_send_failure(&failure).await? {
-                SendFailureAction::Continue => Ok(EntrySendAction::Continue),
-                SendFailureAction::DeferContinue => Ok(EntrySendAction::DeferContinue),
-                SendFailureAction::DeferBreak => Ok(EntrySendAction::DeferBreak),
-            }
+            handle_send_failure(&failure).await
         }
     }
 }
@@ -1096,7 +1068,7 @@ async fn fetch_feed_with_retry(
 ) -> Result<fetcher::FetchResult, FeedFetchError> {
     let is_rss_source = platform_of_url(&sub.feed_url).is_none();
     let known_sent_snapshot: Option<std::collections::HashSet<String>> =
-        if platform_of_url(&sub.feed_url) == Some("weibo") {
+        if crate::platforms::platform_for_url(&sub.feed_url).is_some_and(|p| p.known_sent) {
             match db::sent_entry_ids_recent(
                 &state.db,
                 &cfg.chat_id,
@@ -1333,12 +1305,12 @@ async fn process_feed(
                 .await?
                 {
                     Ok(p) => p,
-                    Err(EntryPrepAction::Continue) => continue,
-                    Err(EntryPrepAction::DeferContinue) => {
+                    Err(policy::FlowAction::Continue) => continue,
+                    Err(policy::FlowAction::DeferContinue) => {
                         deferred = true;
                         continue;
                     }
-                    Err(EntryPrepAction::DeferBreak) => {
+                    Err(policy::FlowAction::DeferBreak) => {
                         deferred = true;
                         break;
                     }
@@ -1375,11 +1347,11 @@ async fn process_feed(
                 })
                 .await?;
                 match action {
-                    EntrySendAction::Continue => {}
-                    EntrySendAction::DeferContinue => {
+                    policy::FlowAction::Continue => {}
+                    policy::FlowAction::DeferContinue => {
                         deferred = true;
                     }
-                    EntrySendAction::DeferBreak => {
+                    policy::FlowAction::DeferBreak => {
                         deferred = true;
                         break;
                     }
@@ -1905,7 +1877,6 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     author,
                     opts,
                     caption_above_media: row.caption_above_media,
-                    aspect_threshold: crate::config::LONG_IMAGE_ASPECT_RATIO,
                     media: &media_items,
                     meta: meta_ref,
                 },

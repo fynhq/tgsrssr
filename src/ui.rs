@@ -453,18 +453,6 @@ pub(crate) async fn render_feed_page(
     chlist_page: usize,
     lang: Lang,
 ) -> ResponseResult<()> {
-    render_feed_page_impl(bot, target, sub_id, state, ch_page, chlist_page, lang).await
-}
-
-async fn render_feed_page_impl(
-    bot: &Bot,
-    target: PageTarget<'_>,
-    sub_id: i64,
-    state: &AppState,
-    ch_page: usize,
-    chlist_page: usize,
-    lang: Lang,
-) -> ResponseResult<()> {
     let Some(sub) = load_sub_or_deliver(bot, &target, &state.db, sub_id, lang).await? else {
         return Ok(());
     };
@@ -688,18 +676,6 @@ pub(crate) fn fmt_source_display(lang: Lang, s: &str) -> &'static str {
 }
 
 pub(crate) async fn render_feed_filter(
-    bot: &Bot,
-    target: PageTarget<'_>,
-    sub_id: i64,
-    state: &AppState,
-    ch_page: usize,
-    chlist_page: usize,
-    lang: Lang,
-) -> ResponseResult<()> {
-    render_feed_filter_impl(bot, target, sub_id, state, ch_page, chlist_page, lang).await
-}
-
-async fn render_feed_filter_impl(
     bot: &Bot,
     target: PageTarget<'_>,
     sub_id: i64,

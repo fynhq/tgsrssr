@@ -2,6 +2,13 @@ pub(super) const MEDIA_DL_MAX_RETRIES: i64 = 10;
 pub(super) const MEDIA_DL_MAX_DEFER_ROUNDS: i64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlowAction {
+    Continue,
+    DeferContinue,
+    DeferBreak,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MediaRetryStep {
     Proceed,
     ReadError,

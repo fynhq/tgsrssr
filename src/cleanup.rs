@@ -17,6 +17,9 @@ const OUTBOUND_TTL_HOURS: u64 = 80;
 const SENT_ENTRIES_RETENTION_DAYS: i64 = 180;
 const FILE_ID_CACHE_RETENTION_DAYS: i64 = 30;
 const SENT_MESSAGES_MAX_ROWS: i64 = 5000;
+const MEDIA_DL_FAIL_TTL_DAYS: i64 = 7;
+const STALE_ZERO_TTL_DAYS: i64 = 14;
+const OUTBOX_MEDIA_LOST_TTL_DAYS: i64 = 7;
 
 async fn run_cleanup_tasks(config: &Config, db_pool: &Db, ctx: &str) {
     match outbox_protected_paths(db_pool).await {
@@ -149,6 +152,9 @@ fn oldest_candidates(
             }
             let path = entry.path();
             if protected.contains(path) {
+                return None;
+            }
+            if entry.file_name().to_string_lossy().starts_with(".tmp_") {
                 return None;
             }
             let meta = entry.metadata().ok()?;
@@ -297,15 +303,15 @@ pub async fn cleanup_database(db_pool: &Db) -> anyhow::Result<()> {
     })
     .await;
     let r3 = step("media_dl_fail", || {
-        db::cleanup_stale_settings(db_pool, "media_dl_fail:", 7)
+        db::cleanup_stale_settings(db_pool, "media_dl_fail:", MEDIA_DL_FAIL_TTL_DAYS)
     })
     .await;
     let r4 = step("stale_zero", || {
-        db::cleanup_stale_settings(db_pool, "stale_zero:", 14)
+        db::cleanup_stale_settings(db_pool, "stale_zero:", STALE_ZERO_TTL_DAYS)
     })
     .await;
     let r5 = step("outbox_media_lost", || {
-        db::cleanup_stale_settings(db_pool, "outbox_media_lost:", 7)
+        db::cleanup_stale_settings(db_pool, "outbox_media_lost:", OUTBOX_MEDIA_LOST_TTL_DAYS)
     })
     .await;
     let r6 = step("sent_messages", || {

@@ -3,7 +3,9 @@ use tracing::warn;
 
 use crate::db;
 use crate::i18n::{self, Lang};
-use crate::notify::{notify_download_failed, notify_oversized_video, notify_owner_html, push_line};
+use crate::notify::{
+    notify_download_failed, notify_oversized_videos, notify_owner_html, push_line,
+};
 use crate::push;
 use crate::state::AppState;
 
@@ -201,19 +203,17 @@ pub(super) async fn apply_send_success(
             }
             SendSuccessEffect::NotifyMediaFailed => ctx.notify_media_failed(outcome).await,
             SendSuccessEffect::NotifyOversizedVideos => {
-                for ov in extras.oversized {
-                    notify_oversized_video(
-                        ctx.bot,
-                        ctx.lang,
-                        extras.owner_id,
-                        ctx.chat_title,
-                        extras.entry_link,
-                        outcome.delivered_tg_link.as_deref(),
-                        outcome.text_only,
-                        ov,
-                    )
-                    .await;
-                }
+                notify_oversized_videos(
+                    ctx.bot,
+                    ctx.lang,
+                    extras.owner_id,
+                    ctx.chat_title,
+                    extras.entry_link,
+                    outcome.delivered_tg_link.as_deref(),
+                    outcome.text_only,
+                    extras.oversized,
+                )
+                .await;
             }
             SendSuccessEffect::RecordAndMarkSent => {
                 ctx.record_and_mark_sent(outcome, mark_log).await;

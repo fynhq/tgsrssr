@@ -25,19 +25,13 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
     let state = ctx.state;
     let lang = ctx.lang;
     let qid = ctx.qid.clone();
-    let parts = ctx.parts;
+    let args = ctx.args;
 
     match ctx.op {
         CallbackOp::Config => {
-            if let Some(cid) = parts.get(2) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(cid) = args.id {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 render_settings_page(
                     bot,
                     PageTarget::Edit(q),
@@ -51,15 +45,9 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::ConfigInterval => {
-            if let Some(cid) = parts.get(2) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(cid) = args.id {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 render_settings_interval(
                     bot,
                     PageTarget::Edit(q),
@@ -73,15 +61,9 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::ConfigMode => {
-            if let Some(cid) = parts.get(2) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(cid) = args.id {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 render_settings_mode(
                     bot,
                     PageTarget::Edit(q),
@@ -95,15 +77,9 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::ConfigSource => {
-            if let Some(cid) = parts.get(2) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(cid) = args.id {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 render_settings_source(
                     bot,
                     PageTarget::Edit(q),
@@ -117,15 +93,9 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::ConfigLinkPreview => {
-            if let Some(cid) = parts.get(2) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(cid) = args.id {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 let cfg = match load_chat_config_checked(&state.db, cid).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -163,15 +133,9 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::ConfigCaption => {
-            if let Some(cid) = parts.get(2) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(cid) = args.id {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 let cfg = match load_chat_config_checked(&state.db, cid).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -213,15 +177,9 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::ResumeAll => {
-            if let Some(cid) = parts.get(2) {
-                let chlist_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let ch_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(cid) = args.id {
+                let chlist_page = args.chlist_page;
+                let ch_page = args.ch_page;
                 match db::resume_all_subscriptions(&state.db, cid).await {
                     Ok(n) => {
                         info!(chat_id = %cid, count = n, "resume-all: subscriptions re-enabled");
@@ -254,18 +212,12 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
         CallbackOp::ConfigIntervalValue
         | CallbackOp::ConfigModeValue
         | CallbackOp::ConfigSourceValue => {
-            if let (Some(cid), Some(val)) = (parts.get(2), parts.get(3)) {
-                let ch_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(5)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let field = match parts[1] {
-                    "cfgiv" => "interval_minutes",
-                    "cfgmv" => "content_mode",
+            if let (Some(cid), Some(val)) = (args.id, args.value) {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
+                let field = match ctx.op {
+                    CallbackOp::ConfigIntervalValue => "interval_minutes",
+                    CallbackOp::ConfigModeValue => "content_mode",
                     _ => "source_display",
                 };
                 // Clamp forged/edge intervals: 0 or negative makes the due check always true (rate-limit / IP-ban risk).
@@ -340,20 +292,14 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
     let state = ctx.state;
     let lang = ctx.lang;
     let qid = ctx.qid.clone();
-    let parts = ctx.parts;
+    let args = ctx.args;
     let guard_chat_id = ctx.guard_chat_id;
 
     match ctx.op {
         CallbackOp::Source => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 render_feed_page(
                     bot,
                     PageTarget::Edit(q),
@@ -367,16 +313,10 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourcePause | CallbackOp::SourceResume => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let active = parts[1] == "srcresume";
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
+                let active = ctx.op == CallbackOp::SourceResume;
                 let Some(expected_chat) = guard_chat_id else {
                     bot.answer_callback_query(qid.clone())
                         .text(i18n::t(lang, "sub_not_found"))
@@ -416,15 +356,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceRename => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
                     let chat = q.message.as_ref().map(|m| m.chat().id);
                     let panel_msg_id = q.message.as_ref().map(|m| m.id().0).unwrap_or(0);
@@ -459,15 +393,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceIntervalPage => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 render_feed_interval(
                     bot,
                     PageTarget::Edit(q),
@@ -481,15 +409,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceModePage => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 render_feed_mode(
                     bot,
                     PageTarget::Edit(q),
@@ -503,15 +425,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceSourcePage => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 render_feed_source(
                     bot,
                     PageTarget::Edit(q),
@@ -525,15 +441,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceCaption => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
                     let (cfg, chat_cfg) = match (
                         db::get_effective_config(&state.db, &sub.chat_id, &sub.feed_url).await,
@@ -600,15 +510,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceLinkPreview => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
                     // A transient DB read error must abort a toggle; toggling from the default persists a wrong override.
                     let (cfg, chat_cfg) = match (
@@ -672,15 +576,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceFilter => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 render_feed_filter(
                     bot,
                     PageTarget::Edit(q),
@@ -694,15 +592,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceFilterToggle => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
                     let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await
                     {
@@ -750,15 +642,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceFilterMode => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
                     let fc = match db::get_feed_filter(&state.db, &sub.chat_id, &sub.feed_url).await
                     {
@@ -806,15 +692,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
             }
         }
         CallbackOp::SourceFilterKeywords => {
-            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
-                let ch_page = parts
-                    .get(3)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
+            if let Some(id) = args.sub_id() {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
                     let chat = q.message.as_ref().map(|m| m.chat().id);
                     let panel_msg_id = q.message.as_ref().map(|m| m.id().0).unwrap_or(0);
@@ -865,19 +745,10 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
         CallbackOp::SourceIntervalValue
         | CallbackOp::SourceModeValue
         | CallbackOp::SourceSourceValue => {
-            if let (Some(id), Some(val)) = (
-                parts.get(2).and_then(|s| s.parse::<i64>().ok()),
-                parts.get(3),
-            ) {
-                let ch_page = parts
-                    .get(4)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let chlist_page = parts
-                    .get(5)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                if parts[1] == "srcfi" && *val != "inherit" {
+            if let (Some(id), Some(val)) = (args.sub_id(), args.value) {
+                let ch_page = args.ch_page;
+                let chlist_page = args.chlist_page;
+                if ctx.op == CallbackOp::SourceIntervalValue && val != "inherit" {
                     let ok = val
                         .parse::<i64>()
                         .map(|n| (1..=crate::db::MAX_INTERVAL_MINUTES).contains(&n))
@@ -891,9 +762,9 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                     }
                 }
                 if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
-                    let field = match parts[1] {
-                        "srcfi" => "interval_minutes",
-                        "srcfm" => "content_mode",
+                    let field = match ctx.op {
+                        CallbackOp::SourceIntervalValue => "interval_minutes",
+                        CallbackOp::SourceModeValue => "content_mode",
                         _ => "source_display",
                     };
                     let chat_cfg = match load_chat_config_checked(&state.db, &sub.chat_id).await {
@@ -912,10 +783,10 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
                         "content_mode" => chat_cfg.content_mode.clone(),
                         _ => chat_cfg.source_display.clone(),
                     };
-                    let value: Option<&str> = if *val == "inherit" || *val == channel_default {
+                    let value: Option<&str> = if val == "inherit" || val == channel_default {
                         None
                     } else {
-                        Some(*val)
+                        Some(val)
                     };
                     match db::set_feed_config_field(
                         &state.db,

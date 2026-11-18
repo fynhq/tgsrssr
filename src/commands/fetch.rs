@@ -1,4 +1,3 @@
-use crate::db;
 use crate::fetcher::{self, Enrichment, FetchOptions, FetchResult};
 use crate::i18n::{self, Lang};
 use crate::platforms;
@@ -33,13 +32,16 @@ pub(super) async fn validate_command_source(
         if p.needs_cookie && state.get_cookie(p.id).await.is_none() {
             return Err(CommandFetchError::PlatformClosed(p.label));
         }
+        if let Some(check) = p.self_source {
+            if check(state, chat_id, url)
+                .await
+                .map_err(CommandFetchError::CheckFailed)?
+            {
+                return Err(CommandFetchError::SelfSource);
+            }
+        }
     }
-
-    match is_self_telegram_source(state, chat_id, url).await {
-        Ok(true) => Err(CommandFetchError::SelfSource),
-        Ok(false) => Ok(()),
-        Err(e) => Err(CommandFetchError::CheckFailed(e)),
-    }
+    Ok(())
 }
 
 pub(super) async fn fetch_command_feed_unchecked(
@@ -113,29 +115,6 @@ pub(super) fn test_error_text(lang: Lang, err: CommandFetchError) -> String {
             i18n::t(lang, "test_fetch_failed").replace("{:#}", &format!("{:#}", e))
         }
     }
-}
-
-async fn is_self_telegram_source(
-    state: &AppState,
-    chat_id: &str,
-    feed_url: &str,
-) -> anyhow::Result<bool> {
-    let Some(p) = platforms::platform_for_url(feed_url) else {
-        return Ok(false);
-    };
-    if p.id != "telegram" {
-        return Ok(false);
-    }
-    let Some(channel) = platforms::telegram::parse_channel_name(feed_url) else {
-        return Ok(false);
-    };
-    let Some(chat) = db::get_chat(&state.db, chat_id).await? else {
-        return Ok(false);
-    };
-    Ok(chat
-        .username
-        .as_deref()
-        .is_some_and(|u| u.eq_ignore_ascii_case(&channel)))
 }
 
 #[cfg(test)]

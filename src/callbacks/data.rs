@@ -166,9 +166,24 @@ impl CallbackOp {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CallbackArgs<'a> {
+    pub id: Option<&'a str>,
+    pub value: Option<&'a str>,
+    pub page: usize,
+    pub ch_page: usize,
+    pub chlist_page: usize,
+}
+
+impl CallbackArgs<'_> {
+    pub(super) fn sub_id(&self) -> Option<i64> {
+        self.id?.parse().ok()
+    }
+}
+
 pub(super) struct CallbackData<'a> {
     pub op: CallbackOp,
-    pub args: Vec<&'a str>,
+    pub args: CallbackArgs<'a>,
 }
 
 impl<'a> CallbackData<'a> {
@@ -181,11 +196,99 @@ impl<'a> CallbackData<'a> {
             return None;
         }
         let op = CallbackOp::parse(parts.next()?)?;
-        let args: Vec<&str> = parts.collect();
-        if args.len() > 5 {
+        let raw_args: Vec<&str> = parts.collect();
+        if raw_args.len() > 5 {
             return None;
         }
-        Some(Self { op, args })
+        Some(Self {
+            op,
+            args: parse_args(op, &raw_args),
+        })
+    }
+}
+
+fn parse_args<'a>(op: CallbackOp, args: &[&'a str]) -> CallbackArgs<'a> {
+    let at = |i: usize| args.get(i).copied();
+    let page = |i: usize| at(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+    match op {
+        CallbackOp::Channel => CallbackArgs {
+            id: at(0),
+            ch_page: page(1),
+            chlist_page: page(2),
+            ..CallbackArgs::default()
+        },
+        CallbackOp::ChannelList => CallbackArgs {
+            page: page(0),
+            ..CallbackArgs::default()
+        },
+        CallbackOp::Language | CallbackOp::Cookies => CallbackArgs {
+            value: at(0),
+            ..CallbackArgs::default()
+        },
+        CallbackOp::Unsub => CallbackArgs {
+            id: at(0),
+            page: page(1),
+            ch_page: page(2),
+            chlist_page: page(3),
+            ..CallbackArgs::default()
+        },
+        CallbackOp::UnsubPage | CallbackOp::UnsubAllAsk => CallbackArgs {
+            id: at(0),
+            page: page(1),
+            ch_page: page(2),
+            chlist_page: page(3),
+            ..CallbackArgs::default()
+        },
+        CallbackOp::UnsubAll => CallbackArgs {
+            id: at(0),
+            ch_page: page(1),
+            page: page(2),
+            chlist_page: page(3),
+            ..CallbackArgs::default()
+        },
+        CallbackOp::ResumeAll => CallbackArgs {
+            id: at(0),
+            chlist_page: page(1),
+            ch_page: page(2),
+            ..CallbackArgs::default()
+        },
+        CallbackOp::Config
+        | CallbackOp::ConfigInterval
+        | CallbackOp::ConfigMode
+        | CallbackOp::ConfigSource
+        | CallbackOp::ConfigLinkPreview
+        | CallbackOp::ConfigCaption
+        | CallbackOp::Source
+        | CallbackOp::SourcePause
+        | CallbackOp::SourceResume
+        | CallbackOp::SourceRename
+        | CallbackOp::SourceIntervalPage
+        | CallbackOp::SourceModePage
+        | CallbackOp::SourceSourcePage
+        | CallbackOp::SourceCaption
+        | CallbackOp::SourceLinkPreview
+        | CallbackOp::SourceFilter
+        | CallbackOp::SourceFilterToggle
+        | CallbackOp::SourceFilterMode
+        | CallbackOp::SourceFilterKeywords => CallbackArgs {
+            id: at(0),
+            ch_page: page(1),
+            chlist_page: page(2),
+            ..CallbackArgs::default()
+        },
+        CallbackOp::ConfigIntervalValue
+        | CallbackOp::ConfigModeValue
+        | CallbackOp::ConfigSourceValue
+        | CallbackOp::SourceIntervalValue
+        | CallbackOp::SourceModeValue
+        | CallbackOp::SourceSourceValue => CallbackArgs {
+            id: at(0),
+            value: at(1),
+            ch_page: page(2),
+            chlist_page: page(3),
+            ..CallbackArgs::default()
+        },
+        CallbackOp::CancelOp | CallbackOp::Page => CallbackArgs::default(),
     }
 }
 
@@ -245,10 +348,32 @@ mod tests {
     }
 
     #[test]
-    fn arguments_are_collected_after_the_op() {
+    fn arguments_are_parsed_into_named_fields() {
         let parsed = CallbackData::parse("c|ch|-100123|2|1").expect("valid");
         assert_eq!(parsed.op, CallbackOp::Channel);
-        assert_eq!(parsed.args, vec!["-100123", "2", "1"]);
+        assert_eq!(parsed.args.id, Some("-100123"));
+        assert_eq!(parsed.args.ch_page, 2);
+        assert_eq!(parsed.args.chlist_page, 1);
+
+        let parsed = CallbackData::parse("c|srcfm|7|title_summary|3|4").expect("valid");
+        assert_eq!(parsed.op, CallbackOp::SourceModeValue);
+        assert_eq!(parsed.args.sub_id(), Some(7));
+        assert_eq!(parsed.args.value, Some("title_summary"));
+        assert_eq!(parsed.args.ch_page, 3);
+        assert_eq!(parsed.args.chlist_page, 4);
+    }
+
+    #[test]
+    fn reversed_unsub_all_pages_keep_their_names() {
+        let ask = CallbackData::parse("c|unsuballask|-100123|2|3|4").expect("valid");
+        assert_eq!(ask.args.page, 2);
+        assert_eq!(ask.args.ch_page, 3);
+        assert_eq!(ask.args.chlist_page, 4);
+
+        let all = CallbackData::parse("c|unsuball|-100123|3|2|4").expect("valid");
+        assert_eq!(all.args.ch_page, 3);
+        assert_eq!(all.args.page, 2);
+        assert_eq!(all.args.chlist_page, 4);
     }
 
     #[test]

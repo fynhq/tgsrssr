@@ -38,7 +38,7 @@ pub async fn upsert_chat(
     .execute(db)
     .await?;
     sqlx::query("DELETE FROM settings WHERE key LIKE ?")
-        .bind(format!("send_fail:{}:%", chat_id))
+        .bind(format!("{}{}:%", setting_key::SEND_FAIL_PREFIX, chat_id))
         .execute(db)
         .await?;
     Ok(())
@@ -49,13 +49,13 @@ pub(super) async fn cleanup_chat_settings_keys(
     chat_id: &str,
 ) -> anyhow::Result<()> {
     for prefix in [
-        "media_dl_fail",
-        "auto_disable_notified",
-        "stale_zero",
-        "send_fail",
+        setting_key::MEDIA_DL_FAIL_PREFIX,
+        setting_key::AUTO_DISABLE_NOTIFIED_PREFIX,
+        setting_key::STALE_ZERO_PREFIX,
+        setting_key::SEND_FAIL_PREFIX,
     ] {
         sqlx::query("DELETE FROM settings WHERE key LIKE ?")
-            .bind(format!("{prefix}:{chat_id}:%"))
+            .bind(format!("{}{}:%", prefix, chat_id))
             .execute(&mut *conn)
             .await?;
     }
@@ -64,32 +64,23 @@ pub(super) async fn cleanup_chat_settings_keys(
 
 pub(super) async fn cleanup_feed_settings_keys(
     conn: &mut sqlx::SqliteConnection,
-    sub_id: i64,
+    chat_id: &str,
+    feed_url: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query(
-        "DELETE FROM settings WHERE instr(key, (SELECT 'media_dl_fail:' || chat_id || ':' || length(feed_url) || ':' || feed_url || ':' FROM subscriptions WHERE id = ?)) = 1",
-    )
-    .bind(sub_id)
-    .execute(&mut *conn)
-    .await?;
-    sqlx::query(
-        "DELETE FROM settings WHERE key = (SELECT 'auto_disable_notified:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
-    )
-    .bind(sub_id)
-    .execute(&mut *conn)
-    .await?;
-    sqlx::query(
-        "DELETE FROM settings WHERE key = (SELECT 'stale_zero:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
-    )
-    .bind(sub_id)
-    .execute(&mut *conn)
-    .await?;
-    sqlx::query(
-        "DELETE FROM settings WHERE key = (SELECT 'send_fail:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ?)",
-    )
-    .bind(sub_id)
-    .execute(&mut *conn)
-    .await?;
+    for key in [
+        setting_key::auto_disable_notified(chat_id, feed_url),
+        setting_key::stale_zero(chat_id, feed_url),
+        setting_key::send_fail(chat_id, feed_url),
+    ] {
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
+    }
+    sqlx::query("DELETE FROM settings WHERE instr(key, ?) = 1")
+        .bind(setting_key::media_dl_fail_prefix(chat_id, feed_url))
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 
@@ -164,7 +155,12 @@ pub async fn migrate_chat_id(db: &Db, old_chat_id: &str, new_chat_id: &str) -> a
             .await?;
     }
 
-    for prefix in ["auto_disable_notified:", "stale_zero:", "media_dl_fail:"] {
+    for prefix in [
+        setting_key::AUTO_DISABLE_NOTIFIED_PREFIX,
+        setting_key::STALE_ZERO_PREFIX,
+        setting_key::MEDIA_DL_FAIL_PREFIX,
+        setting_key::SEND_FAIL_PREFIX,
+    ] {
         let old_prefix = format!("{}{}:", prefix, old_chat_id);
         let new_prefix = format!("{}{}:", prefix, new_chat_id);
         sqlx::query(

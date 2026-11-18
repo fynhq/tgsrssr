@@ -84,13 +84,12 @@ pub async fn fetch_by_url(
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let screen_name = parse_screen_name(&url)
         .ok_or_else(|| anyhow::anyhow!("Invalid X user profile URL: {}", url))?;
-    fetch_x_user(state, &screen_name, opts.known_sent, opts.lang).await
+    fetch_x_user(state, &screen_name, opts.lang).await
 }
 
 pub async fn fetch_x_user(
     state: &AppState,
     screen_name: &str,
-    known_sent: Option<&std::collections::HashSet<String>>,
     lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let auth_token = match state.get_cookie("x").await {
@@ -102,8 +101,7 @@ pub async fn fetch_x_user(
 
     let mut ct0 = obtain_ct0_cached(state, &auth_token).await?;
 
-    let result =
-        fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent, lang).await;
+    let result = fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, lang).await;
     let result = match result {
         Err(e) if e.downcast_ref::<StaleCt0Error>().is_some() => {
             tracing::info!(
@@ -122,7 +120,7 @@ pub async fn fetch_x_user(
                     },
                 );
             }
-            fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, known_sent, lang).await
+            fetch_x_user_with_ct0(state, &auth_token, &ct0, screen_name, lang).await
         }
         other => other,
     };
@@ -140,7 +138,6 @@ async fn fetch_x_user_with_ct0(
     auth_token: &str,
     ct0: &str,
     screen_name: &str,
-    _known_sent: Option<&std::collections::HashSet<String>>,
     lang: Lang,
 ) -> anyhow::Result<crate::fetcher::FetchResult> {
     let (rest_id, display_name) = resolve_user(state, auth_token, ct0, screen_name).await?;

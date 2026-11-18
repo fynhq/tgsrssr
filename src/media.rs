@@ -435,7 +435,9 @@ async fn upgrade_weibo_video_hd(state: &AppState, owner_mid: Option<&str>, url: 
                 .header("Referer", "https://m.weibo.cn/")
                 .header("User-Agent", crate::state::MOBILE_BROWSER_UA)
                 .header("Accept", "application/json, text/plain, */*");
-            if !user_cookies.is_empty() && (hop == 0 || same_origin(cur_url, &api)) {
+            if !user_cookies.is_empty()
+                && (hop == 0 || crate::httpfollow::same_origin(cur_url, &api))
+            {
                 req = req.header("Cookie", user_cookies.as_str());
             }
             req
@@ -449,30 +451,12 @@ async fn upgrade_weibo_video_hd(state: &AppState, owner_mid: Option<&str>, url: 
         return url.to_string();
     };
 
-    let urls = json
-        .pointer("/data/page_info/urls")
-        .and_then(|v| v.as_object());
-    let Some(urls) = urls else {
+    let Some(urls) = json.pointer("/data/page_info/urls") else {
         return url.to_string();
     };
-    for key in [
-        "ultra",
-        "hd",
-        "high",
-        "medium",
-        "mp4_4k_mp4",
-        "mp4_1080p_mp4",
-        "mp4_720p_mp4",
-        "hevc_mp4_hd",
-        "mp4_hd_mp4",
-        "mp4_ld_mp4",
-    ] {
-        if let Some(v) = urls.get(key).and_then(|v| v.as_str()) {
-            if !v.is_empty() {
-                debug!(mid = %mid, key = key, "weibo HD video resolved (mobile api)");
-                return v.to_string();
-            }
-        }
+    if let Some(v) = crate::platforms::weibo::best_video_url(urls) {
+        debug!(mid = %mid, url = %v, "weibo HD video resolved (mobile api)");
+        return v;
     }
     url.to_string()
 }
@@ -813,17 +797,6 @@ fn urlencoding(s: &str) -> String {
     out
 }
 
-fn same_origin(a: &str, b: &str) -> bool {
-    let key = |s: &str| {
-        let u = url::Url::parse(s).ok()?;
-        Some((
-            u.host_str()?.to_ascii_lowercase(),
-            u.port_or_known_default(),
-        ))
-    };
-    matches!((key(a), key(b)), (Some(a), Some(b)) if a == b)
-}
-
 async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -> Option<String> {
     let api = format!("https://weibo.com/ajax/statuses/show?id={}", mid);
     let resp = crate::httpfollow::get_follow_redirects(
@@ -839,7 +812,7 @@ async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -
                 .header("Referer", "https://weibo.com/")
                 .header("Accept", "application/json, text/plain, */*")
                 .header("X-Requested-With", "XMLHttpRequest");
-            if !cookies.is_empty() && (hop == 0 || same_origin(cur_url, &api)) {
+            if !cookies.is_empty() && (hop == 0 || crate::httpfollow::same_origin(cur_url, &api)) {
                 req = req.header("Cookie", cookies);
             }
             req
@@ -1417,12 +1390,7 @@ pub async fn prepare_entry_media(
             item.duration_secs = dur;
         } else if item.kind == MediaKind::Image
             && !item.is_gif
-            && (image_goes_to_doc(
-                item.size,
-                item.width,
-                item.height,
-                crate::config::LONG_IMAGE_ASPECT_RATIO,
-            ) || !photo_format_compatible(&item.path))
+            && image_sends_as_document(item, crate::config::LONG_IMAGE_ASPECT_RATIO)
         {
             if !thumb_pixels_allowed(item.width, item.height) {
                 warn!(
@@ -1702,6 +1670,13 @@ pub fn image_goes_to_doc(size: u64, width: u32, height: u32, aspect_threshold: f
         }
     }
     false
+}
+
+// Single source for the document decision; gif-specific routing stays in the callers.
+pub fn image_sends_as_document(item: &MediaItem, aspect_threshold: f64) -> bool {
+    item.kind == MediaKind::Image
+        && ((!item.is_gif && !photo_format_compatible(&item.path))
+            || image_goes_to_doc(item.size, item.width, item.height, aspect_threshold))
 }
 
 async fn run_tool_with_stdin_timeout(

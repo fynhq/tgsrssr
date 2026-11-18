@@ -63,6 +63,18 @@ impl PendingOp {
             PendingOp::SetFilterKeywords { created_at, .. } => *created_at,
         }
     }
+
+    pub fn panel_msg_id(&self) -> i32 {
+        match self {
+            PendingOp::RenameSub { panel_msg_id, .. } => *panel_msg_id,
+            PendingOp::SetCookie { panel_msg_id, .. } => *panel_msg_id,
+            PendingOp::SetFilterKeywords { panel_msg_id, .. } => *panel_msg_id,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.created_at().elapsed() > PENDING_OP_TIMEOUT
+    }
 }
 
 pub const PENDING_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);

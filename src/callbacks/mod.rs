@@ -50,7 +50,7 @@ pub(super) struct CallbackCtx<'a> {
     pub state: &'a AppState,
     pub lang: Lang,
     pub qid: teloxide::types::CallbackQueryId,
-    pub parts: &'a [&'a str],
+    pub args: data::CallbackArgs<'a>,
     pub op: data::CallbackOp,
     pub guard_chat_id: Option<&'a str>,
 }
@@ -81,12 +81,6 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
 
     let lang = resolve_lang(&state, user_id, q.from.language_code.as_deref()).await;
 
-    let parts: Vec<&str> = data.split('|').collect();
-    if parts.is_empty() || parts[0] != "c" {
-        bot.answer_callback_query(qid).await.ok();
-        return Ok(());
-    }
-
     // Callback data is client-controlled and forgeable; ownership must be verified (no admin bypass) before any management op.
     let cb = match data::CallbackData::parse(&data) {
         Some(cb) => cb,
@@ -97,15 +91,22 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
         }
     };
     let guard_chat_id: Option<String> = match cb.op.guard_target() {
-        GuardTarget::Chat => cb.args.first().map(|s| s.to_string()),
-        GuardTarget::Sub => match cb.args.first().and_then(|s| s.parse::<i64>().ok()) {
+        GuardTarget::Chat => match cb.args.id {
+            Some(id) => Some(id.to_string()),
+            None => {
+                tracing::warn!(op = %cb.op.as_str(), "callback missing its chat id (fail-closed)");
+                bot.answer_callback_query(qid).await.ok();
+                return Ok(());
+            }
+        },
+        GuardTarget::Sub => match cb.args.sub_id() {
             Some(sub_id) => match db::get_subscription_by_id(&state.db, sub_id).await {
                 Ok(Some(s)) => Some(s.chat_id),
                 Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(
                         user_id = user_id,
-                        op = %parts.get(1).copied().unwrap_or("?"),
+                        op = %cb.op.as_str(),
                         error = %e,
                         "ownership guard: subscription lookup failed, rejecting (fail-closed)"
                     );
@@ -116,7 +117,11 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
                     return Ok(());
                 }
             },
-            None => None,
+            None => {
+                tracing::warn!(op = %cb.op.as_str(), "callback missing its subscription id (fail-closed)");
+                bot.answer_callback_query(qid).await.ok();
+                return Ok(());
+            }
         },
         GuardTarget::None => None,
     };
@@ -126,7 +131,7 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
             Err(e) => {
                 tracing::warn!(
                     user_id = user_id,
-                    op = %parts.get(1).copied().unwrap_or("?"),
+                    op = %cb.op.as_str(),
                     target_chat = %gcid,
                     error = %e,
                     "ownership guard: permission lookup failed, rejecting (fail-closed)"
@@ -141,7 +146,7 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
         if !allowed {
             tracing::warn!(
                 user_id = user_id,
-                op = %parts.get(1).copied().unwrap_or("?"),
+                op = %cb.op.as_str(),
                 target_chat = %gcid,
                 "ownership guard rejected callback"
             );
@@ -159,27 +164,24 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
         state: &state,
         lang,
         qid: qid.clone(),
-        parts: &parts,
+        args: cb.args,
         op: cb.op,
         guard_chat_id: guard_chat_id.as_deref(),
     };
     let res: ResponseResult<()> = async {
-        match parts.get(1).copied() {
-        Some(_) if dispatch::is_config_op(cb.op) => dispatch::config(&ctx).await?,
-        Some(_) if dispatch::is_source_op(cb.op) => dispatch::source(&ctx).await?,
-        Some("ch") => {
-            if let Some(target) = parts.get(2) {
-                let page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                let chlist_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                render_channel_page(&bot, PageTarget::Edit(&q), target, &state, page, chlist_page, lang).await?;
+        match cb.op {
+        op if dispatch::is_config_op(op) => dispatch::config(&ctx).await?,
+        op if dispatch::is_source_op(op) => dispatch::source(&ctx).await?,
+        data::CallbackOp::Channel => {
+            if let Some(target) = cb.args.id {
+                render_channel_page(&bot, PageTarget::Edit(&q), target, &state, cb.args.ch_page, cb.args.chlist_page, lang).await?;
             }
         }
-        Some("chlist") => {
-            let page = parts.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-            render_channel_list(&bot, PageTarget::Edit(&q), &state, user_id, page, lang).await?;
+        data::CallbackOp::ChannelList => {
+            render_channel_list(&bot, PageTarget::Edit(&q), &state, user_id, cb.args.page, lang).await?;
         }
-        Some("lang") => {
-            let Some(code) = parts.get(2).copied() else {
+        data::CallbackOp::Language => {
+            let Some(code) = cb.args.value else {
                 render_language_picker(&bot, PageTarget::Edit(&q), lang).await?;
                 return Ok(());
             };
@@ -200,44 +202,41 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
             bot.answer_callback_query(q.id.clone()).text(toast).await.ok();
             render_channel_list(&bot, PageTarget::Edit(&q), &state, user_id, 0, next).await?;
         }
-        Some("unsub") => {
-            if let Some(sub_id_str) = parts.get(2) {
-                if let Ok(sub_id) = sub_id_str.parse::<i64>() {
-                    let page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                    let ch_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                    let chlist_page = parts.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                    unsub::handle_unsub_callback(&bot, &q, &state, sub_id, page, ch_page, chlist_page, lang).await?;
-                }
+        data::CallbackOp::Unsub => {
+            if let Some(sub_id) = cb.args.sub_id() {
+                unsub::handle_unsub_callback(&bot, &q, &state, sub_id, cb.args.page, cb.args.ch_page, cb.args.chlist_page, lang).await?;
             }
         }
-        Some("unsubpg") => {
-            if let Some(cid) = parts.get(2) {
-                let page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                let ch_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                let chlist_page = parts.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                unsub::render_unsub_panel(&bot, PageTarget::Edit(&q), cid, &state, page, ch_page, chlist_page, lang).await?;
+        data::CallbackOp::UnsubPage => {
+            if let Some(cid) = cb.args.id {
+                unsub::render_unsub_panel(&bot, PageTarget::Edit(&q), cid, &state, cb.args.page, cb.args.ch_page, cb.args.chlist_page, lang).await?;
             }
         }
-        Some("unsuballask") => {
-            if let Some(cid) = parts.get(2) {
-                let page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                let ch_page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                let chlist_page = parts.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                unsub::render_unsub_all_confirm(&bot, PageTarget::Edit(&q), cid, &state, page, ch_page, chlist_page, lang).await?;
+        data::CallbackOp::UnsubAllAsk => {
+            if let Some(cid) = cb.args.id {
+                unsub::render_unsub_all_confirm(&bot, PageTarget::Edit(&q), cid, &state, cb.args.page, cb.args.ch_page, cb.args.chlist_page, lang).await?;
             }
         }
-        Some("unsuball") => {
-            if let Some(cid) = parts.get(2) {
-                let ch_page = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                let page = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                let chlist_page = parts.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                unsub::handle_unsub_all_callback(&bot, &q, &state, cid, ch_page, page, chlist_page, lang).await?;
+        data::CallbackOp::UnsubAll => {
+            if let Some(cid) = cb.args.id {
+                unsub::handle_unsub_all_callback(&bot, &q, &state, cid, cb.args.ch_page, cb.args.page, cb.args.chlist_page, lang).await?;
             }
         }
-        Some("cancelop") => {
+        data::CallbackOp::CancelOp => {
             if let Some(m) = q.message.as_ref() {
                 let key = (m.chat().id.0, q.from.id.0 as i64);
-                let removed_op = state.pending_ops.lock().await.remove(&key);
+                let msg_id = m.id().0;
+                let removed_op = {
+                    let mut ops = state.pending_ops.lock().await;
+                    let owns_op = ops.get(&key).is_some_and(|op| {
+                        op.prompt_msg_id() == msg_id || op.panel_msg_id() == msg_id
+                    });
+                    if owns_op {
+                        ops.remove(&key)
+                    } else {
+                        None
+                    }
+                };
                 bot.answer_callback_query(qid.clone()).await.ok();
                 if let Some(op) = removed_op {
                     crate::push::retire_prompt(&bot, m.chat().id, op.prompt_msg_id(), i18n::t(lang, "cancelled")).await;
@@ -256,10 +255,10 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
                 bot.answer_callback_query(qid.clone()).await.ok();
             }
         }
-        Some("ck") => {
+        data::CallbackOp::Cookies => {
             if !state.config.is_admin(user_id) {
                 bot.answer_callback_query(qid.clone()).await.ok();
-            } else if let Some(pid) = parts.get(2) {
+            } else if let Some(pid) = cb.args.value {
                 if let Some(p) = crate::platforms::find_platform(pid) {
                     if !p.needs_cookie {
                         bot.answer_callback_query(qid.clone())
@@ -306,7 +305,7 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
     bot.answer_callback_query(qid).await.ok();
 
     if let Err(e) = &res {
-        tracing::warn!(user_id = user_id, op = %parts.get(1).copied().unwrap_or("?"), error = %e, "callback dispatch failed (spinner cleared)");
+        tracing::warn!(user_id = user_id, op = %cb.op.as_str(), error = %e, "callback dispatch failed (spinner cleared)");
     }
     res
 }

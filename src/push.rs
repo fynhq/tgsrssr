@@ -563,7 +563,6 @@ pub struct PushCtx<'a> {
     pub author: Option<&'a str>,
     pub opts: RenderOpts,
     pub caption_above_media: bool,
-    pub aspect_threshold: f64,
     pub media: &'a [MediaItem],
     pub meta: Option<&'a crate::entrymeta::EntryMeta>,
 }
@@ -589,18 +588,16 @@ struct MediaPlan<'a> {
     rt_photos: Vec<&'a MediaItem>,
 }
 
-fn classify_media<'a>(media: &'a [MediaItem], aspect_threshold: f64) -> MediaPlan<'a> {
+fn classify_media<'a>(media: &'a [MediaItem]) -> MediaPlan<'a> {
     let mut photos: Vec<&MediaItem> = Vec::new();
     let mut gifs: Vec<&MediaItem> = Vec::new();
     let mut docs: Vec<&MediaItem> = Vec::new();
     let mut videos: Vec<&MediaItem> = Vec::new();
     let mut rt_photos: Vec<&MediaItem> = Vec::new();
+    let aspect_threshold = crate::config::LONG_IMAGE_ASPECT_RATIO;
     for m in media {
         if m.is_retweet && m.kind == MediaKind::Image {
-            let format_doc = !m.is_gif && !crate::media::photo_format_compatible(&m.path);
-            if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold)
-                || format_doc
-            {
+            if crate::media::image_sends_as_document(m, aspect_threshold) {
                 docs.push(m);
             } else if m.is_gif {
                 gifs.push(m);
@@ -611,17 +608,13 @@ fn classify_media<'a>(media: &'a [MediaItem], aspect_threshold: f64) -> MediaPla
         }
         match m.kind {
             MediaKind::Image => {
-                let format_doc = !m.is_gif && !crate::media::photo_format_compatible(&m.path);
-                if crate::media::image_goes_to_doc(m.size, m.width, m.height, aspect_threshold)
-                    || format_doc
-                {
+                if crate::media::image_sends_as_document(m, aspect_threshold) {
                     docs.push(m);
                     tracing::debug!(
                         size = m.size,
                         w = m.width,
                         h = m.height,
-                        format_doc = format_doc,
-                        "image -> document (oversized/long/w+h/format)"
+                        "image -> document"
                     );
                 } else if m.is_gif {
                     gifs.push(m);
@@ -662,6 +655,236 @@ fn plan_caption(full_caption: &str) -> CaptionPlan {
     }
 }
 
+struct TailDelivery {
+    anchor: Option<Message>,
+    first_doc: Option<Message>,
+    caption_delivered: bool,
+    media_failed: bool,
+}
+
+impl TailDelivery {
+    fn new(anchor: Option<Message>, caption_delivered: bool, media_failed: bool) -> Self {
+        Self {
+            anchor,
+            first_doc: None,
+            caption_delivered,
+            media_failed,
+        }
+    }
+
+    fn has_carrier(&self) -> bool {
+        self.anchor.is_some() || self.first_doc.is_some()
+    }
+
+    fn reply_to(&self) -> Option<teloxide::types::MessageId> {
+        self.anchor
+            .as_ref()
+            .or(self.first_doc.as_ref())
+            .map(|m| m.id)
+    }
+
+    async fn send_documents(
+        &mut self,
+        bot: &Bot,
+        db: &Db,
+        chat_id: i64,
+        docs: &[&MediaItem],
+        caption: &str,
+        group: bool,
+    ) {
+        if docs.is_empty() {
+            return;
+        }
+        let reply_to = self.reply_to();
+        let cap = if self.has_carrier() { "" } else { caption };
+
+        if group {
+            match send_doc_group(bot, db, chat_id, docs, cap, reply_to).await {
+                Ok(msgs) => {
+                    self.first_doc = msgs.into_iter().next();
+                }
+                Err((delivered, e)) => {
+                    tracing::warn!(
+                        chat_id = chat_id,
+                        error = %e,
+                        delivered = delivered.len(),
+                        total_docs = docs.len(),
+                        "doc group send failed, falling back to one-by-one"
+                    );
+                    let mut chain_id = reply_to;
+                    if let Some(first) = delivered.first() {
+                        self.first_doc = Some(first.clone());
+                        if self.anchor.is_none() && chain_id.is_none() {
+                            chain_id = Some(first.id);
+                        }
+                    }
+                    for (i, d) in docs.iter().enumerate().skip(delivered.len()) {
+                        let cap = if i == 0 && self.anchor.is_none() {
+                            cap
+                        } else {
+                            ""
+                        };
+                        match send_doc_msg(bot, db, chat_id, d, cap, chain_id).await {
+                            Ok(m) => {
+                                if self.first_doc.is_none() {
+                                    self.first_doc = Some(m.clone());
+                                }
+                                if self.anchor.is_none() && chain_id.is_none() {
+                                    chain_id = Some(m.id);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(chat_id = chat_id, error = %e, "document send failed");
+                                self.media_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        let mut reply_to = reply_to;
+        let mut cap = cap;
+        for d in docs {
+            match send_doc_msg(bot, db, chat_id, d, cap, reply_to).await {
+                Ok(m) => {
+                    if self.first_doc.is_none() {
+                        self.first_doc = Some(m.clone());
+                    }
+                    if reply_to.is_none() {
+                        reply_to = Some(m.id);
+                    }
+                    cap = "";
+                }
+                Err(e) => {
+                    tracing::warn!(chat_id = chat_id, error = %e, "document send failed");
+                    self.media_failed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn send_retweet_images(
+        &mut self,
+        bot: &Bot,
+        db: &Db,
+        chat_id: i64,
+        rt_photos: &[&MediaItem],
+        caption: &str,
+        caption_above: bool,
+    ) {
+        if rt_photos.is_empty() {
+            return;
+        }
+        let rt_is_sole_carrier = !self.has_carrier();
+        let rt_caption = if rt_is_sole_carrier { caption } else { "" };
+        let rt_reply_to = self.reply_to();
+        let rt_ops = build_rich_ops(rt_photos, &[], &[]);
+        match send_rich_ops_with_retry(
+            bot,
+            db,
+            chat_id,
+            rt_caption,
+            caption_above,
+            &rt_ops,
+            rt_reply_to,
+            "rt_images",
+        )
+        .await
+        {
+            Ok((_, first_rt_msg)) => {
+                if rt_is_sole_carrier {
+                    if let Some(m) = first_rt_msg {
+                        self.anchor = Some(m);
+                    }
+                }
+            }
+            Err((sent, delivered, e)) => {
+                tracing::warn!(
+                    chat_id = chat_id,
+                    failed_op = sent,
+                    total_ops = rt_ops.len(),
+                    error = %e,
+                    "retweet inline images send failed"
+                );
+                self.media_failed = true;
+                if rt_is_sole_carrier && sent > 0 {
+                    self.caption_delivered = true;
+                    if self.anchor.is_none() {
+                        self.anchor = delivered.map(|m| *m);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_overflow(
+        &mut self,
+        bot: &Bot,
+        chat_id: i64,
+        chunks: &[String],
+    ) -> anyhow::Result<()> {
+        let reply_to = self.reply_to();
+        for chunk in chunks {
+            if let Err(e) = send_chunk_with_retry(bot, chat_id, chunk, false, reply_to).await {
+                if self.caption_delivered || self.has_carrier() {
+                    tracing::warn!(
+                        chat_id = chat_id,
+                        error = %e,
+                        "overflow text failed after delivery, not retrying"
+                    );
+                    self.media_failed = true;
+                    break;
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_poll(
+        &mut self,
+        bot: &Bot,
+        chat_id: i64,
+        meta: Option<&crate::entrymeta::EntryMeta>,
+    ) {
+        if try_send_poll(bot, chat_id, self.reply_to(), meta).await {
+            self.media_failed = true;
+        }
+    }
+
+    fn into_outcome(
+        self,
+        entry: &Entry,
+        text_only: bool,
+        text_partial: bool,
+        uncertain: bool,
+    ) -> SendOutcome {
+        let delivered_tg_link = self
+            .anchor
+            .as_ref()
+            .and_then(tg_message_link)
+            .or_else(|| self.first_doc.as_ref().and_then(tg_message_link));
+        let delivered_message_id = self
+            .anchor
+            .as_ref()
+            .or(self.first_doc.as_ref())
+            .map(|m| m.id.0 as i64);
+        SendOutcome {
+            media_failed: self.media_failed,
+            entry_link: fetcher::entry_link(entry),
+            delivered_tg_link,
+            delivered_message_id,
+            text_only,
+            uncertain,
+            text_partial,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fallback_after_main_media_failure(
     bot: &Bot,
@@ -679,31 +902,17 @@ async fn fallback_after_main_media_failure(
     delivered: Option<&Message>,
     error: &anyhow::Error,
 ) -> anyhow::Result<SendOutcome> {
-    let mut delivered_tg_link = delivered.and_then(tg_message_link);
-    let mut fallback_msg_id: Option<teloxide::types::MessageId> = delivered.map(|m| m.id);
-    let mut text_delivered = false;
+    let mut tail = TailDelivery::new(delivered.cloned(), sent > 0, true);
+    let text_only = sent == 0;
+    let mut text_delivered = sent > 0;
     let mut text_partial = false;
     if sent > 0 {
-        text_delivered = true;
-        for chunk in overflow_chunks {
-            if let Err(te) =
-                send_chunk_with_retry(bot, chat_id, chunk, false, fallback_msg_id).await
-            {
-                tracing::warn!(
-                    chat_id = chat_id,
-                    entry_id = %fetcher::entry_id(entry),
-                    error = %te,
-                    "overflow text failed after partial media delivery"
-                );
-                break;
-            }
-        }
+        tail.send_overflow(bot, chat_id, overflow_chunks).await?;
     } else if let Some((body, footer)) = format_entry_parts(entry, feed_title, author, opts, meta) {
         match send_entry_msg(bot, chat_id, &body, &footer, opts.link_preview).await {
             Ok(sent) => {
-                let m = sent.first;
-                delivered_tg_link = tg_message_link(&m);
-                fallback_msg_id = Some(m.id);
+                tail.anchor = Some(sent.first);
+                tail.caption_delivered = true;
                 text_delivered = true;
                 text_partial = sent.partial;
             }
@@ -728,51 +937,11 @@ async fn fallback_after_main_media_failure(
             error
         ));
     }
-    for (di, d) in docs.iter().enumerate() {
-        if let Err(de) = send_doc_msg(bot, db, chat_id, d, "", fallback_msg_id).await {
-            tracing::warn!(
-                chat_id = chat_id,
-                entry_id = %fetcher::entry_id(entry),
-                failed_doc = di,
-                skipped_docs = docs.len() - di - 1,
-                error = %de,
-                "document send failed after text fallback"
-            );
-            break;
-        }
-    }
-    if !rt_photos.is_empty() {
-        let rt_ops = build_rich_ops(rt_photos, &[], &[]);
-        if let Err((_, _, re)) = send_rich_ops_with_retry(
-            bot,
-            db,
-            chat_id,
-            "",
-            false,
-            &rt_ops,
-            fallback_msg_id,
-            "rt_images_text_fallback",
-        )
-        .await
-        {
-            tracing::warn!(
-                chat_id = chat_id,
-                entry_id = %fetcher::entry_id(entry),
-                error = %re,
-                "retweet images send failed after text fallback"
-            );
-        }
-    }
-    try_send_poll(bot, chat_id, fallback_msg_id, meta).await;
-    Ok(SendOutcome {
-        media_failed: true,
-        entry_link: fetcher::entry_link(entry),
-        delivered_tg_link,
-        delivered_message_id: fallback_msg_id.map(|m| m.0 as i64),
-        text_only: sent == 0,
-        uncertain: false,
-        text_partial,
-    })
+    tail.send_documents(bot, db, chat_id, docs, "", false).await;
+    tail.send_retweet_images(bot, db, chat_id, rt_photos, "", false)
+        .await;
+    tail.send_poll(bot, chat_id, meta).await;
+    Ok(tail.into_outcome(entry, text_only, text_partial, false))
 }
 
 pub async fn send_entry_with_media(
@@ -788,7 +957,6 @@ pub async fn send_entry_with_media(
         author,
         opts,
         caption_above_media,
-        aspect_threshold,
         media,
         meta,
     } = ctx;
@@ -819,12 +987,10 @@ pub async fn send_entry_with_media(
         docs,
         videos,
         rt_photos,
-    } = classify_media(media, aspect_threshold);
+    } = classify_media(media);
 
     let rich_ops = build_rich_ops(&photos, &gifs, &videos);
-    let mut anchor: Option<Message> = None;
-    let mut caption_delivered = false;
-    let mut media_failed = false;
+    let mut tail = TailDelivery::new(None, false, false);
     let mut rich_delivered = false;
 
     let album_media: Vec<&MediaItem> = videos
@@ -867,8 +1033,8 @@ pub async fn send_entry_with_media(
         .await
         {
             Ok(m) => {
-                anchor = Some(m);
-                caption_delivered = true;
+                tail.anchor = Some(m);
+                tail.caption_delivered = true;
                 rich_delivered = true;
                 tracing::info!(
                     chat_id = chat_id,
@@ -916,7 +1082,7 @@ pub async fn send_entry_with_media(
 
     if rich_delivered && !gifs.is_empty() {
         let gif_ops = build_rich_ops(&[], &gifs, &[]);
-        let reply_to = anchor.as_ref().map(|m| m.id);
+        let reply_to = tail.reply_to();
         if let Err((_, _, e)) =
             send_rich_ops_with_retry(bot, db, chat_id, "", false, &gif_ops, reply_to, "rich_gifs")
                 .await
@@ -927,7 +1093,7 @@ pub async fn send_entry_with_media(
                 error = %e,
                 "gif follow-up after rich message failed"
             );
-            media_failed = true;
+            tail.media_failed = true;
         }
     }
 
@@ -945,8 +1111,8 @@ pub async fn send_entry_with_media(
         .await;
         match rich {
             Ok((_, first_msg)) => {
-                anchor = first_msg;
-                caption_delivered = true;
+                tail.anchor = first_msg;
+                tail.caption_delivered = true;
             }
             Err((sent, delivered, e)) => {
                 tracing::warn!(
@@ -978,153 +1144,26 @@ pub async fn send_entry_with_media(
         }
     }
 
-    let mut first_doc_msg: Option<Message> = None;
     let docs_to_send: &[&MediaItem] = if rich_delivered { &follow_docs } else { &docs };
-    if !docs_to_send.is_empty() {
-        let reply_to = anchor.as_ref().map(|m| m.id);
-        let cap = if anchor.is_none() {
-            caption.as_str()
-        } else {
-            ""
-        };
-        match send_doc_group(bot, db, chat_id, docs_to_send, cap, reply_to).await {
-            Ok(msgs) => {
-                first_doc_msg = msgs.into_iter().next();
-            }
-            Err((delivered, e)) => {
-                tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %e, delivered = delivered.len(), total_docs = docs_to_send.len(), "doc group send failed, falling back to one-by-one");
-                let mut chain_id: Option<teloxide::types::MessageId> = reply_to;
-                if let Some(first) = delivered.first() {
-                    first_doc_msg = Some(first.clone());
-                    if anchor.is_none() && chain_id.is_none() {
-                        chain_id = Some(first.id);
-                    }
-                }
-                for (i, d) in docs_to_send.iter().enumerate().skip(delivered.len()) {
-                    let cap = if i == 0 && anchor.is_none() {
-                        caption.as_str()
-                    } else {
-                        ""
-                    };
-                    match send_doc_msg(bot, db, chat_id, d, cap, chain_id).await {
-                        Ok(m) => {
-                            if first_doc_msg.is_none() {
-                                first_doc_msg = Some(m.clone());
-                            }
-                            if anchor.is_none() && chain_id.is_none() {
-                                chain_id = Some(m.id);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %e, "document send failed");
-                            media_failed = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if !rt_photos.is_empty() {
-        let rt_is_sole_carrier = anchor.is_none() && first_doc_msg.is_none();
-        let rt_caption = if rt_is_sole_carrier {
-            caption.as_str()
-        } else {
-            ""
-        };
-        let rt_reply_to = anchor.as_ref().or(first_doc_msg.as_ref()).map(|m| m.id);
-        let rt_ops = build_rich_ops(&rt_photos, &[], &[]);
-        let rt_res = send_rich_ops_with_retry(
-            bot,
-            db,
-            chat_id,
-            rt_caption,
-            caption_above,
-            &rt_ops,
-            rt_reply_to,
-            "rt_images",
-        )
+    tail.send_documents(bot, db, chat_id, docs_to_send, &caption, true)
         .await;
-        match rt_res {
-            Ok((_, first_rt_msg)) => {
-                if rt_is_sole_carrier {
-                    if let Some(m) = first_rt_msg {
-                        anchor = Some(m);
-                    }
-                }
-            }
-            Err((sent, delivered, e)) => {
-                tracing::warn!(
-                    chat_id = chat_id,
-                    entry_id = %fetcher::entry_id(entry),
-                    failed_op = sent,
-                    total_ops = rt_ops.len(),
-                    error = %e,
-                    "retweet inline images send failed"
-                );
-                media_failed = true;
-                if rt_is_sole_carrier && sent > 0 {
-                    caption_delivered = true;
-                    if anchor.is_none() {
-                        anchor = delivered.map(|m| *m);
-                    }
-                }
-            }
-        }
-    }
 
-    let overflow_reply_to: Option<teloxide::types::MessageId> =
-        anchor.as_ref().or(first_doc_msg.as_ref()).map(|m| m.id);
-    let already_delivered = caption_delivered || anchor.is_some() || first_doc_msg.is_some();
+    tail.send_retweet_images(bot, db, chat_id, &rt_photos, &caption, caption_above)
+        .await;
+
     if !rich_delivered {
-        for chunk in &overflow_chunks {
-            if let Err(e) =
-                send_chunk_with_retry(bot, chat_id, chunk, false, overflow_reply_to).await
-            {
-                if already_delivered {
-                    tracing::warn!(chat_id = chat_id, entry_id = %fetcher::entry_id(entry), error = %e, "overflow text failed after delivery, not retrying");
-                    media_failed = true;
-                    break;
-                }
-                return Err(e);
-            }
-        }
+        tail.send_overflow(bot, chat_id, &overflow_chunks).await?;
     }
 
-    if !caption_delivered
-        && anchor.is_none()
-        && first_doc_msg.is_none()
-        && (!docs.is_empty() || !rt_photos.is_empty())
+    if !tail.caption_delivered && !tail.has_carrier() && (!docs.is_empty() || !rt_photos.is_empty())
     {
         return Err(anyhow::anyhow!(
             "all caption carriers (documents/retweet images) failed to send; caption undelivered"
         ));
     }
 
-    let poll_reply_to = anchor.as_ref().or(first_doc_msg.as_ref()).map(|m| m.id);
-    if try_send_poll(bot, chat_id, poll_reply_to, meta).await {
-        media_failed = true;
-    }
-
-    let delivered_tg_link = anchor
-        .as_ref()
-        .and_then(tg_message_link)
-        .or_else(|| first_doc_msg.as_ref().and_then(tg_message_link));
-    let delivered_message_id = anchor
-        .as_ref()
-        .or(first_doc_msg.as_ref())
-        .map(|m| m.id.0 as i64);
-
-    Ok(SendOutcome {
-        media_failed,
-        entry_link: fetcher::entry_link(entry),
-        delivered_tg_link,
-        delivered_message_id,
-        text_only: false,
-        uncertain: false,
-        text_partial: false,
-    })
+    tail.send_poll(bot, chat_id, meta).await;
+    Ok(tail.into_outcome(entry, false, false, false))
 }
 
 enum RichOp<'a> {

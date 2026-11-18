@@ -66,6 +66,23 @@ pub fn parse_channel_name(url: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+pub async fn is_self_source(
+    state: &AppState,
+    chat_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<bool> {
+    let Some(channel) = parse_channel_name(feed_url) else {
+        return Ok(false);
+    };
+    let Some(chat) = crate::db::get_chat(&state.db, chat_id).await? else {
+        return Ok(false);
+    };
+    Ok(chat
+        .username
+        .as_deref()
+        .is_some_and(|u| u.eq_ignore_ascii_case(&channel)))
+}
+
 static RE_CHAN_TITLE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?is)tgme_channel_info_header_title[^>]*>.*?<span[^>]*>(.*?)</span>"#)
         .unwrap()

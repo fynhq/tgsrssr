@@ -148,19 +148,26 @@ pub async fn entry_dedup_state(
 
 pub async fn delete_subscription(db: &Db, sub_id: i64) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
-    sqlx::query(
-        "DELETE FROM outbox WHERE EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = ? AND s.chat_id = outbox.chat_id AND s.feed_url = outbox.feed_url)",
-    )
-    .bind(sub_id)
-    .execute(&mut *tx)
-    .await?;
-    cleanup_feed_settings_keys(&mut tx, sub_id).await?;
-    sqlx::query(
-        "DELETE FROM feed_configs WHERE EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = ? AND s.chat_id = feed_configs.chat_id AND s.feed_url = feed_configs.feed_url)",
-    )
-    .bind(sub_id)
-    .execute(&mut *tx)
-    .await?;
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT chat_id, feed_url FROM subscriptions WHERE id = ?")
+            .bind(sub_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((chat_id, feed_url)) = row else {
+        tx.commit().await?;
+        return Ok(());
+    };
+    sqlx::query("DELETE FROM outbox WHERE chat_id = ? AND feed_url = ?")
+        .bind(&chat_id)
+        .bind(&feed_url)
+        .execute(&mut *tx)
+        .await?;
+    cleanup_feed_settings_keys(&mut tx, &chat_id, &feed_url).await?;
+    sqlx::query("DELETE FROM feed_configs WHERE chat_id = ? AND feed_url = ?")
+        .bind(&chat_id)
+        .bind(&feed_url)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM subscriptions WHERE id = ?")
         .bind(sub_id)
         .execute(&mut *tx)
@@ -253,26 +260,18 @@ pub async fn get_effective_config(
     chat_id: &str,
     feed_url: &str,
 ) -> anyhow::Result<EffectiveConfig> {
-    let row = sqlx::query(
+    let sql = format!(
         r#"SELECT ?1 AS chat_id, ?2 AS feed_url,
-                  COALESCE(f.interval_minutes, c.interval_minutes, 30) AS interval_minutes,
-                  COALESCE(f.content_mode, c.content_mode, 'title_link') AS content_mode,
-                  COALESCE(f.source_display, c.source_display, 'source') AS source_display,
-                  COALESCE(f.caption_above_media, c.caption_above_media, 0) AS caption_above_media,
-                  COALESCE(f.link_preview, c.link_preview, 1) AS link_preview,
-                  f.interval_minutes IS NOT NULL AS iv_overridden,
-                  f.content_mode IS NOT NULL AS cm_overridden,
-                  f.source_display IS NOT NULL AS sd_overridden,
-                  f.caption_above_media IS NOT NULL AS cp_overridden,
-                  f.link_preview IS NOT NULL AS lp_overridden
+                  {EFFECTIVE_CONFIG_COLUMNS}
            FROM (SELECT 1) AS base
            LEFT JOIN chat_configs c ON c.chat_id = ?1
-           LEFT JOIN feed_configs f ON f.chat_id = ?1 AND f.feed_url = ?2"#,
-    )
-    .bind(chat_id)
-    .bind(feed_url)
-    .fetch_optional(db)
-    .await?;
+           LEFT JOIN feed_configs f ON f.chat_id = ?1 AND f.feed_url = ?2"#
+    );
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(chat_id)
+        .bind(feed_url)
+        .fetch_optional(db)
+        .await?;
     let Some(row) = row else {
         return Ok(EffectiveConfig {
             chat_id: chat_id.to_string(),
@@ -325,20 +324,23 @@ pub async fn set_subscription_active(
             tx.commit().await?;
             return Ok(false);
         }
-        sqlx::query(
-            "DELETE FROM settings WHERE key = (SELECT 'auto_disable_notified:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ? AND chat_id = ?)",
-        )
-        .bind(sub_id)
-        .bind(chat_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "DELETE FROM settings WHERE key = (SELECT 'send_fail:' || chat_id || ':' || feed_url FROM subscriptions WHERE id = ? AND chat_id = ?)",
-        )
-        .bind(sub_id)
-        .bind(chat_id)
-        .execute(&mut *tx)
-        .await?;
+        let feed_url: Option<String> =
+            sqlx::query_scalar("SELECT feed_url FROM subscriptions WHERE id = ? AND chat_id = ?")
+                .bind(sub_id)
+                .bind(chat_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(feed_url) = feed_url {
+            for key in [
+                setting_key::auto_disable_notified(chat_id, &feed_url),
+                setting_key::send_fail(chat_id, &feed_url),
+            ] {
+                sqlx::query("DELETE FROM settings WHERE key = ?")
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
     } else {
         let res = sqlx::query(
             "UPDATE subscriptions SET active = 0, auto_disabled = 0, disabled_at = NULL WHERE id = ? AND chat_id = ?",
@@ -371,12 +373,13 @@ pub async fn reenable_due_auto_disabled(db: &Db, cooldown_hours: i64) -> anyhow:
     let mut tx = db.begin().await?;
     sqlx::query(
         r#"DELETE FROM settings WHERE key IN (
-             SELECT 'send_fail:' || chat_id || ':' || feed_url FROM subscriptions
+             SELECT ? || chat_id || ':' || feed_url FROM subscriptions
              WHERE active = 0 AND auto_disabled = 1
                AND disabled_at IS NOT NULL
                AND (julianday('now') - julianday(disabled_at)) * 24 >= ?
            )"#,
     )
+    .bind(setting_key::SEND_FAIL_PREFIX)
     .bind(cooldown_hours)
     .execute(&mut *tx)
     .await?;
@@ -405,11 +408,15 @@ pub async fn resume_all_subscriptions(db: &Db, chat_id: &str) -> anyhow::Result<
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM settings WHERE key LIKE ?")
-        .bind(format!("auto_disable_notified:{}:%", chat_id))
+        .bind(format!(
+            "{}{}:%",
+            setting_key::AUTO_DISABLE_NOTIFIED_PREFIX,
+            chat_id
+        ))
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM settings WHERE key LIKE ?")
-        .bind(format!("send_fail:{}:%", chat_id))
+        .bind(format!("{}{}:%", setting_key::SEND_FAIL_PREFIX, chat_id))
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -443,6 +450,7 @@ pub async fn reset_error_count(db: &Db, sub_id: i64) -> anyhow::Result<()> {
 
 #[derive(Debug, sqlx::FromRow)]
 struct DueRow {
+    due_total: i64,
     #[sqlx(flatten)]
     sub: SubRow,
     #[sqlx(flatten)]
@@ -451,35 +459,14 @@ struct DueRow {
 
 pub const MAX_DUE_PER_CYCLE: i64 = 200;
 
-pub async fn count_due_subscriptions(db: &Db) -> anyhow::Result<i64> {
-    let (n,): (i64,) = sqlx::query_as(
-        r#"SELECT COUNT(*)
-           FROM subscriptions s
-           LEFT JOIN chat_configs c ON c.chat_id = s.chat_id
-           LEFT JOIN feed_configs f ON f.chat_id = s.chat_id AND f.feed_url = s.feed_url
-           JOIN chats ch ON ch.chat_id = s.chat_id AND ch.enabled = 1
-           WHERE s.active = 1
-             AND (s.last_fetch_at IS NULL OR (julianday('now') - julianday(s.last_fetch_at)) * 1440 >= COALESCE(f.interval_minutes, c.interval_minutes, 30))"#,
-    )
-    .fetch_one(db)
-    .await?;
-    Ok(n)
-}
-
-pub async fn get_due_subscriptions(db: &Db) -> anyhow::Result<Vec<(SubRow, EffectiveConfig)>> {
-    let rows = sqlx::query_as::<_, DueRow>(
-        r#"SELECT s.id, s.chat_id, s.feed_url, s.feed_title, s.title_overridden, s.original_title, s.active, s.error_count, s.last_fetch_at, s.last_error,
+pub async fn get_due_subscriptions(
+    db: &Db,
+) -> anyhow::Result<(i64, Vec<(SubRow, EffectiveConfig)>)> {
+    let sql = format!(
+        r#"SELECT COUNT(*) OVER() AS due_total,
+                  s.id, s.chat_id, s.feed_url, s.feed_title, s.title_overridden, s.original_title, s.active, s.error_count, s.last_fetch_at, s.last_error,
                   s.http_etag, s.http_last_modified, s.auto_disabled, s.disabled_at,
-                  COALESCE(f.interval_minutes, c.interval_minutes, 30) AS interval_minutes,
-                  COALESCE(f.content_mode, c.content_mode, 'title_link') AS content_mode,
-                  COALESCE(f.source_display, c.source_display, 'source') AS source_display,
-                  COALESCE(f.caption_above_media, c.caption_above_media, 0) AS caption_above_media,
-                  COALESCE(f.link_preview, c.link_preview, 1) AS link_preview,
-                  f.interval_minutes IS NOT NULL AS iv_overridden,
-                  f.content_mode IS NOT NULL AS cm_overridden,
-                  f.source_display IS NOT NULL AS sd_overridden,
-                  f.caption_above_media IS NOT NULL AS cp_overridden,
-                  f.link_preview IS NOT NULL AS lp_overridden
+                  {EFFECTIVE_CONFIG_COLUMNS}
            FROM subscriptions s
            LEFT JOIN chat_configs c ON c.chat_id = s.chat_id
            LEFT JOIN feed_configs f ON f.chat_id = s.chat_id AND f.feed_url = s.feed_url
@@ -487,13 +474,15 @@ pub async fn get_due_subscriptions(db: &Db) -> anyhow::Result<Vec<(SubRow, Effec
            WHERE s.active = 1
              AND (s.last_fetch_at IS NULL OR (julianday('now') - julianday(s.last_fetch_at)) * 1440 >= COALESCE(f.interval_minutes, c.interval_minutes, 30))
            ORDER BY (s.last_fetch_at IS NOT NULL) ASC, s.last_fetch_at ASC, s.id ASC
-           LIMIT ?"#,
-    )
-    .bind(MAX_DUE_PER_CYCLE)
-    .fetch_all(db)
-    .await?;
+           LIMIT ?"#
+    );
+    let rows = sqlx::query_as::<_, DueRow>(sqlx::AssertSqlSafe(sql))
+        .bind(MAX_DUE_PER_CYCLE)
+        .fetch_all(db)
+        .await?;
 
-    Ok(rows.into_iter().map(|r| (r.sub, r.cfg)).collect())
+    let total = rows.first().map(|r| r.due_total).unwrap_or(0);
+    Ok((total, rows.into_iter().map(|r| (r.sub, r.cfg)).collect()))
 }
 
 pub async fn update_fetch_headers(

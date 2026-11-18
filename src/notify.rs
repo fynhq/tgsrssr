@@ -192,6 +192,32 @@ pub(crate) async fn notify_oversized_video(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) async fn notify_oversized_videos(
+    bot: &Bot,
+    lang: Lang,
+    owner_id: Option<i64>,
+    chat_title: &str,
+    entry_link: &str,
+    delivered_tg_link: Option<&str>,
+    delivered_as_text: bool,
+    oversized: &[crate::media::OversizedVideo],
+) {
+    for ov in oversized {
+        notify_oversized_video(
+            bot,
+            lang,
+            owner_id,
+            chat_title,
+            entry_link,
+            delivered_tg_link,
+            delivered_as_text,
+            ov,
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn notify_download_failed(
     bot: &Bot,
     lang: Lang,

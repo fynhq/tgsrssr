@@ -24,38 +24,51 @@ pub use subs::*;
 pub type Db = SqlitePool;
 
 pub mod setting_key {
+    pub const COOKIE_PREFIX: &str = "cookie:";
+    pub const COOKIE_EXPIRED_NOTIFIED_PREFIX: &str = "cookie_expired_notified:";
+    pub const PLATFORM_HEALTH_PREFIX: &str = "platform_health:";
+    pub const PLATFORM_STREAK_PREFIX: &str = "platform_streak:";
+    pub const MEDIA_DL_FAIL_PREFIX: &str = "media_dl_fail:";
+    pub const AUTO_DISABLE_NOTIFIED_PREFIX: &str = "auto_disable_notified:";
+    pub const STALE_ZERO_PREFIX: &str = "stale_zero:";
+    pub const OUTBOX_MEDIA_LOST_PREFIX: &str = "outbox_media_lost:";
+    pub const SEND_FAIL_PREFIX: &str = "send_fail:";
+
     pub fn cookie(platform: &str) -> String {
-        format!("cookie:{}", platform)
+        format!("{}{}", COOKIE_PREFIX, platform)
     }
     pub fn cookie_expired_notified(platform: &str) -> String {
-        format!("cookie_expired_notified:{}", platform)
+        format!("{}{}", COOKIE_EXPIRED_NOTIFIED_PREFIX, platform)
     }
     pub fn platform_health(platform: &str) -> String {
-        format!("platform_health:{}", platform)
+        format!("{}{}", PLATFORM_HEALTH_PREFIX, platform)
     }
     pub fn platform_streak(platform: &str) -> String {
-        format!("platform_streak:{}", platform)
+        format!("{}{}", PLATFORM_STREAK_PREFIX, platform)
     }
-    pub fn media_dl_fail(chat_id: &str, feed_url: &str, entry_id: &str) -> String {
+    pub fn media_dl_fail_prefix(chat_id: &str, feed_url: &str) -> String {
         format!(
-            "media_dl_fail:{}:{}:{}:{}",
+            "{}{}:{}:{}:",
+            MEDIA_DL_FAIL_PREFIX,
             chat_id,
             feed_url.chars().count(),
-            feed_url,
-            entry_id
+            feed_url
         )
     }
+    pub fn media_dl_fail(chat_id: &str, feed_url: &str, entry_id: &str) -> String {
+        format!("{}{}", media_dl_fail_prefix(chat_id, feed_url), entry_id)
+    }
     pub fn auto_disable_notified(chat_id: &str, feed_url: &str) -> String {
-        format!("auto_disable_notified:{}:{}", chat_id, feed_url)
+        format!("{}{}:{}", AUTO_DISABLE_NOTIFIED_PREFIX, chat_id, feed_url)
     }
     pub fn stale_zero(chat_id: &str, feed_url: &str) -> String {
-        format!("stale_zero:{}:{}", chat_id, feed_url)
+        format!("{}{}:{}", STALE_ZERO_PREFIX, chat_id, feed_url)
     }
     pub fn outbox_media_lost(outbox_id: i64) -> String {
-        format!("outbox_media_lost:{}", outbox_id)
+        format!("{}{}", OUTBOX_MEDIA_LOST_PREFIX, outbox_id)
     }
     pub fn send_fail(chat_id: &str, feed_url: &str) -> String {
-        format!("send_fail:{}:{}", chat_id, feed_url)
+        format!("{}{}:{}", SEND_FAIL_PREFIX, chat_id, feed_url)
     }
 }
 
@@ -65,6 +78,18 @@ pub const DEFAULT_SOURCE_DISPLAY: &str = "source";
 pub const DEFAULT_CAPTION_ABOVE_MEDIA: i64 = 0;
 pub const DEFAULT_LINK_PREVIEW: i64 = 1;
 pub const MAX_INTERVAL_MINUTES: i64 = 1440;
+
+const EFFECTIVE_CONFIG_COLUMNS: &str =
+    "COALESCE(f.interval_minutes, c.interval_minutes, 30) AS interval_minutes, \
+     COALESCE(f.content_mode, c.content_mode, 'title_link') AS content_mode, \
+     COALESCE(f.source_display, c.source_display, 'source') AS source_display, \
+     COALESCE(f.caption_above_media, c.caption_above_media, 0) AS caption_above_media, \
+     COALESCE(f.link_preview, c.link_preview, 1) AS link_preview, \
+     f.interval_minutes IS NOT NULL AS iv_overridden, \
+     f.content_mode IS NOT NULL AS cm_overridden, \
+     f.source_display IS NOT NULL AS sd_overridden, \
+     f.caption_above_media IS NOT NULL AS cp_overridden, \
+     f.link_preview IS NOT NULL AS lp_overridden";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -428,7 +453,8 @@ mod tests {
         .await
         .unwrap();
 
-        let due = get_due_subscriptions(&pool).await.unwrap();
+        let (total, due) = get_due_subscriptions(&pool).await.unwrap();
+        assert_eq!(total, 1);
         assert_eq!(due.len(), 1);
         let (sub, cfg) = &due[0];
         assert_eq!(sub.chat_id, "1");
@@ -731,6 +757,7 @@ mod tests {
             format!("auto_disable_notified:{}:{}", old, feed),
             format!("stale_zero:{}:{}", old, feed),
             setting_key::media_dl_fail(old, feed, "e4"),
+            setting_key::send_fail(old, feed),
         ] {
             set_setting(&pool, &key, "1").await.unwrap();
         }
@@ -782,7 +809,8 @@ mod tests {
 
         let settings: Vec<String> = sqlx::query_scalar(
             "SELECT key FROM settings WHERE instr(key, 'auto_disable_notified:') = 1
-                OR instr(key, 'stale_zero:') = 1 OR instr(key, 'media_dl_fail:') = 1 ORDER BY key",
+                OR instr(key, 'stale_zero:') = 1 OR instr(key, 'media_dl_fail:') = 1
+                OR instr(key, 'send_fail:') = 1 ORDER BY key",
         )
         .fetch_all(&pool)
         .await
@@ -792,6 +820,7 @@ mod tests {
             vec![
                 format!("auto_disable_notified:{}:{}", new, feed),
                 setting_key::media_dl_fail(new, feed, "e4"),
+                setting_key::send_fail(new, feed),
                 format!("stale_zero:{}:{}", new, feed),
             ]
         );
@@ -1040,7 +1069,7 @@ mod tests {
         )
         .await;
 
-        let due = get_due_subscriptions(&pool).await.unwrap();
+        let (total, due) = get_due_subscriptions(&pool).await.unwrap();
         let urls: Vec<&str> = due.iter().map(|(s, _)| s.feed_url.as_str()).collect();
         assert_eq!(
             urls,
@@ -1051,13 +1080,13 @@ mod tests {
             ],
             "never-fetched first, then oldest, disabled chats excluded"
         );
-        assert_eq!(count_due_subscriptions(&pool).await.unwrap(), 3);
+        assert_eq!(total, 3);
 
         for i in 0..MAX_DUE_PER_CYCLE {
             insert_sub(&pool, "1", &format!("https://example.com/bulk/{}", i), None).await;
         }
-        let due = get_due_subscriptions(&pool).await.unwrap();
+        let (total, due) = get_due_subscriptions(&pool).await.unwrap();
         assert_eq!(due.len() as i64, MAX_DUE_PER_CYCLE);
-        assert!(count_due_subscriptions(&pool).await.unwrap() > MAX_DUE_PER_CYCLE);
+        assert!(total > MAX_DUE_PER_CYCLE);
     }
 }
