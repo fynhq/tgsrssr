@@ -1,7 +1,0 @@
-# Temporary accepted risk: RUSTSEC-2026-0459 affects libsqlite3-sys < 0.39.0.
-# sqlx 0.9.0 requires libsqlite3-sys < 0.38.0, so the patched release cannot
-# be selected; upstream lifted the bound to < 0.40.0 but has not released it.
-# The vector is local-only: a crafted, attacker-writable sibling -wal file.
-# Remove this ignore and update libsqlite3-sys after sqlx > 0.9.0 ships.
-[advisories]
-ignore = ["RUSTSEC-2026-0459"]
