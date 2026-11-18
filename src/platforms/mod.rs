@@ -9,6 +9,7 @@ use std::pin::Pin;
 
 use crate::state::AppState;
 use feed_rs::model::{Content, Entry, Link, Person, Text};
+use jiff::Timestamp;
 
 pub fn make_entry(
     id: String,
@@ -17,7 +18,7 @@ pub fn make_entry(
     body: String,
     content_type: &str,
     link: String,
-    published: Option<chrono::DateTime<chrono::Utc>>,
+    published: Option<Timestamp>,
 ) -> Entry {
     Entry {
         id,
@@ -26,8 +27,8 @@ pub fn make_entry(
             src: None,
             content: title,
         }),
-        updated: published,
-        published,
+        updated: published.map(crate::timeutil::to_chrono),
+        published: published.map(crate::timeutil::to_chrono),
         authors: vec![Person {
             name: Some(author),
             uri: None,
@@ -278,8 +279,8 @@ pub fn platform_for_url(url: &str) -> Option<&'static PlatformDef> {
 
 pub fn sort_entries_newest_first(entries: &mut [feed_rs::model::Entry]) {
     entries.sort_by(|a, b| {
-        let ta = a.published.or(a.updated);
-        let tb = b.published.or(b.updated);
+        let ta = crate::timeutil::entry_timestamp(a);
+        let tb = crate::timeutil::entry_timestamp(b);
         tb.cmp(&ta)
     });
 }

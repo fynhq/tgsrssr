@@ -5,6 +5,7 @@ use feed_rs::model::Entry;
 use crate::db;
 use crate::fetcher;
 use crate::i18n::Lang;
+use crate::timeutil::entry_timestamp;
 
 pub(super) struct PendingSelection<'a> {
     pub entries: Vec<&'a Entry>,
@@ -50,8 +51,8 @@ pub(super) fn select_pending<'a>(
         pending.push(entry);
     }
 
-    if pending.len() > 1 && pending.iter().all(|e| e.published.or(e.updated).is_some()) {
-        pending.sort_by_key(|e| e.published.or(e.updated));
+    if pending.len() > 1 && pending.iter().all(|e| entry_timestamp(e).is_some()) {
+        pending.sort_by_key(|e| entry_timestamp(e));
     }
 
     PendingSelection {
@@ -64,9 +65,16 @@ pub(super) fn select_pending<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use jiff::Timestamp;
 
-    fn entry(id: &str, title: &str, published: Option<chrono::DateTime<Utc>>) -> Entry {
+    fn utc_at(year: i16, month: i8, day: i8) -> Timestamp {
+        jiff::tz::TimeZone::UTC
+            .to_zoned(jiff::civil::DateTime::new(year, month, day, 0, 0, 0, 0).unwrap())
+            .unwrap()
+            .timestamp()
+    }
+
+    fn entry(id: &str, title: &str, published: Option<Timestamp>) -> Entry {
         crate::platforms::make_entry(
             id.to_string(),
             title.to_string(),
@@ -181,8 +189,8 @@ mod tests {
 
     #[test]
     fn pending_is_sorted_oldest_first_when_all_have_timestamps() {
-        let old = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let new = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let old = utc_at(2026, 1, 1);
+        let new = utc_at(2026, 1, 2);
         let entries = vec![
             entry("new", "new", Some(new)),
             entry("old", "old", Some(old)),

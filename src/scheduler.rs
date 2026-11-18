@@ -5,6 +5,7 @@ mod send_effects;
 
 use send_effects::{apply_send_success, SendSuccessCtx, SendSuccessExtras};
 
+use jiff::Timestamp;
 use teloxide::prelude::*;
 use tokio::sync::Semaphore;
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -474,7 +475,7 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<policy:
     let meta_json = meta
         .map(|m| serde_json::to_string(m).unwrap_or_default())
         .unwrap_or_default();
-    let now_ts = chrono::Utc::now().timestamp();
+    let now_ts = Timestamp::now().as_second();
     let next_retry = now_ts + outbox_backoff_secs(0);
     let entry_link = fetcher::entry_link(entry).unwrap_or_default();
     match db::outbox_insert(
@@ -1678,7 +1679,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     }
     let _guard = crate::state::ActiveFlagGuard(state.outbox_retry_active.clone());
 
-    let now = chrono::Utc::now().timestamp();
+    let now = Timestamp::now().as_second();
     let due_ids = db::outbox_due_ids(&state.db, now, OUTBOX_BATCH_LIMIT).await?;
     if due_ids.is_empty() {
         return Ok(());
@@ -1730,7 +1731,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             }
         }
 
-        let row_now = chrono::Utc::now().timestamp();
+        let row_now = Timestamp::now().as_second();
         if outbox_abandon_due(row.created_at, row.first_attempt_at, row.attempts, row_now) {
             warn!(
                 entry_id = %row.entry_id,
@@ -1957,7 +1958,7 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                 let attempts = row.attempts + 1;
                 retried += 1;
                 let backoff = outbox_backoff_secs(attempts);
-                let retry_now = chrono::Utc::now().timestamp();
+                let retry_now = Timestamp::now().as_second();
                 let next_retry = retry_now + backoff;
                 warn!(
                     entry_id = %row.entry_id,

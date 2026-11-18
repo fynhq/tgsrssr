@@ -411,10 +411,8 @@ pub fn entry_id(entry: &Entry) -> String {
         .as_ref()
         .map(|t| t.content.clone())
         .unwrap_or_default();
-    let ts = entry
-        .published
-        .or(entry.updated)
-        .map(|d| d.timestamp().to_string())
+    let ts = crate::timeutil::entry_timestamp(entry)
+        .map(|ts| ts.as_second().to_string())
         .unwrap_or_default();
     let body: &str = entry
         .content

@@ -3,8 +3,8 @@
 use std::sync::LazyLock;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use feed_rs::model::Entry;
+use jiff::Timestamp;
 
 use crate::fetcher::FetchOptions;
 use crate::i18n::{self, Lang};
@@ -425,7 +425,7 @@ fn extract_reply_blockquote(block: &str) -> String {
     format!("<blockquote>{}</blockquote>", quoted)
 }
 
-fn extract_published(block: &str) -> Option<DateTime<Utc>> {
+fn extract_published(block: &str) -> Option<Timestamp> {
     let reply_range = RE_REPLY_BLOCK.find(block).map(|reply| {
         let end = crate::htmltext::find_balanced_close(
             block,
@@ -450,8 +450,7 @@ fn extract_published(block: &str) -> Option<DateTime<Utc>> {
         };
         let dt = RE_DATETIME
             .captures(s)
-            .and_then(|c| DateTime::parse_from_rfc3339(&c[1]).ok())
-            .map(|d| d.with_timezone(&Utc));
+            .and_then(|c| c[1].parse::<Timestamp>().ok());
         if dt.is_some() {
             return dt;
         }
@@ -460,8 +459,8 @@ fn extract_published(block: &str) -> Option<DateTime<Utc>> {
         if caps.get(0).map(|m| in_reply(m.start())).unwrap_or(true) {
             continue;
         }
-        if let Ok(dt) = DateTime::parse_from_rfc3339(&caps[1]) {
-            return Some(dt.with_timezone(&Utc));
+        if let Ok(dt) = caps[1].parse::<Timestamp>() {
+            return Some(dt);
         }
     }
     None
@@ -622,9 +621,7 @@ mod tests {
     fn published_prefers_date_container_outside_reply() {
         let block = r#"<div class="tgme_widget_message" data-post="chan/200"><a class="tgme_widget_message_reply" href="https://t.me/chan/100"><div class="tgme_widget_message_date"><time datetime="2020-01-01T00:00:00+00:00">old</time></div><span class="tgme_widget_message_author_name">Author</span><div class="tgme_widget_message_text js-message_reply_text">quoted</div></a><div class="tgme_widget_message_text js-message_text">new main</div><div class="tgme_widget_message_date"><time datetime="2026-10-17T08:30:00+00:00">now</time></div></div>"#;
         let dt = extract_published(block).expect("a publish time");
-        let expected = DateTime::parse_from_rfc3339("2026-10-17T08:30:00+00:00")
-            .unwrap()
-            .with_timezone(&Utc);
+        let expected = "2026-10-17T08:30:00+00:00".parse::<Timestamp>().unwrap();
         assert_eq!(dt, expected);
     }
 
@@ -632,9 +629,7 @@ mod tests {
     fn published_falls_back_after_reply_anchor() {
         let block = r#"<div class="tgme_widget_message" data-post="chan/200"><a class="tgme_widget_message_reply" href="https://t.me/chan/100"><time datetime="2020-01-01T00:00:00+00:00">old</time><span class="tgme_widget_message_author_name">Author</span><div class="tgme_widget_message_text js-message_reply_text">quoted</div></a><div class="tgme_widget_message_text js-message_text">new main</div><time datetime="2026-10-17T08:30:00+00:00">now</time></div>"#;
         let dt = extract_published(block).expect("a publish time");
-        let expected = DateTime::parse_from_rfc3339("2026-10-17T08:30:00+00:00")
-            .unwrap()
-            .with_timezone(&Utc);
+        let expected = "2026-10-17T08:30:00+00:00".parse::<Timestamp>().unwrap();
         assert_eq!(dt, expected);
     }
 
@@ -642,9 +637,7 @@ mod tests {
     fn published_without_reply_unchanged() {
         let block = r#"<div class="tgme_widget_message" data-post="chan/200"><div class="tgme_widget_message_date"><time datetime="2026-10-17T08:30:00+00:00">now</time></div><div class="tgme_widget_message_text js-message_text">plain</div></div>"#;
         let dt = extract_published(block).expect("a publish time");
-        let expected = DateTime::parse_from_rfc3339("2026-10-17T08:30:00+00:00")
-            .unwrap()
-            .with_timezone(&Utc);
+        let expected = "2026-10-17T08:30:00+00:00".parse::<Timestamp>().unwrap();
         assert_eq!(dt, expected);
     }
 

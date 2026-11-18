@@ -1,5 +1,6 @@
 //! Periodic/startup cleanup: media quota, logs and DB backups.
 use futures_util::TryStreamExt;
+use jiff::{civil::Date, tz::TimeZone, Span, Timestamp};
 use sqlx::Row;
 use std::collections::{BinaryHeap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,8 @@ use crate::db::{self, Db};
 use crate::fsutil::dir_size;
 
 const OUTBOUND_TTL_HOURS: u64 = 80;
+// jiff spans cover the representable civil-date range.
+const MAX_SPAN_DAYS: i64 = 7_304_484;
 const SENT_ENTRIES_RETENTION_DAYS: i64 = 180;
 const FILE_ID_CACHE_RETENTION_DAYS: i64 = 30;
 const SENT_MESSAGES_MAX_ROWS: i64 = 5000;
@@ -74,12 +77,20 @@ async fn outbox_protected_paths(
     Ok(set)
 }
 
-pub(crate) fn outbound_cutoff(today: chrono::NaiveDate, ttl_hours: u64) -> chrono::NaiveDate {
+pub(crate) fn outbound_cutoff(today: Date, ttl_hours: u64) -> Date {
     let ttl_days = ((ttl_hours as f64) / 24.0).ceil() as u64;
     let days = ttl_days.saturating_add(1);
-    today
-        .checked_sub_days(chrono::Days::new(days))
-        .unwrap_or(today)
+    let Some(days) = i64::try_from(days)
+        .ok()
+        .filter(|days| *days <= MAX_SPAN_DAYS)
+    else {
+        return today;
+    };
+    today.checked_sub(Span::new().days(days)).unwrap_or(today)
+}
+
+fn utc_today() -> Date {
+    Timestamp::now().to_zoned(TimeZone::UTC).date()
 }
 
 pub async fn cleanup_outbound(
@@ -90,14 +101,14 @@ pub async fn cleanup_outbound(
     if !outbound.exists() {
         return Ok(0);
     }
-    let cutoff = outbound_cutoff(chrono::Utc::now().date_naive(), OUTBOUND_TTL_HOURS);
+    let cutoff = outbound_cutoff(utc_today(), OUTBOUND_TTL_HOURS);
     let mut removed = 0u64;
 
     let mut entries = fs::read_dir(&outbound).await?;
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if let Ok(date) = chrono::NaiveDate::parse_from_str(&name_str, "%Y-%m-%d") {
+        if let Ok(date) = Date::strptime("%Y-%m-%d", name_str.as_bytes()) {
             if date < cutoff {
                 let dir_path = entry.path();
                 let has_protected = outbox_protected.iter().any(|p| p.starts_with(&dir_path));
@@ -348,7 +359,7 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
         }
     }
 
-    let today = chrono::Utc::now().format("%Y%m%d").to_string();
+    let today = utc_today().strftime("%Y%m%d").to_string();
     let target = backups.join(format!("rss_bot_{}.db", today));
     if !target.exists() {
         match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -386,7 +397,9 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
     }
 
     let retention = config.backup_retention_days.max(1);
-    let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(retention);
+    let cutoff = utc_today()
+        .checked_sub(Span::new().days(retention))
+        .unwrap_or(Date::MIN);
     let mut entries = fs::read_dir(&backups).await?;
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
@@ -395,7 +408,7 @@ pub async fn backup_database(db_pool: &Db, config: &Config) -> anyhow::Result<()
             .strip_prefix("rss_bot_")
             .and_then(|s| s.strip_suffix(".db"));
         if let Some(d) = date_part {
-            if let Ok(date) = chrono::NaiveDate::parse_from_str(d, "%Y%m%d") {
+            if let Ok(date) = Date::strptime("%Y%m%d", d) {
                 if date < cutoff {
                     match fs::remove_file(entry.path()).await {
                         Ok(()) => info!(backup = %name_str, "removed old database backup"),
@@ -473,15 +486,13 @@ mod tests {
 
     #[test]
     fn outbound_cutoff_is_date_granular_and_checked() {
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
-        assert_eq!(outbound_cutoff(today, 1), today - chrono::Days::new(2));
-        assert_eq!(outbound_cutoff(today, 24), today - chrono::Days::new(2));
-        assert_eq!(outbound_cutoff(today, 80), today - chrono::Days::new(5));
-        assert_eq!(outbound_cutoff(today, 168), today - chrono::Days::new(8));
-        assert_eq!(
-            outbound_cutoff(today, 87_600),
-            today - chrono::Days::new(3651)
-        );
+        let today = Date::new(2026, 11, 3).unwrap();
+        let sub = |days| today.checked_sub(Span::new().days(days)).unwrap();
+        assert_eq!(outbound_cutoff(today, 1), sub(2));
+        assert_eq!(outbound_cutoff(today, 24), sub(2));
+        assert_eq!(outbound_cutoff(today, 80), sub(5));
+        assert_eq!(outbound_cutoff(today, 168), sub(8));
+        assert_eq!(outbound_cutoff(today, 87_600), sub(3651));
         assert_eq!(outbound_cutoff(today, u64::MAX), today);
     }
 }

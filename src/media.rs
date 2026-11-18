@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use feed_rs::model::Entry;
+use jiff::Timestamp;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
@@ -923,7 +924,10 @@ impl PreparedMedia {
 }
 
 fn ensure_outbound_dir(media_dir: &std::path::Path) -> std::io::Result<PathBuf> {
-    let date_dir = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let date_dir = Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .strftime("%Y-%m-%d")
+        .to_string();
     let outbound = media_dir.join("outbound").join(date_dir);
     std::fs::create_dir_all(&outbound)?;
     Ok(outbound)
@@ -1584,7 +1588,9 @@ async fn download_one(
     }
     let name = format!(
         "{}_{}.{}{}",
-        chrono::Utc::now().format("%H%M%S%f"),
+        Timestamp::now()
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .strftime("%H%M%S%N"),
         uuid::Uuid::new_v4(),
         ext,
         STORAGE_SUFFIX

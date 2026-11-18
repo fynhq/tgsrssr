@@ -3,8 +3,12 @@
 use std::sync::LazyLock;
 
 use anyhow::Context;
-use chrono::{DateTime, Datelike, Utc};
 use feed_rs::model::Entry;
+use jiff::{
+    civil::{Date, DateTime, Time},
+    tz::{Offset, TimeZone},
+    Span, Timestamp, Zoned,
+};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -17,8 +21,8 @@ static RE_HREF_DQ: LazyLock<regex::Regex> =
 static RE_HREF_SQ: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)href\s*=\s*'(/[^']*)'").unwrap());
 
-static CST: LazyLock<chrono::FixedOffset> =
-    LazyLock::new(|| chrono::FixedOffset::east_opt(8 * 3600).expect("valid UTC+8 offset"));
+static CST: LazyLock<TimeZone> =
+    LazyLock::new(|| TimeZone::fixed(Offset::from_hours(8).expect("valid UTC+8 offset")));
 
 fn status_id_str(mblog: &Value) -> Option<String> {
     mblog["id"]
@@ -882,14 +886,34 @@ fn mblog_to_entry(
     ))
 }
 
-fn parse_weibo_time(s: &str) -> Option<DateTime<Utc>> {
-    parse_weibo_time_at(s, Utc::now())
+fn parse_weibo_time(s: &str) -> Option<Timestamp> {
+    parse_weibo_time_at(s, Timestamp::now())
 }
 
-fn parse_weibo_time_at(s: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+fn cst_timestamp(date: Date, time: Time, cst: &TimeZone) -> Option<Timestamp> {
+    let dt = DateTime::new(
+        date.year(),
+        date.month(),
+        date.day(),
+        time.hour(),
+        time.minute(),
+        time.second(),
+        time.subsec_nanosecond(),
+    )
+    .ok()?;
+    cst.to_zoned(dt).ok().map(|z| z.timestamp())
+}
+
+fn cst_midnight(date: Date, cst: &TimeZone) -> Option<Timestamp> {
+    cst.to_zoned(DateTime::from(date))
+        .ok()
+        .map(|z| z.timestamp())
+}
+
+fn parse_weibo_time_at(s: &str, now: Timestamp) -> Option<Timestamp> {
     if let Some(rest) = s.split_once(' ').map(|(_, r)| r) {
-        if let Ok(dt) = chrono::DateTime::parse_from_str(rest, "%b %d %H:%M:%S %z %Y") {
-            return Some(dt.with_timezone(&Utc));
+        if let Ok(dt) = Zoned::strptime("%b %d %H:%M:%S %z %Y", rest) {
+            return Some(dt.timestamp());
         }
     }
     if s == "刚刚" {
@@ -897,46 +921,38 @@ fn parse_weibo_time_at(s: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     }
     if let Some(m) = s.strip_suffix("分钟前") {
         if let Ok(n) = m.trim().parse::<i64>() {
-            return Some(now - chrono::Duration::minutes(n));
+            return now.checked_sub(Span::new().minutes(n)).ok();
         }
     }
     if let Some(m) = s.strip_suffix("小时前") {
         if let Ok(n) = m.trim().parse::<i64>() {
-            return Some(now - chrono::Duration::hours(n));
+            return now.checked_sub(Span::new().hours(n)).ok();
         }
     }
     if let Some(hm) = s.strip_prefix("昨天 ") {
-        if let Ok(t) = chrono::NaiveTime::parse_from_str(hm, "%H:%M") {
-            let cst = *CST;
-            let yesterday = (now.with_timezone(&cst) - chrono::Duration::days(1)).date_naive();
-            let dt = yesterday.and_time(t).and_local_timezone(cst).single()?;
-            return Some(dt.with_timezone(&Utc));
+        if let Ok(t) = Time::strptime("%H:%M", hm) {
+            let cst = CST.clone();
+            let yesterday = now.to_zoned(cst.clone()).date().yesterday().ok()?;
+            return cst_timestamp(yesterday, t, &cst);
         }
     }
     if s.len() == 5 && s.chars().nth(2) == Some('-') {
-        let cst = *CST;
-        let cst_now = now.with_timezone(&cst);
-        if let Ok(md) = chrono::NaiveDate::parse_from_str(
-            &format!("{}-{}", cst_now.format("%Y"), s),
-            "%Y-%m-%d",
-        ) {
-            let dt = md.and_hms_opt(0, 0, 0)?.and_local_timezone(cst).single()?;
-            let dt = if dt > now + chrono::Duration::days(1) {
-                md.with_year(md.year() - 1)?
-                    .and_hms_opt(0, 0, 0)?
-                    .and_local_timezone(cst)
-                    .single()?
-            } else {
-                dt
-            };
-            return Some(dt.with_timezone(&Utc));
+        let cst = CST.clone();
+        let cst_now = now.to_zoned(cst.clone());
+        let input = format!("{}-{}", cst_now.strftime("%Y"), s);
+        if let Ok(md) = Date::strptime("%Y-%m-%d", &input) {
+            let midnight = cst_midnight(md, &cst)?;
+            if midnight > now.checked_add(Span::new().hours(24)).ok()? {
+                let md = Date::new(md.year() - 1, md.month(), md.day()).ok()?;
+                return cst_midnight(md, &cst);
+            }
+            return Some(midnight);
         }
     }
     if s.len() == 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-') {
-        let cst = *CST;
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-            let dt = d.and_hms_opt(0, 0, 0)?.and_local_timezone(cst).single()?;
-            return Some(dt.with_timezone(&Utc));
+        let cst = CST.clone();
+        if let Ok(d) = Date::strptime("%Y-%m-%d", s) {
+            return cst_midnight(d, &cst);
         }
     }
     None
@@ -1459,13 +1475,16 @@ mod tests {
         assert_eq!(absolutize_hrefs(abs), abs);
     }
 
+    fn cst_at(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> Timestamp {
+        let cst = CST.clone();
+        let dt = DateTime::new(year, month, day, hour, minute, 0, 0).unwrap();
+        cst.to_zoned(dt).unwrap().timestamp()
+    }
+
     #[test]
     fn parse_weibo_time_absolute() {
         let t = parse_weibo_time("Fri Sep 25 20:09:08 +0800 2026");
-        let expected =
-            chrono::DateTime::parse_from_str("2026-09-25 12:09:08 +0000", "%Y-%m-%d %H:%M:%S %z")
-                .unwrap()
-                .with_timezone(&Utc);
+        let expected = "2026-09-25T12:09:08Z".parse::<Timestamp>().unwrap();
         assert_eq!(t, Some(expected));
         let t2 = parse_weibo_time("Mon Sep 25 20:09:08 +0800 2026");
         assert_eq!(t2, Some(expected));
@@ -1473,111 +1492,75 @@ mod tests {
 
     #[test]
     fn parse_weibo_time_relative() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let t = parse_weibo_time("刚刚").expect("just-now form should parse");
+        let delta = (t.as_second() - now.as_second()).abs();
         assert!(
-            (t - now).num_seconds().abs() <= 2,
-            "just-now form should be ~now, got delta {:?}",
-            t - now
+            delta <= 2,
+            "just-now form should be ~now, got delta {}s",
+            delta
         );
         let t = parse_weibo_time("10分钟前").expect("10-minutes-ago form should parse");
-        let delta = (t - (now - chrono::Duration::minutes(10)))
-            .num_seconds()
-            .abs();
+        let expected = now.checked_sub(Span::new().minutes(10)).unwrap();
+        let delta = (t.as_second() - expected.as_second()).abs();
         assert!(delta <= 2, "10-minutes-ago offset wrong by {}s", delta);
         let t = parse_weibo_time("3小时前").expect("3-hours-ago form should parse");
-        let delta = (t - (now - chrono::Duration::hours(3))).num_seconds().abs();
+        let expected = now.checked_sub(Span::new().hours(3)).unwrap();
+        let delta = (t.as_second() - expected.as_second()).abs();
         assert!(delta <= 2, "3-hours-ago offset wrong by {}s", delta);
     }
 
     #[test]
     fn parse_weibo_time_yesterday() {
-        let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-        let now_cst = Utc::now().with_timezone(&cst);
-        let yesterday = (now_cst - chrono::Duration::days(1)).date_naive();
+        let yesterday = Timestamp::now()
+            .to_zoned(CST.clone())
+            .date()
+            .yesterday()
+            .unwrap();
         let t = parse_weibo_time("昨天 08:30").expect("yesterday form should parse");
-        let expected = yesterday
-            .and_hms_opt(8, 30, 0)
-            .unwrap()
-            .and_local_timezone(cst)
-            .single()
-            .unwrap()
-            .with_timezone(&Utc);
+        let expected = cst_at(yesterday.year(), yesterday.month(), yesterday.day(), 8, 30);
         assert_eq!(t, expected);
     }
 
     #[test]
     fn parse_weibo_time_mm_dd_past() {
-        let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-        let year = Utc::now().with_timezone(&cst).year();
+        let year = Timestamp::now().to_zoned(CST.clone()).date().year();
         let t = parse_weibo_time("01-01").expect("01-01 should parse");
-        let expected = chrono::NaiveDate::from_ymd_opt(year, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_local_timezone(cst)
-            .single()
-            .unwrap()
-            .with_timezone(&Utc);
+        let expected = cst_at(year, 1, 1, 0, 0);
         assert_eq!(t, expected);
     }
 
     #[test]
     fn parse_weibo_time_mm_dd_cross_year() {
-        let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-        let now_cst = Utc::now().with_timezone(&cst);
-        let target = (now_cst + chrono::Duration::days(30)).date_naive();
+        let now_date = Timestamp::now().to_zoned(CST.clone()).date();
+        let target = now_date.checked_add(Span::new().days(30)).unwrap();
         let mmdd = format!("{:02}-{:02}", target.month(), target.day());
         let t = parse_weibo_time(&mmdd).unwrap_or_else(|| panic!("{} should parse", mmdd));
-        let expected_year = if target.year() == now_cst.year() {
-            now_cst.year() - 1
+        let expected_year = if target.year() == now_date.year() {
+            now_date.year() - 1
         } else {
-            now_cst.year()
+            now_date.year()
         };
-        let expected = chrono::NaiveDate::from_ymd_opt(expected_year, target.month(), target.day())
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_local_timezone(cst)
-            .single()
-            .unwrap()
-            .with_timezone(&Utc);
+        let expected = cst_at(expected_year, target.month(), target.day(), 0, 0);
         assert_eq!(t, expected, "mmdd={}", mmdd);
     }
 
     #[test]
     fn parse_weibo_time_mm_dd_cst_new_year() {
-        let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-        let now = chrono::NaiveDate::from_ymd_opt(2025, 12, 31)
+        let now = TimeZone::UTC
+            .to_zoned(DateTime::new(2025, 12, 31, 16, 30, 0, 0).unwrap())
             .unwrap()
-            .and_hms_opt(16, 30, 0)
-            .unwrap()
-            .and_utc();
+            .timestamp();
         let t = parse_weibo_time_at("01-01", now).expect("01-01 should parse");
-        let expected = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_local_timezone(cst)
-            .single()
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let expected = cst_at(2026, 1, 1, 0, 0);
         assert_eq!(t, expected);
     }
 
     #[test]
     fn parse_weibo_time_full_date() {
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let t = parse_weibo_time_at("2024-03-05", now).expect("YYYY-MM-DD should parse");
-        let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-        let expected = chrono::NaiveDate::from_ymd_opt(2024, 3, 5)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_local_timezone(cst)
-            .single()
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let expected = cst_at(2024, 3, 5, 0, 0);
         assert_eq!(t, expected);
     }
 

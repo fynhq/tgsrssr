@@ -5,8 +5,8 @@ use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use feed_rs::model::Entry;
+use jiff::{Timestamp, Zoned};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -1343,10 +1343,10 @@ fn tweet_text_to_html(text: &str) -> String {
     out.replace('\n', "<br>")
 }
 
-fn parse_twitter_time(s: &str) -> Option<DateTime<Utc>> {
-    chrono::DateTime::parse_from_str(s, "%a %b %d %H:%M:%S %z %Y")
+fn parse_twitter_time(s: &str) -> Option<Timestamp> {
+    Zoned::strptime("%a %b %d %H:%M:%S %z %Y", s)
         .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+        .map(|z| z.timestamp())
 }
 
 #[cfg(test)]
@@ -1398,7 +1398,12 @@ mod tests {
         let t = parse_twitter_time("Wed Oct 10 20:19:24 +0000 2018");
         assert!(t.is_some());
         let dt = t.unwrap();
-        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2018-10-10");
+        assert_eq!(
+            dt.to_zoned(jiff::tz::TimeZone::UTC)
+                .strftime("%Y-%m-%d")
+                .to_string(),
+            "2018-10-10"
+        );
     }
 
     #[test]
