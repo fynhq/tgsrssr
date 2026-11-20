@@ -319,7 +319,7 @@ pub async fn fetch_weibo_user(
 
     crate::platforms::sort_entries_newest_first(&mut entries);
 
-    // A non-empty card list with zero entries must error, not return empty (silent feed death).
+    // Zero entries with a non-empty or invalid card list signal a structure change; warn here, stale-zero guard catches silent death.
     if entries.is_empty() && (!cards.is_empty() || !cards_value.is_array()) {
         let types: Vec<i64> = cards
             .iter()

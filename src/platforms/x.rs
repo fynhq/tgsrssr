@@ -642,7 +642,7 @@ async fn fetch_user_tweets(
         if !instructions.is_array() {
             let alt = &json["data"]["user"]["result"]["timeline_v2"]["timeline"]["instructions"];
             if !alt.is_array() {
-                // A non-empty timeline with zero tweets must error, not return empty (silent feed death).
+                // Missing instructions mean the API shape changed; bail instead of returning a silent empty timeline.
                 anyhow::bail!(
                     "X UserTweets response missing timeline instructions (API shape may have changed)"
                 );
@@ -1845,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_screen_name_reads_core_user_results_core_path() {
+    fn screen_name_opt_reads_core_user_results_core_path() {
         let tweet: Value = serde_json::json!({
             "core": {
                 "user_results": {

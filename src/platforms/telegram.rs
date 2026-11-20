@@ -250,7 +250,7 @@ pub async fn fetch_telegram_channel(
 
     crate::platforms::sort_entries_newest_first(&mut entries);
 
-    // A page with message blocks but zero parsed entries must error, not return empty (silent feed death).
+    // Zero entries with message blocks signal a structure change; warn here, stale-zero guard catches silent feed death.
     if entries.is_empty() && total_blocks > 0 {
         tracing::warn!(
             channel = %channel,
