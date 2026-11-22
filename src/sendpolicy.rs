@@ -82,12 +82,27 @@ fn is_explicitly_undelivered(err_str: &str) -> bool {
         || err_str.contains("rich media upload body read failed")
 }
 
+fn telegram_api_error_code(err_str: &str) -> Option<u16> {
+    let rest = err_str.split_once("Telegram API error ")?.1;
+    let digits = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
 pub fn is_ambiguous_send_error(err_str: &str) -> bool {
     if is_explicitly_undelivered(err_str) {
         return false;
     }
     let err_str = mask_urls(err_str);
-    err_str.contains("timed out")
+    err_str.contains(crate::richmsg::RICH_OUTCOME_UNCERTAIN)
+        || telegram_api_error_code(&err_str).is_some_and(|code| (500..600).contains(&code))
+        || err_str.contains("timed out")
         || err_str.contains("timeout")
         || err_str.contains("connection reset")
         || err_str.contains("connection closed")
@@ -324,6 +339,19 @@ mod tests {
         is_net_error, is_send_retryable_error, SendFailureClass, SendRetryAction, SendRetryPolicy,
         SendRetryState,
     };
+
+    #[test]
+    fn telegram_api_5xx_is_ambiguous_but_4xx_is_not() {
+        assert!(is_ambiguous_send_error(
+            "Telegram API error 502: Bad Gateway"
+        ));
+        assert!(!is_ambiguous_send_error(
+            "Telegram API error 400: Bad Request"
+        ));
+        assert!(is_ambiguous_send_error(
+            crate::richmsg::RICH_OUTCOME_UNCERTAIN
+        ));
+    }
 
     #[test]
     fn failure_classes_cover_each_recovery_branch() {

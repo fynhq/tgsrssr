@@ -571,7 +571,7 @@ fn split_rich_docs<'a>(docs: &[&'a MediaItem]) -> (Vec<&'a MediaItem>, Vec<&'a M
     let mut rich = Vec::new();
     let mut follow = Vec::new();
     for item in docs {
-        if item.kind == MediaKind::Image {
+        if item.kind == MediaKind::Image && !item.is_retweet && !item.is_gif {
             rich.push(*item);
         } else {
             follow.push(*item);
@@ -597,10 +597,10 @@ fn classify_media<'a>(media: &'a [MediaItem]) -> MediaPlan<'a> {
     let aspect_threshold = crate::config::LONG_IMAGE_ASPECT_RATIO;
     for m in media {
         if m.is_retweet && m.kind == MediaKind::Image {
-            if crate::media::image_sends_as_document(m, aspect_threshold) {
-                docs.push(m);
-            } else if m.is_gif {
+            if m.is_gif {
                 gifs.push(m);
+            } else if crate::media::image_sends_as_document(m, aspect_threshold) {
+                docs.push(m);
             } else {
                 rt_photos.push(m);
             }
@@ -608,7 +608,9 @@ fn classify_media<'a>(media: &'a [MediaItem]) -> MediaPlan<'a> {
         }
         match m.kind {
             MediaKind::Image => {
-                if crate::media::image_sends_as_document(m, aspect_threshold) {
+                if m.is_gif {
+                    gifs.push(m);
+                } else if crate::media::image_sends_as_document(m, aspect_threshold) {
                     docs.push(m);
                     tracing::debug!(
                         size = m.size,
@@ -616,8 +618,6 @@ fn classify_media<'a>(media: &'a [MediaItem]) -> MediaPlan<'a> {
                         h = m.height,
                         "image -> document"
                     );
-                } else if m.is_gif {
-                    gifs.push(m);
                 } else {
                     photos.push(m);
                 }
@@ -653,6 +653,10 @@ fn plan_caption(full_caption: &str) -> CaptionPlan {
         caption,
         overflow_chunks,
     }
+}
+
+fn doc_fallback_allowed(err_str: &str) -> bool {
+    !crate::sendpolicy::is_ambiguous_send_error(err_str)
 }
 
 struct TailDelivery {
@@ -704,6 +708,21 @@ impl TailDelivery {
                     self.first_doc = msgs.into_iter().next();
                 }
                 Err((delivered, e)) => {
+                    let err_str = error_chain_string(e.as_ref());
+                    if !doc_fallback_allowed(&err_str) {
+                        tracing::warn!(
+                            chat_id = chat_id,
+                            error = %e,
+                            delivered = delivered.len(),
+                            total_docs = docs.len(),
+                            "doc group outcome uncertain, not retrying remaining documents"
+                        );
+                        if let Some(first) = delivered.first() {
+                            self.first_doc = Some(first.clone());
+                        }
+                        self.media_failed = true;
+                        return;
+                    }
                     tracing::warn!(
                         chat_id = chat_id,
                         error = %e,
@@ -1812,7 +1831,9 @@ async fn send_single_html(
                             html_head = %html_text.chars().take(100).collect::<String>(),
                             "HTML parse failed, falling back to plain text"
                         );
-                        plain_text = Some(crate::htmltext::strip_html_keep_links(&html_text));
+                        plain_text = Some(crate::htmltext::strip_html_keep_links(
+                            &html_text, SAFE_LIMIT,
+                        ));
                         continue;
                     }
                     _ => return Err(e.into()),
@@ -1885,6 +1906,15 @@ mod tests {
             }),
             retweet_images: Vec::new(),
         }
+    }
+
+    #[test]
+    fn doc_group_fallback_rejects_ambiguous_outcomes() {
+        assert!(!doc_fallback_allowed("request timed out after 600s"));
+        assert!(!doc_fallback_allowed("Telegram API error 502: Bad Gateway"));
+        assert!(doc_fallback_allowed(
+            "Telegram API error 400: Bad Request: chat not found"
+        ));
     }
 
     #[test]
@@ -2353,18 +2383,35 @@ mod tests {
     }
 
     #[test]
-    fn split_rich_docs_keeps_audio_and_files_out_of_the_rich_payload() {
+    fn split_rich_docs_keeps_audio_files_gifs_and_retweets_out() {
         let doc_image = mk_item("d0", MediaKind::Image, false);
         let audio = mk_item("d1", MediaKind::Other, false);
         let file = mk_item("d2", MediaKind::Other, false);
+        let gif = mk_item("d3", MediaKind::Image, true);
+        let mut retweet = mk_item("d4", MediaKind::Image, false);
+        retweet.is_retweet = true;
 
-        let (rich, follow) = split_rich_docs(&[&doc_image, &audio, &file]);
+        let (rich, follow) = split_rich_docs(&[&doc_image, &audio, &file, &gif, &retweet]);
 
         assert_eq!(rich.len(), 1);
         assert_eq!(rich[0].content_hash, "d0");
-        assert_eq!(follow.len(), 2);
+        assert_eq!(follow.len(), 4);
         assert_eq!(follow[0].content_hash, "d1");
         assert_eq!(follow[1].content_hash, "d2");
+        assert_eq!(follow[2].content_hash, "d3");
+        assert_eq!(follow[3].content_hash, "d4");
+    }
+
+    #[test]
+    fn oversized_gif_remains_animation_not_document() {
+        let mut gif = mk_item("g0", MediaKind::Image, true);
+        gif.size = 20 * 1024 * 1024;
+        gif.path = std::path::PathBuf::from("g0.bin");
+        let media = [gif];
+        let plan = classify_media(&media);
+        assert_eq!(plan.gifs.len(), 1);
+        assert!(plan.docs.is_empty());
+        assert!(plan.photos.is_empty());
     }
 
     #[test]

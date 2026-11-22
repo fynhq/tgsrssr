@@ -1130,6 +1130,7 @@ async fn download_cover_fallback(
         Ok(DownloadOutcome::Item(item)) => {
             let size = item.size;
             out.items.push(item);
+            out.download_failed = false;
             return Some(size);
         }
         Ok(DownloadOutcome::InvalidContent) => {

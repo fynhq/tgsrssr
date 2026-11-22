@@ -15,11 +15,12 @@ pub async fn dir_size(path: &Path) -> std::io::Result<u64> {
             let entry = match entries.next_entry().await {
                 Ok(Some(entry)) => entry,
                 Ok(None) => break,
-                Err(_) => break,
+                Err(e) => return Err(e),
             };
             let meta = match entry.metadata().await {
                 Ok(meta) => meta,
-                Err(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
             };
             if meta.is_dir() {
                 stack.push(entry.path());

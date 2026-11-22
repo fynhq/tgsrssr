@@ -87,7 +87,7 @@ pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) ->
         );
         return false;
     }
-    let plain = crate::htmltext::strip_html_keep_links(&html_msg);
+    let plain = crate::htmltext::strip_html_keep_links(&html_msg, NOTIFY_MAX_VISIBLE);
     let fallback_err = send_message_with_pace_flood(bot, user_id, &plain, false, &no_preview).await;
     match fallback_err {
         None => true,

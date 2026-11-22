@@ -316,15 +316,39 @@ pub fn strip_html_tags(s: &str) -> String {
     decode_entities(&RE_TAG.replace_all(s, ""))
 }
 
-pub fn strip_html_keep_links(s: &str) -> String {
-    static RE_ANCHOR_ANY: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r#"(?is)<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>"#).unwrap()
+pub fn strip_html_keep_links(s: &str, max: usize) -> String {
+    static RE_ANCHOR: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a\s*>"#)
+            .unwrap()
     });
-    static RE_ANCHOR_CLOSE_ANY: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?i)</a\s*>").unwrap());
-    let s = RE_ANCHOR_ANY.replace_all(s, "$1 ");
-    let s = RE_ANCHOR_CLOSE_ANY.replace_all(&s, "");
-    decode_entities(&RE_TAG.replace_all(&s, ""))
+    let plain = |html: &str| decode_entities(&RE_TAG.replace_all(html, ""));
+
+    let mut out = String::new();
+    let mut last = 0;
+    for caps in RE_ANCHOR.captures_iter(s) {
+        let Some(m) = caps.get(0) else {
+            continue;
+        };
+        out.push_str(&plain(&s[last..m.start()]));
+        let href = caps
+            .get(1)
+            .map(|m| decode_entities(m.as_str()))
+            .unwrap_or_default();
+        let label = plain(caps.get(2).map(|m| m.as_str()).unwrap_or(""));
+        let with_href = format!("{href} {label}");
+        if utf16_len(&out).saturating_add(utf16_len(&with_href)) <= max {
+            out.push_str(&with_href);
+        } else {
+            out.push_str(&label);
+        }
+        last = m.end();
+    }
+    out.push_str(&plain(&s[last..]));
+    if utf16_len(&out) > max {
+        take_utf16_prefix(&out, max).to_string()
+    } else {
+        out
+    }
 }
 
 pub fn unescape_html(s: &str) -> String {
@@ -1019,10 +1043,25 @@ mod tests {
     fn plain_fallback_keeps_anchor_destinations() {
         assert_eq!(
             strip_html_keep_links(
-                r#"before <a href="https://example.com/a?x=1&amp;y=2">link</a> after"#
+                r#"before <a href="https://example.com/a?x=1&amp;y=2">link</a> after"#,
+                4096
             ),
             "before https://example.com/a?x=1&y=2 link after"
         );
+    }
+
+    #[test]
+    fn plain_fallback_drops_only_urls_that_exceed_budget() {
+        let long_url = format!("https://example.com/{}", "x".repeat(80));
+        let html = format!(
+            r#"<a href="{long_url}">first</a> <a href="https://example.com/short">second</a>"#
+        );
+        let plain = strip_html_keep_links(&html, 60);
+        assert!(utf16_len(&plain) <= 60);
+        assert!(!plain.contains(&long_url));
+        assert!(plain.contains("https://example.com/short"));
+        assert!(plain.contains("first"));
+        assert!(plain.contains("second"));
     }
 
     #[test]

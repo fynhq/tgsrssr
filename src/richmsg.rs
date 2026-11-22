@@ -5,6 +5,8 @@ use serde_json::{json, Map, Value};
 use teloxide::prelude::Bot;
 use teloxide::types::{Message, MessageId};
 
+pub(crate) const RICH_OUTCOME_UNCERTAIN: &str = "rich message outcome uncertain";
+
 static RICH_UNSUPPORTED_UNTIL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -74,19 +76,19 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
         .chunk()
         .await
         .map_err(|e| e.without_url())
-        .context("rich message response read failed")?
+        .with_context(|| format!("{RICH_OUTCOME_UNCERTAIN}: response read failed"))?
     {
         body.extend_from_slice(&chunk);
         if body.len() > MAX_RESPONSE_BYTES {
             anyhow::bail!(
-                "rich message response too large (limit {} bytes)",
+                "{RICH_OUTCOME_UNCERTAIN}: response too large (limit {} bytes)",
                 MAX_RESPONSE_BYTES
             );
         }
     }
     let parsed: TelegramResponse<T> = serde_json::from_slice(&body).map_err(|e| {
         anyhow::anyhow!(
-            "rich message response parse failed (HTTP {}): {}",
+            "{RICH_OUTCOME_UNCERTAIN}: response parse failed (HTTP {}): {}",
             status.as_u16(),
             e
         )
@@ -94,7 +96,7 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
     if parsed.ok {
         return parsed
             .result
-            .ok_or_else(|| anyhow::anyhow!("rich message response missing result"));
+            .ok_or_else(|| anyhow::anyhow!("{RICH_OUTCOME_UNCERTAIN}: response missing result"));
     }
 
     let mut description = parsed
