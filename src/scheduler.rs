@@ -415,7 +415,7 @@ async fn handle_send_failure(ctx: &SendFailureCtx<'_>) -> anyhow::Result<policy:
                     new_chat_id = %new_id,
                     "chat id migrated after send error; retrying on the next cycle"
                 );
-                return Ok(policy::FlowAction::Continue);
+                return Ok(policy::FlowAction::DeferBreak);
             }
             Err(me) => warn!(
                 old_chat_id = %cfg.chat_id,
