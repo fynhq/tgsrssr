@@ -73,6 +73,11 @@ pub enum PlatformError {
         platform: &'static str,
         status: u16,
     },
+    SourceForbidden {
+        platform: &'static str,
+        status: u16,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for PlatformError {
@@ -92,6 +97,17 @@ impl std::fmt::Display for PlatformError {
                     platform, status
                 )
             }
+            PlatformError::SourceForbidden {
+                platform,
+                status,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "{} source request forbidden (HTTP {}): {}",
+                    platform, status, detail
+                )
+            }
         }
     }
 }
@@ -107,6 +123,18 @@ pub fn auth_expired(platform: &'static str, detail: impl Into<String>) -> anyhow
 
 pub fn rate_limited(platform: &'static str, status: u16) -> anyhow::Error {
     anyhow::Error::new(PlatformError::RateLimited { platform, status })
+}
+
+pub fn source_forbidden(
+    platform: &'static str,
+    status: u16,
+    detail: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(PlatformError::SourceForbidden {
+        platform,
+        status,
+        detail: detail.into(),
+    })
 }
 
 pub type PlatformFetchFn = for<'a> fn(
@@ -465,15 +493,11 @@ pub async fn migrate_legacy_cookies(state: &AppState) {
 
 pub async fn update_cookie(state: &AppState, platform: &str, value: &str) -> anyhow::Result<()> {
     let value = value.trim();
-    crate::db::set_setting(&state.db, &cookie_setting_key(platform), value).await?;
+    let cookie_key = cookie_setting_key(platform);
+    let notified_key = crate::db::setting_key::cookie_expired_notified(platform);
+    crate::db::set_settings_atomic(&state.db, &[(&cookie_key, value), (&notified_key, "0")])
+        .await?;
     state.set_cookie(platform, value).await;
-    crate::db::set_setting(
-        &state.db,
-        &crate::db::setting_key::cookie_expired_notified(platform),
-        "0",
-    )
-    .await
-    .ok();
     Ok(())
 }
 

@@ -733,13 +733,7 @@ async fn handle_fetch_failure(
         stats.last_err.lock().await.insert(p, err_msg.clone());
     }
 
-    let auth_expired = e.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<crate::platforms::PlatformError>(),
-            Some(crate::platforms::PlatformError::AuthExpired { .. })
-        )
-    });
-    if auth_expired || err_msg.to_lowercase().contains("cookie") {
+    if marks_cookie_expired(e, &err_msg) {
         if let Some(p) = platform_of_url(&sub.feed_url) {
             db::set_setting(&state.db, &db::setting_key::cookie_expired_notified(p), "1")
                 .await
@@ -1393,6 +1387,21 @@ fn platform_of_url(feed_url: &str) -> Option<&'static str> {
     crate::platforms::platform_for_url(feed_url).map(|p| p.id)
 }
 
+fn marks_cookie_expired(error: &anyhow::Error, err_msg: &str) -> bool {
+    let mut auth_expired = false;
+    let mut source_forbidden = false;
+    for cause in error.chain() {
+        match cause.downcast_ref::<crate::platforms::PlatformError>() {
+            Some(crate::platforms::PlatformError::AuthExpired { .. }) => auth_expired = true,
+            Some(crate::platforms::PlatformError::SourceForbidden { .. }) => {
+                source_forbidden = true;
+            }
+            _ => {}
+        }
+    }
+    auth_expired || (!source_forbidden && err_msg.to_lowercase().contains("cookie"))
+}
+
 async fn maybe_notify_platform_down(bot: &Bot, state: &AppState, platform: &str, err_msg: &str) {
     let health_key = db::setting_key::platform_health(platform);
     let flipped = match db::flip_setting_once(&state.db, &health_key, "down").await {
@@ -1460,10 +1469,20 @@ async fn maybe_notify_platform_recovered(bot: &Bot, state: &AppState, platform: 
     let label = crate::platforms::find_platform(platform)
         .map(|p| p.label)
         .unwrap_or(platform);
-    notify_admins_html(bot, state, |lang| {
+    let delivered = notify_admins_html(bot, state, |lang| {
         i18n::t(lang, "notif_platform_recovered").replacen("{}", label, 1)
     })
     .await;
+    if !delivered {
+        if let Err(e) = db::set_setting(&state.db, &health_key, "down").await {
+            warn!(platform = platform, error = %e, "failed to restore health bit after undelivered recovery");
+        } else {
+            warn!(
+                platform = platform,
+                "platform-recovered alert undelivered; will retry next round"
+            );
+        }
+    }
 }
 
 pub async fn register_outbox_retry_job(
@@ -2028,6 +2047,21 @@ fn extract_entry_link_from_json(entry_json: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookie_expiry_classification_ignores_source_forbidden_details() {
+        let forbidden = crate::platforms::source_forbidden("X", 403, "cookie challenge");
+        assert!(!marks_cookie_expired(
+            &forbidden,
+            &format!("{:#}", forbidden)
+        ));
+        let expired = crate::platforms::auth_expired("X", "HTTP 401");
+        assert!(marks_cookie_expired(&expired, &format!("{:#}", expired)));
+        assert!(marks_cookie_expired(
+            &anyhow::anyhow!("Weibo cookie invalid"),
+            "Weibo cookie invalid"
+        ));
+    }
 
     #[test]
     fn outbox_abandon_requires_an_attempt_and_uses_first_attempt() {

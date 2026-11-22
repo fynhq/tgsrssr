@@ -514,10 +514,11 @@ async fn gql_request_once(
         if is_stale_ct0_response(&text) {
             return Err(anyhow::Error::new(StaleCt0Error));
         }
-        anyhow::bail!(
-            "X API forbidden (HTTP 403, not a ct0/cookie problem): {}",
-            text.chars().take(200).collect::<String>()
-        );
+        return Err(crate::platforms::source_forbidden(
+            "X",
+            status.as_u16(),
+            text.chars().take(200).collect::<String>(),
+        ));
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(crate::platforms::rate_limited("X", status.as_u16()));

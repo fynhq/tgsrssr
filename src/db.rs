@@ -500,6 +500,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn atomic_settings_write_persists_all_entries() {
+        let pool = test_pool().await;
+        set_settings_atomic(
+            &pool,
+            &[("cookie:x", "a"), ("cookie_expired_notified:x", "0")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_setting(&pool, "cookie:x").await.unwrap().as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            get_setting(&pool, "cookie_expired_notified:x")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+    }
+
+    #[tokio::test]
     async fn trim_sent_messages_keeps_newest_rows() {
         let pool = test_pool().await;
         for mid in 1..=3 {

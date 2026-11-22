@@ -21,6 +21,22 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+pub async fn set_settings_atomic(db: &Db, entries: &[(&str, &str)]) -> anyhow::Result<()> {
+    let mut tx = db.begin().await?;
+    for (key, value) in entries {
+        sqlx::query(
+            r#"INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')"#,
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn delete_setting(db: &Db, key: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM settings WHERE key = ?")
         .bind(key)
