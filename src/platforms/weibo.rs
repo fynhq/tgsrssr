@@ -1000,18 +1000,22 @@ fn render_md_inline(text: &str) -> String {
     let mut dropped_urls: Vec<String> = Vec::new();
     for (i, (link_text, url)) in links.iter().enumerate() {
         let token = format!("\u{FFFE}L{}\u{FFFE}", i);
+        let label = crate::htmltext::escape_html(&crate::htmltext::decode_entities(link_text));
+        let href = crate::htmltext::decode_entities(url);
         if link_text.is_empty() || url.is_empty() {
             dropped_urls.push(url.clone());
             s = s.replace(&token, "");
-        } else {
+        } else if crate::htmltext::is_safe_href(&href) {
             s = s.replace(
                 &token,
                 &format!(
                     "<a href=\"{}\">{}</a>",
-                    crate::htmltext::escape_attr(&crate::htmltext::decode_entities(url)),
-                    crate::htmltext::escape_html(&crate::htmltext::decode_entities(link_text))
+                    crate::htmltext::escape_attr(&href),
+                    label
                 ),
             );
+        } else {
+            s = s.replace(&token, &label);
         }
     }
     if !dropped_urls.is_empty() {
@@ -1035,7 +1039,7 @@ fn render_weibo_markdown(text: &str) -> String {
     let text = RE_MD_ANCHOR
         .replace_all(&text, |caps: &regex::Captures| {
             let idx = anchors.len();
-            anchors.push(caps[0].to_string());
+            anchors.push(crate::fetcher::html_to_telegram_html(&caps[0]));
             format!("\u{FFFC}{}\u{FFFC}", idx)
         })
         .to_string();
@@ -1793,6 +1797,14 @@ mod tests {
     }
 
     #[test]
+    fn md_unsafe_links_keep_label_only() {
+        let out = render_weibo_markdown("[这里](javascript:alert(1))");
+        assert!(out.contains("这里"), "out: {out}");
+        assert!(!out.contains("javascript:"), "out: {out}");
+        assert!(!out.contains("<a "), "out: {out}");
+    }
+
+    #[test]
     fn md_inline_code_wins_over_link_syntax() {
         let out = render_weibo_markdown("`[x](https://example.com)`");
         assert!(
@@ -1814,6 +1826,10 @@ mod tests {
             "out: {}",
             out
         );
+        let unsafe_out = render_weibo_markdown(r#"<a href="javascript:alert(1)">危险</a>"#);
+        assert!(unsafe_out.contains("危险"), "out: {unsafe_out}");
+        assert!(!unsafe_out.contains("javascript:"), "out: {unsafe_out}");
+        assert!(!unsafe_out.contains("<a "), "out: {unsafe_out}");
     }
 
     #[test]

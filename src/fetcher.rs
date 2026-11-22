@@ -436,7 +436,7 @@ pub fn entry_link(entry: &Entry) -> Option<String> {
         .links
         .iter()
         .map(|l| l.href.trim())
-        .find(|href| !href.is_empty())
+        .find(|href| !href.is_empty() && crate::htmltext::is_safe_href(href))
         .map(|href| href.to_string())
 }
 
@@ -1027,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_link_skips_blank_hrefs() {
+    fn entry_link_skips_blank_and_unsafe_hrefs() {
         use feed_rs::model::{Entry, Link};
         let empty_link = |href: &str| Link {
             href: href.into(),
@@ -1049,6 +1049,7 @@ mod tests {
             links: vec![
                 empty_link("  "),
                 empty_link(""),
+                empty_link("javascript:alert(1)"),
                 empty_link("https://example.com/x"),
             ],
             summary: None,
