@@ -15,10 +15,26 @@ pub const MOBILE_BROWSER_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 27_0 lik
 
 pub const PLATFORM_COMMAND_CONCURRENCY: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteKind {
     Insecure,
+    DirectInsecure,
     Direct,
     Proxy,
+}
+
+fn route_choice(insecure: bool, has_proxy: bool, no_proxy_hit: bool) -> (RouteKind, bool) {
+    if insecure {
+        if has_proxy && !no_proxy_hit {
+            (RouteKind::Insecure, true)
+        } else {
+            (RouteKind::DirectInsecure, false)
+        }
+    } else if has_proxy && !no_proxy_hit {
+        (RouteKind::Proxy, true)
+    } else {
+        (RouteKind::Direct, false)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +125,7 @@ pub struct AppState {
     pub db: Db,
     pub media: reqwest::Client,
     pub media_direct: reqwest::Client,
+    pub media_direct_insecure: reqwest::Client,
     pub media_insecure: reqwest::Client,
     pub media_trusted: reqwest::Client,
     pub media_trusted_insecure: reqwest::Client,
@@ -173,6 +190,7 @@ impl AppState {
         let has_proxy = proxy.is_some();
 
         let media_direct = build_client(None, false, false, true)?;
+        let media_direct_insecure = build_client(None, true, false, true)?;
         let media = if has_proxy {
             build_client(proxy, false, false, false)?
         } else {
@@ -198,6 +216,7 @@ impl AppState {
             bot_username,
             media,
             media_direct,
+            media_direct_insecure,
             media_insecure,
             media_trusted,
             media_trusted_insecure,
@@ -233,19 +252,17 @@ impl AppState {
             return Ok(());
         }
         let via_proxy = self.is_routed_via_proxy(url);
+        if via_proxy {
+            if let Some(host) = proxy_target_denied(url) {
+                anyhow::bail!("blocked: internal-looking host via proxy: {}", host)
+            }
+        }
         match crate::ssrf::ssrf_check(url).await {
             crate::ssrf::SsrfOutcome::Allowed => Ok(()),
             crate::ssrf::SsrfOutcome::Private => {
                 anyhow::bail!("blocked: private/loopback address: {}", url)
             }
             crate::ssrf::SsrfOutcome::LookupFailed if via_proxy => {
-                let host = url::Url::parse(url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
-                    .unwrap_or_default();
-                if crate::ssrf::proxy_host_denied(&host) {
-                    anyhow::bail!("blocked: internal-looking host via proxy: {}", host)
-                }
                 tracing::warn!(
                     url = %url,
                     kind = kind,
@@ -315,18 +332,10 @@ impl AppState {
             .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
             .unwrap_or_default();
 
-        if crate::config::host_matches_exact(&host, &self.config.rss_insecure_hosts) {
-            return (RouteKind::Insecure, self.config.rss_proxy.is_some());
-        }
-
-        if self.config.rss_proxy.is_none() {
-            return (RouteKind::Direct, false);
-        }
-        if crate::config::host_in_list(&host, &self.config.rss_no_proxy) {
-            (RouteKind::Direct, false)
-        } else {
-            (RouteKind::Proxy, true)
-        }
+        let insecure = crate::config::host_matches_exact(&host, &self.config.rss_insecure_hosts);
+        let no_proxy_hit = self.config.rss_proxy.is_some()
+            && crate::config::host_in_list(&host, &self.config.rss_no_proxy);
+        route_choice(insecure, self.config.rss_proxy.is_some(), no_proxy_hit)
     }
 
     pub fn media_client_for_url(&self, url: &str) -> &reqwest::Client {
@@ -337,6 +346,7 @@ impl AppState {
         let (kind, via_proxy) = self.route_kind(url);
         let client = match kind {
             RouteKind::Insecure => &self.media_insecure,
+            RouteKind::DirectInsecure => &self.media_direct_insecure,
             RouteKind::Direct => &self.media_direct,
             RouteKind::Proxy => &self.media,
         };
@@ -346,6 +356,11 @@ impl AppState {
     pub fn is_routed_via_proxy(&self, url: &str) -> bool {
         self.route_kind(url).1
     }
+}
+
+fn proxy_target_denied(url: &str) -> Option<String> {
+    let host = url::Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
+    crate::ssrf::proxy_host_denied(&host).then_some(host)
 }
 
 // The trusted private allowlist is exact host:port; subdomains never inherit an entry.
@@ -391,6 +406,39 @@ mod tests {
             "released permit must be reusable"
         );
         drop(second);
+    }
+
+    #[test]
+    fn route_matrix_respects_no_proxy_and_tls_exemption() {
+        assert_eq!(
+            route_choice(true, true, true),
+            (RouteKind::DirectInsecure, false)
+        );
+        assert_eq!(route_choice(true, true, false), (RouteKind::Insecure, true));
+        assert_eq!(
+            route_choice(true, false, false),
+            (RouteKind::DirectInsecure, false)
+        );
+        assert_eq!(route_choice(false, true, true), (RouteKind::Direct, false));
+        assert_eq!(route_choice(false, true, false), (RouteKind::Proxy, true));
+        assert_eq!(
+            route_choice(false, false, false),
+            (RouteKind::Direct, false)
+        );
+    }
+
+    #[test]
+    fn proxy_target_denial_covers_internal_names_even_with_public_dns() {
+        assert_eq!(
+            proxy_target_denied("http://rsshub/feed").as_deref(),
+            Some("rsshub")
+        );
+        assert_eq!(
+            proxy_target_denied("https://service.internal/path").as_deref(),
+            Some("service.internal")
+        );
+        assert!(proxy_target_denied("https://example.com/feed").is_none());
+        assert!(proxy_target_denied("not a url").is_none());
     }
 
     #[test]

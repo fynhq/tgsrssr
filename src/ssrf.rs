@@ -33,7 +33,9 @@ async fn lookup_classify(host: &str, port: u16) -> (SsrfOutcome, Vec<SocketAddr>
 }
 
 fn classify_addrs(addrs: &[SocketAddr]) -> SsrfOutcome {
-    if addrs.iter().any(|sa| is_private_ip(&sa.ip())) {
+    if addrs.is_empty() {
+        SsrfOutcome::LookupFailed
+    } else if addrs.iter().any(|sa| is_private_ip(&sa.ip())) {
         SsrfOutcome::Private
     } else {
         SsrfOutcome::Allowed
@@ -193,6 +195,11 @@ mod tests {
 
     fn sa(ip: &str, port: u16) -> SocketAddr {
         SocketAddr::new(ip.parse::<IpAddr>().unwrap(), port)
+    }
+
+    #[test]
+    fn classify_empty_lookup_failed() {
+        assert_eq!(classify_addrs(&[]), SsrfOutcome::LookupFailed);
     }
 
     #[test]
