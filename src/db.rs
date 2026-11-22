@@ -23,6 +23,25 @@ pub use subs::*;
 
 pub type Db = SqlitePool;
 
+pub(crate) fn push_delivery_owner_filter(
+    qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    alias: &str,
+    owner_ids: &[i64],
+) {
+    qb.push(format!("({alias}.added_by IS NULL"));
+    if !owner_ids.is_empty() {
+        qb.push(format!(" OR {alias}.added_by IN ("));
+        {
+            let mut separated = qb.separated(", ");
+            for id in owner_ids {
+                separated.push_bind(id.to_string());
+            }
+        }
+        qb.push(")");
+    }
+    qb.push(")");
+}
+
 pub mod setting_key {
     pub const COOKIE_PREFIX: &str = "cookie:";
     pub const COOKIE_EXPIRED_NOTIFIED_PREFIX: &str = "cookie_expired_notified:";
@@ -453,7 +472,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (total, due) = get_due_subscriptions(&pool).await.unwrap();
+        let (total, due) = get_due_subscriptions(&pool, &[7, 8]).await.unwrap();
         assert_eq!(total, 1);
         assert_eq!(due.len(), 1);
         let (sub, cfg) = &due[0];
@@ -594,7 +613,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO subscriptions (chat_id, feed_url, active) VALUES ('1', 'https://example.com/feed', 0)",
+            "INSERT INTO subscriptions (chat_id, feed_url, active) VALUES ('1', 'https://example.com/feed', 1)",
         )
         .execute(&pool)
         .await
@@ -618,20 +637,34 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("UPDATE subscriptions SET active = 0 WHERE chat_id = '1'")
+            .execute(&pool)
+            .await
+            .unwrap();
 
-        assert!(outbox_due_ids(&pool, 1, 10).await.unwrap().is_empty());
+        assert!(outbox_due_ids(&pool, 1, 10, &[42])
+            .await
+            .unwrap()
+            .is_empty());
         sqlx::query("UPDATE subscriptions SET active = 1 WHERE chat_id = '1'")
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(outbox_due_ids(&pool, 1, 10).await.unwrap().len(), 1);
+        assert_eq!(outbox_due_ids(&pool, 1, 10, &[42]).await.unwrap().len(), 1);
+        assert!(
+            outbox_due_ids(&pool, 1, 10, &[7]).await.unwrap().is_empty(),
+            "outbox must not deliver after the owner loses whitelist access"
+        );
 
         assert!(set_chat_enabled(&pool, "1", false).await.unwrap());
-        assert!(outbox_due_ids(&pool, 1, 10).await.unwrap().is_empty());
+        assert!(outbox_due_ids(&pool, 1, 10, &[42])
+            .await
+            .unwrap()
+            .is_empty());
         assert!(!can_manage_chat(&pool, 42, "1").await.unwrap());
         assert!(set_chat_enabled(&pool, "1", true).await.unwrap());
         assert!(can_manage_chat(&pool, 42, "1").await.unwrap());
-        assert_eq!(outbox_due_ids(&pool, 1, 10).await.unwrap().len(), 1);
+        assert_eq!(outbox_due_ids(&pool, 1, 10, &[42]).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -664,7 +697,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let due_ids = outbox_due_ids(&pool, 1, 10).await.unwrap();
+        let due_ids = outbox_due_ids(&pool, 1, 10, &[42]).await.unwrap();
         assert_eq!(due_ids.len(), 1);
         let row = outbox_get(&pool, due_ids[0]).await.unwrap().unwrap();
         assert_eq!(row.first_attempt_at, None);
@@ -672,7 +705,7 @@ mod tests {
         outbox_update_retry(&pool, row.id, 1, 5, 123, "boom")
             .await
             .unwrap();
-        let due_ids = outbox_due_ids(&pool, 5, 10).await.unwrap();
+        let due_ids = outbox_due_ids(&pool, 5, 10, &[7]).await.unwrap();
         let row = outbox_get(&pool, due_ids[0]).await.unwrap().unwrap();
         assert_eq!(row.attempts, 1);
         assert_eq!(row.first_attempt_at, Some(123));
@@ -681,7 +714,7 @@ mod tests {
         outbox_update_retry(&pool, row.id, 2, 10, 456, "still boom")
             .await
             .unwrap();
-        let due_ids = outbox_due_ids(&pool, 10, 10).await.unwrap();
+        let due_ids = outbox_due_ids(&pool, 10, 10, &[7]).await.unwrap();
         let row = outbox_get(&pool, due_ids[0]).await.unwrap().unwrap();
         assert_eq!(row.attempts, 2);
         assert_eq!(row.first_attempt_at, Some(123));
@@ -689,6 +722,86 @@ mod tests {
 
         outbox_delete(&pool, row.id).await.unwrap();
         assert!(outbox_get(&pool, row.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn outbox_insert_requires_active_subscription() {
+        let pool = test_pool().await;
+        insert_chat(&pool, "1", "7", 1).await;
+        sqlx::query(
+            "INSERT INTO subscriptions (chat_id, feed_url, active) VALUES ('1', 'https://example.com/paused', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let inserted = outbox_insert(
+            &pool,
+            "1",
+            "https://example.com/paused",
+            "e1",
+            "Feed",
+            "{}",
+            "[]",
+            "",
+            "title_link",
+            "source",
+            true,
+            false,
+            None,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(!inserted);
+        assert!(outbox_entry_ids(&pool, "1", "https://example.com/paused")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_outbox_for_ineligible_owner_is_purged() {
+        let pool = test_pool().await;
+        insert_chat(&pool, "allowed", "7", 1).await;
+        insert_chat(&pool, "revoked", "9", 1).await;
+        insert_sub(&pool, "allowed", "https://example.com/allowed", None).await;
+        insert_sub(&pool, "revoked", "https://example.com/revoked", None).await;
+        for (chat_id, entry_id, created_at) in [
+            ("allowed", "old-allowed", 1),
+            ("revoked", "old-revoked", 1),
+            ("revoked", "new-revoked", 101),
+        ] {
+            sqlx::query(
+                "INSERT INTO outbox (chat_id, feed_url, entry_id, feed_title, entry_json, media_json, meta_json, content_mode, source_display, next_retry_at, created_at) \
+                 VALUES (?, ?, ?, 'Feed', '{}', '[]', '', 'title_link', 'source', 0, ?)",
+            )
+            .bind(chat_id)
+            .bind(format!("https://example.com/{chat_id}"))
+            .bind(entry_id)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let deleted = delete_ineligible_owner_outbox_before(&pool, 100, &[7])
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            outbox_entry_ids(&pool, "allowed", "https://example.com/allowed")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            outbox_entry_ids(&pool, "revoked", "https://example.com/revoked")
+                .await
+                .unwrap()
+                .contains("new-revoked")
+        );
     }
 
     #[tokio::test]
@@ -842,6 +955,8 @@ mod tests {
             content_hash: "h".into(),
             is_retweet: false,
         };
+        insert_chat(&pool, "1", "7", 1).await;
+        insert_sub(&pool, "1", "https://example.com/feed", None).await;
         let media_json = serde_json::to_string(&vec![item]).unwrap();
         for (entry, media) in [("with-media", media_json.as_str()), ("empty", "[]")] {
             outbox_insert(
@@ -876,6 +991,8 @@ mod tests {
     #[tokio::test]
     async fn entry_dedup_state_reports_sent_and_queued() {
         let pool = test_pool().await;
+        insert_chat(&pool, "1", "7", 1).await;
+        insert_sub(&pool, "1", "https://example.com/feed", None).await;
 
         mark_entry_sent(&pool, "1", "https://example.com/feed", "sent-entry")
             .await
@@ -1069,7 +1186,7 @@ mod tests {
         )
         .await;
 
-        let (total, due) = get_due_subscriptions(&pool).await.unwrap();
+        let (total, due) = get_due_subscriptions(&pool, &[7, 8]).await.unwrap();
         let urls: Vec<&str> = due.iter().map(|(s, _)| s.feed_url.as_str()).collect();
         assert_eq!(
             urls,
@@ -1085,8 +1202,88 @@ mod tests {
         for i in 0..MAX_DUE_PER_CYCLE {
             insert_sub(&pool, "1", &format!("https://example.com/bulk/{}", i), None).await;
         }
-        let (total, due) = get_due_subscriptions(&pool).await.unwrap();
+        let (total, due) = get_due_subscriptions(&pool, &[7, 8]).await.unwrap();
         assert_eq!(due.len() as i64, MAX_DUE_PER_CYCLE);
         assert!(total > MAX_DUE_PER_CYCLE);
+    }
+
+    #[tokio::test]
+    async fn auto_heal_clears_both_source_notification_keys() {
+        let pool = test_pool().await;
+        insert_chat(&pool, "1", "7", 1).await;
+        sqlx::query(
+            "INSERT INTO subscriptions (chat_id, feed_url, active, auto_disabled, disabled_at) \
+             VALUES ('1', 'https://example.com/feed', 0, 1, '2020-01-01 00:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let send_fail = setting_key::send_fail("1", "https://example.com/feed");
+        let notified = setting_key::auto_disable_notified("1", "https://example.com/feed");
+        set_setting(&pool, &send_fail, "1").await.unwrap();
+        set_setting(&pool, &notified, "1").await.unwrap();
+
+        assert_eq!(reenable_due_auto_disabled(&pool, 3).await.unwrap(), 1);
+        assert!(get_setting(&pool, &send_fail).await.unwrap().is_none());
+        assert!(get_setting(&pool, &notified).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn resubscribe_clears_old_outbox_and_marks_current_window() {
+        let pool = test_pool().await;
+        insert_chat(&pool, "1", "7", 1).await;
+        insert_sub(&pool, "1", "https://example.com/feed", None).await;
+        outbox_insert(
+            &pool,
+            "1",
+            "https://example.com/feed",
+            "old",
+            "Feed",
+            "{}",
+            "[]",
+            "",
+            "title_link",
+            "source",
+            true,
+            false,
+            None,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        add_subscription_with_sent(
+            &pool,
+            "1",
+            "https://example.com/feed",
+            Some("Feed"),
+            &["new".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(outbox_entry_ids(&pool, "1", "https://example.com/feed")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(is_entry_sent(&pool, "1", "https://example.com/feed", "new")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn delivery_queries_exclude_revoked_chat_owners() {
+        let pool = test_pool().await;
+        insert_chat(&pool, "allowed", "7", 1).await;
+        insert_chat(&pool, "revoked", "9", 1).await;
+        insert_sub(&pool, "allowed", "https://example.com/allowed", None).await;
+        insert_sub(&pool, "revoked", "https://example.com/revoked", None).await;
+
+        let (_, due) = get_due_subscriptions(&pool, &[7]).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0.chat_id, "allowed");
+
+        let active = active_subscription_urls(&pool, &[7]).await.unwrap();
+        assert_eq!(active, vec!["https://example.com/allowed"]);
     }
 }

@@ -292,6 +292,7 @@ mod tests {
     }
 
     const DYNAMIC_KEYS: &[&str] = &[
+        "notif_entry_unreadable",
         "back",
         "chpage_back",
         "chpage_header",

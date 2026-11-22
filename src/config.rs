@@ -151,6 +151,14 @@ impl Config {
         is_allowed_by_ids(self.admin_user_id, &self.allowed_user_ids, user_id)
     }
 
+    pub fn allowed_owner_ids(&self) -> Vec<i64> {
+        let mut ids = self.allowed_user_ids.clone();
+        if !ids.contains(&self.admin_user_id) {
+            ids.push(self.admin_user_id);
+        }
+        ids
+    }
+
     pub fn is_admin(&self, user_id: i64) -> bool {
         self.admin_user_id == user_id
     }

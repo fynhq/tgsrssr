@@ -43,7 +43,17 @@ pub async fn outbox_insert(
     created_at: i64,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
-        "INSERT OR IGNORE INTO outbox (chat_id, feed_url, entry_id, feed_title, entry_json, media_json, meta_json, content_mode, source_display, link_preview, caption_above_media, author, next_retry_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        r#"INSERT OR IGNORE INTO outbox
+             (chat_id, feed_url, entry_id, feed_title, entry_json, media_json, meta_json,
+              content_mode, source_display, link_preview, caption_above_media, author,
+              next_retry_at, created_at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+            WHERE EXISTS (
+              SELECT 1
+                FROM chats ch
+                JOIN subscriptions s ON s.chat_id = ch.chat_id AND s.feed_url = ?2
+               WHERE ch.chat_id = ?1 AND ch.enabled = 1 AND s.active = 1
+            )"#,
     )
     .bind(chat_id)
     .bind(feed_url)
@@ -64,23 +74,29 @@ pub async fn outbox_insert(
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn outbox_due_ids(db: &Db, now_ts: i64, limit: i64) -> anyhow::Result<Vec<i64>> {
-    let rows = sqlx::query_scalar::<_, i64>(
+pub async fn outbox_due_ids(
+    db: &Db,
+    now_ts: i64,
+    limit: i64,
+    allowed_owner_ids: &[i64],
+) -> anyhow::Result<Vec<i64>> {
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         r#"SELECT o.id
              FROM outbox o
              JOIN chats ch
                ON ch.chat_id = o.chat_id AND ch.enabled = 1
              JOIN subscriptions s
                ON s.chat_id = o.chat_id AND s.feed_url = o.feed_url AND s.active = 1
-            WHERE o.next_retry_at <= ?
-            ORDER BY o.next_retry_at ASC, o.id ASC
-            LIMIT ?"#,
-    )
-    .bind(now_ts)
-    .bind(limit)
-    .fetch_all(db)
-    .await?;
-    Ok(rows)
+            WHERE o.next_retry_at <= "#,
+    );
+    qb.push_bind(now_ts).push(" AND ");
+    super::push_delivery_owner_filter(&mut qb, "ch", allowed_owner_ids);
+    qb.push(" ORDER BY o.next_retry_at ASC, o.id ASC LIMIT ")
+        .push_bind(limit);
+    qb.build_query_scalar::<i64>()
+        .fetch_all(db)
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn outbox_count_for_feed(db: &Db, chat_id: &str, feed_url: &str) -> anyhow::Result<i64> {
@@ -99,6 +115,20 @@ pub async fn delete_outbox_for_chat(db: &Db, chat_id: &str) -> anyhow::Result<u6
         .bind(chat_id)
         .execute(db)
         .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn delete_ineligible_owner_outbox_before(
+    db: &Db,
+    before: i64,
+    allowed_owner_ids: &[i64],
+) -> anyhow::Result<u64> {
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("DELETE FROM outbox WHERE created_at < ");
+    qb.push_bind(before)
+        .push(" AND NOT EXISTS (SELECT 1 FROM chats ch WHERE ch.chat_id = outbox.chat_id AND ");
+    super::push_delivery_owner_filter(&mut qb, "ch", allowed_owner_ids);
+    qb.push(")");
+    let result = qb.build().execute(db).await?;
     Ok(result.rows_affected())
 }
 

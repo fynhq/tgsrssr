@@ -141,6 +141,7 @@ struct PlatRoundStats {
     ok: tokio::sync::Mutex<std::collections::HashSet<&'static str>>,
     last_err: tokio::sync::Mutex<std::collections::HashMap<&'static str, String>>,
     active_counts: std::collections::HashMap<&'static str, usize>,
+    active_counts_valid: bool,
 }
 
 async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
@@ -158,8 +159,9 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         return Ok(());
     }
     let _guard = crate::state::ActiveFlagGuard(state.fetch_cycle_active.clone());
+    let allowed_owner_ids = state.config.allowed_owner_ids();
 
-    let (total_due, due) = db::get_due_subscriptions(&state.db).await?;
+    let (total_due, due) = db::get_due_subscriptions(&state.db, &allowed_owner_ids).await?;
     if due.is_empty() {
         return Ok(());
     }
@@ -172,7 +174,12 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         "fetch cycle: due subscriptions selected"
     );
 
-    let active_counts = match db::active_subscription_urls(&state.db).await {
+    let (active_counts, active_counts_valid) = match db::active_subscription_urls(
+        &state.db,
+        &allowed_owner_ids,
+    )
+    .await
+    {
         Ok(urls) => {
             let mut counts: std::collections::HashMap<&'static str, usize> =
                 std::collections::HashMap::new();
@@ -181,15 +188,16 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
                     *counts.entry(p).or_insert(0) += 1;
                 }
             }
-            counts
+            (counts, true)
         }
         Err(e) => {
-            warn!(error = %e, "active subscription count failed; platform health uses the due sample only");
-            std::collections::HashMap::new()
+            warn!(error = %e, "active subscription count failed; skipping platform health this round");
+            (std::collections::HashMap::new(), false)
         }
     };
     let stats = std::sync::Arc::new(PlatRoundStats {
         active_counts,
+        active_counts_valid,
         ..PlatRoundStats::default()
     });
 
@@ -272,6 +280,9 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     );
 
     const HYSTERESIS_ROUNDS: i64 = 2;
+    if !stats.active_counts_valid {
+        return Ok(());
+    }
     let seen = stats.seen.lock().await.clone();
     let failed = stats.failed.lock().await.clone();
     let ok_set = stats.ok.lock().await.clone();
@@ -1018,14 +1029,8 @@ async fn resolve_feed_owner(
     state: &AppState,
     sub: &db::SubRow,
     stats: &PlatRoundStats,
-) -> Option<FeedOwnerCtx> {
-    let owner_id = match db::get_chat_owner(&state.db, &sub.chat_id).await {
-        Ok(o) => o,
-        Err(e) => {
-            warn!(chat_id = %sub.chat_id, error = %e, "get_chat_owner failed, treating as no owner");
-            None
-        }
-    };
+) -> anyhow::Result<Option<FeedOwnerCtx>> {
+    let owner_id = db::get_chat_owner(&state.db, &sub.chat_id).await?;
     if let Some(owner) = owner_id {
         if !state.config.is_allowed(owner) {
             info!(
@@ -1034,7 +1039,7 @@ async fn resolve_feed_owner(
                 feed = %sub.feed_url,
                 "subscription owner is no longer whitelisted; skipping feed"
             );
-            return None;
+            return Ok(None);
         }
     }
     let lang = match owner_id {
@@ -1048,11 +1053,11 @@ async fn resolve_feed_owner(
     if let Some(p) = platform_of_url(&sub.feed_url) {
         *stats.seen.lock().await.entry(p).or_insert(0) += 1;
     }
-    Some(FeedOwnerCtx {
+    Ok(Some(FeedOwnerCtx {
         owner_id,
         lang,
         allow_trusted_private,
-    })
+    }))
 }
 
 enum FeedFetchError {
@@ -1125,7 +1130,7 @@ async fn process_feed(
     stats: &PlatRoundStats,
 ) -> anyhow::Result<FeedStatus> {
     let transport = crate::media::MediaTransport::new(&state.config);
-    let Some(owner) = resolve_feed_owner(state, &sub, stats).await else {
+    let Some(owner) = resolve_feed_owner(state, &sub, stats).await? else {
         return Ok(FeedStatus::Ok);
     };
     let FeedOwnerCtx {
@@ -1680,7 +1685,23 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
     let _guard = crate::state::ActiveFlagGuard(state.outbox_retry_active.clone());
 
     let now = Timestamp::now().as_second();
-    let due_ids = db::outbox_due_ids(&state.db, now, OUTBOX_BATCH_LIMIT).await?;
+    let allowed_owner_ids = state.config.allowed_owner_ids();
+    match db::delete_ineligible_owner_outbox_before(
+        &state.db,
+        now.saturating_sub(OUTBOX_UNATTEMPTED_MAX_SECS),
+        &allowed_owner_ids,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => debug!(
+            count = n,
+            "silently removed outbox rows for ineligible owners"
+        ),
+        Err(e) => warn!(error = %e, "failed to purge ineligible-owner outbox rows"),
+    }
+    let due_ids =
+        db::outbox_due_ids(&state.db, now, OUTBOX_BATCH_LIMIT, &allowed_owner_ids).await?;
     if due_ids.is_empty() {
         return Ok(());
     }
@@ -1748,10 +1769,8 @@ async fn run_outbox_retry(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
             Ok(e) => e,
             Err(e) => {
                 error!(entry_id = %row.entry_id, error = %e, "outbox: failed to deserialize entry");
-                if let Err(e) = db::outbox_delete(&state.db, row.id).await {
-                    warn!(entry_id = %row.entry_id, error = %e, "outbox: failed to delete entry");
-                }
-                dropped += 1;
+                abandon_outbox_row(bot, state, &row, "notif_entry_unreadable").await;
+                abandoned += 1;
                 continue;
             }
         };

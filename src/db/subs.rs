@@ -4,16 +4,21 @@ use super::chats::{
 use super::*;
 use sqlx::Row;
 
-pub async fn active_subscription_urls(db: &Db) -> anyhow::Result<Vec<String>> {
-    let rows = sqlx::query_scalar::<_, String>(
+pub async fn active_subscription_urls(
+    db: &Db,
+    allowed_owner_ids: &[i64],
+) -> anyhow::Result<Vec<String>> {
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         "SELECT s.feed_url
            FROM subscriptions s
            JOIN chats ch ON ch.chat_id = s.chat_id AND ch.enabled = 1
-          WHERE s.active = 1",
-    )
-    .fetch_all(db)
-    .await?;
-    Ok(rows)
+          WHERE s.active = 1 AND ",
+    );
+    super::push_delivery_owner_filter(&mut qb, "ch", allowed_owner_ids);
+    qb.build_query_scalar::<String>()
+        .fetch_all(db)
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn count_subscriptions_per_chat(
@@ -107,6 +112,11 @@ pub async fn add_subscription_with_sent(
     .await?;
     sqlx::query("DELETE FROM settings WHERE key = ?")
         .bind(setting_key::send_fail(chat_id, feed_url))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM outbox WHERE chat_id = ? AND feed_url = ?")
+        .bind(chat_id)
+        .bind(feed_url)
         .execute(&mut *tx)
         .await?;
     for eid in entry_ids {
@@ -371,18 +381,23 @@ pub async fn auto_disable_subscription(db: &Db, sub_id: i64) -> anyhow::Result<b
 
 pub async fn reenable_due_auto_disabled(db: &Db, cooldown_hours: i64) -> anyhow::Result<u64> {
     let mut tx = db.begin().await?;
-    sqlx::query(
-        r#"DELETE FROM settings WHERE key IN (
-             SELECT ? || chat_id || ':' || feed_url FROM subscriptions
-             WHERE active = 0 AND auto_disabled = 1
-               AND disabled_at IS NOT NULL
-               AND (julianday('now') - julianday(disabled_at)) * 24 >= ?
-           )"#,
-    )
-    .bind(setting_key::SEND_FAIL_PREFIX)
-    .bind(cooldown_hours)
-    .execute(&mut *tx)
-    .await?;
+    for prefix in [
+        setting_key::SEND_FAIL_PREFIX,
+        setting_key::AUTO_DISABLE_NOTIFIED_PREFIX,
+    ] {
+        sqlx::query(
+            r#"DELETE FROM settings WHERE key IN (
+                 SELECT ? || chat_id || ':' || feed_url FROM subscriptions
+                 WHERE active = 0 AND auto_disabled = 1
+                   AND disabled_at IS NOT NULL
+                   AND (julianday('now') - julianday(disabled_at)) * 24 >= ?
+               )"#,
+        )
+        .bind(prefix)
+        .bind(cooldown_hours)
+        .execute(&mut *tx)
+        .await?;
+    }
     let res = sqlx::query(
         r#"UPDATE subscriptions
            SET active = 1, auto_disabled = 0, disabled_at = NULL, error_count = 0, last_error = NULL
@@ -461,8 +476,9 @@ pub const MAX_DUE_PER_CYCLE: i64 = 200;
 
 pub async fn get_due_subscriptions(
     db: &Db,
+    allowed_owner_ids: &[i64],
 ) -> anyhow::Result<(i64, Vec<(SubRow, EffectiveConfig)>)> {
-    let sql = format!(
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
         r#"SELECT COUNT(*) OVER() AS due_total,
                   s.id, s.chat_id, s.feed_url, s.feed_title, s.title_overridden, s.original_title, s.active, s.error_count, s.last_fetch_at, s.last_error,
                   s.http_etag, s.http_last_modified, s.auto_disabled, s.disabled_at,
@@ -471,15 +487,16 @@ pub async fn get_due_subscriptions(
            LEFT JOIN chat_configs c ON c.chat_id = s.chat_id
            LEFT JOIN feed_configs f ON f.chat_id = s.chat_id AND f.feed_url = s.feed_url
            JOIN chats ch ON ch.chat_id = s.chat_id AND ch.enabled = 1
-           WHERE s.active = 1
-             AND (s.last_fetch_at IS NULL OR (julianday('now') - julianday(s.last_fetch_at)) * 1440 >= COALESCE(f.interval_minutes, c.interval_minutes, 30))
+           WHERE s.active = 1 AND "#
+    ));
+    super::push_delivery_owner_filter(&mut qb, "ch", allowed_owner_ids);
+    qb.push(
+        r#" AND (s.last_fetch_at IS NULL OR (julianday('now') - julianday(s.last_fetch_at)) * 1440 >= COALESCE(f.interval_minutes, c.interval_minutes, 30))
            ORDER BY (s.last_fetch_at IS NOT NULL) ASC, s.last_fetch_at ASC, s.id ASC
-           LIMIT ?"#
+           LIMIT "#,
     );
-    let rows = sqlx::query_as::<_, DueRow>(sqlx::AssertSqlSafe(sql))
-        .bind(MAX_DUE_PER_CYCLE)
-        .fetch_all(db)
-        .await?;
+    qb.push_bind(MAX_DUE_PER_CYCLE);
+    let rows = qb.build_query_as::<DueRow>().fetch_all(db).await?;
 
     let total = rows.first().map(|r| r.due_total).unwrap_or(0);
     Ok((total, rows.into_iter().map(|r| (r.sub, r.cfg)).collect()))
