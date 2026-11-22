@@ -8,14 +8,21 @@ pub struct FilterConfig {
     pub keywords: String,
 }
 
+const FILTER_SEPARATORS: [char; 4] = [',', '，', ';', '；'];
+
 impl FilterConfig {
+    pub fn has_any_keyword(text: &str) -> bool {
+        text.split(FILTER_SEPARATORS)
+            .any(|keyword| !keyword.trim().is_empty())
+    }
+
     pub fn is_active(&self) -> bool {
-        self.enabled && !self.keywords.trim().is_empty()
+        self.enabled && Self::has_any_keyword(&self.keywords)
     }
 
     pub fn keyword_list(&self) -> Vec<String> {
         self.keywords
-            .split([',', '，', ';', '；'])
+            .split(FILTER_SEPARATORS)
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .collect()
@@ -123,4 +130,22 @@ pub async fn clear_feed_filter(db: &Db, chat_id: &str, feed_url: &str) -> anyhow
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FilterConfig;
+
+    #[test]
+    fn delimiter_only_keywords_are_not_active() {
+        let cfg = FilterConfig {
+            enabled: true,
+            mode: "whitelist".to_string(),
+            keywords: " ,，;； ".to_string(),
+        };
+        assert!(!cfg.is_active());
+        assert!(cfg.keyword_list().is_empty());
+        assert!(!FilterConfig::has_any_keyword(" ,，;； "));
+        assert!(FilterConfig::has_any_keyword(" , alpha； ; "));
+    }
 }

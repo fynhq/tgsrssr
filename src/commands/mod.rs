@@ -1024,13 +1024,13 @@ async fn handle_test(
     }
 
     if prepared.setup_failed {
-        let name = if feed_title.is_empty() {
-            &feed_url
-        } else {
-            &feed_title
-        };
-        let notice = i18n::t(lang, "notif_media_storage").replacen("{}", name, 1);
-        test_report(bot, msg.chat.id, progress_id, notice).await;
+        test_report(
+            bot,
+            msg.chat.id,
+            progress_id,
+            i18n::t(lang, "test_media_storage").to_string(),
+        )
+        .await;
         return Ok(());
     }
 
@@ -1593,6 +1593,16 @@ pub async fn handle_pending_op(
                         msg.chat.id,
                         prompt_msg_id,
                         &i18n::fill(i18n::t(lang, "fkw_too_long"), &[&limit]),
+                    )
+                    .await;
+                    return Ok(());
+                }
+                if !db::FilterConfig::has_any_keyword(text) {
+                    retire_prompt(
+                        bot,
+                        msg.chat.id,
+                        prompt_msg_id,
+                        i18n::t(lang, "fkw_invalid"),
                     )
                     .await;
                     return Ok(());

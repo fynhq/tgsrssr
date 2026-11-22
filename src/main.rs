@@ -276,7 +276,27 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
 
     let chat_id = msg.chat.id.0;
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-    let pending = state.pending_ops.lock().await.remove(&(chat_id, user_id));
+    let is_command = text.starts_with('/');
+    let is_channel_forward = matches!(
+        msg.forward_origin(),
+        Some(teloxide::types::MessageOrigin::Channel { .. })
+    );
+    let pending = {
+        let mut pending_ops = state.pending_ops.lock().await;
+        let key = (chat_id, user_id);
+        let keep_for_media = pending_ops.get(&key).is_some_and(|op| {
+            state.config.is_allowed(user_id)
+                && !op.is_expired()
+                && msg.text().is_none()
+                && !is_command
+                && !is_channel_forward
+        });
+        if keep_for_media {
+            None
+        } else {
+            pending_ops.remove(&key)
+        }
+    };
     if let Some(op) = pending {
         let lang = commands::user_lang(&state, user_id, Some(&msg)).await;
         if !state.config.is_allowed(user_id) {
@@ -290,11 +310,6 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
             return Ok(());
         }
         let expired = op.is_expired();
-        let is_command = Command::parse(text, &state.bot_username).is_ok();
-        let is_channel_forward = matches!(
-            msg.forward_origin(),
-            Some(teloxide::types::MessageOrigin::Channel { .. })
-        );
         if expired {
             let prompt_msg_id = op.prompt_msg_id();
             crate::commands::retire_prompt(
