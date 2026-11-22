@@ -60,7 +60,9 @@ services:
       # BOT_API_MEDIA_DIR: "/var/lib/telegram-bot-api-media"
 
       ## 默认空=官方 API；本地 bot-api 时设置，此时 BOT_PROXY 被忽略
+      ## 本地 bot-api 应只监听 127.0.0.1，勿在不可信网络中暴露其 HTTP 端口
       ## Empty = official API; set for a local bot-api, which makes BOT_PROXY ignored
+      ## Keep a local bot-api bound to 127.0.0.1; do not expose its HTTP port on untrusted networks
       # BOT_API_URL: "http://127.0.0.1:8081"
 
       ## Bot API 代理（http:// / socks5:// / socks5h://）；默认空=直连。

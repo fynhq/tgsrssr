@@ -34,12 +34,11 @@ RUN if [ -n "$CARGO_REGISTRY" ]; then \
       > /usr/local/cargo/config.toml; \
     fi
 
-# Cargo.lock is optional on first build; wildcard avoids failure if absent
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 
 # Create dummy source to cache dependency builds
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release || true
+RUN cargo build --release --locked || true
 RUN rm -rf src
 
 # Copy real source

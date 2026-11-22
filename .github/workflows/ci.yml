@@ -36,6 +36,17 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Check declared MSRV
+        run: cargo check --locked
+
   # ---------------------------------------------------------------------------
   # Public-surface guard: reject private-document references, local environment
   # narration, verification trailers, and local paths in new commit messages
