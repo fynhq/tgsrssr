@@ -381,22 +381,25 @@ pub async fn auto_disable_subscription(db: &Db, sub_id: i64) -> anyhow::Result<b
 
 pub async fn reenable_due_auto_disabled(db: &Db, cooldown_hours: i64) -> anyhow::Result<u64> {
     let mut tx = db.begin().await?;
-    for prefix in [
-        setting_key::SEND_FAIL_PREFIX,
-        setting_key::AUTO_DISABLE_NOTIFIED_PREFIX,
-    ] {
-        sqlx::query(
-            r#"DELETE FROM settings WHERE key IN (
-                 SELECT ? || chat_id || ':' || feed_url FROM subscriptions
-                 WHERE active = 0 AND auto_disabled = 1
-                   AND disabled_at IS NOT NULL
-                   AND (julianday('now') - julianday(disabled_at)) * 24 >= ?
-               )"#,
-        )
-        .bind(prefix)
-        .bind(cooldown_hours)
-        .execute(&mut *tx)
-        .await?;
+    let due: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT chat_id, feed_url FROM subscriptions
+           WHERE active = 0 AND auto_disabled = 1
+             AND disabled_at IS NOT NULL
+             AND (julianday('now') - julianday(disabled_at)) * 24 >= ?"#,
+    )
+    .bind(cooldown_hours)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (chat_id, feed_url) in &due {
+        for key in [
+            setting_key::send_fail(chat_id, feed_url),
+            setting_key::auto_disable_notified(chat_id, feed_url),
+        ] {
+            sqlx::query("DELETE FROM settings WHERE key = ?")
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
     let res = sqlx::query(
         r#"UPDATE subscriptions

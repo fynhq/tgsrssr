@@ -314,15 +314,27 @@ pub async fn cleanup_database(db_pool: &Db) -> anyhow::Result<()> {
     })
     .await;
     let r3 = step("media_dl_fail", || {
-        db::cleanup_stale_settings(db_pool, "media_dl_fail:", MEDIA_DL_FAIL_TTL_DAYS)
+        db::cleanup_stale_settings(
+            db_pool,
+            db::setting_key::MEDIA_DL_FAIL_PREFIX,
+            MEDIA_DL_FAIL_TTL_DAYS,
+        )
     })
     .await;
     let r4 = step("stale_zero", || {
-        db::cleanup_stale_settings(db_pool, "stale_zero:", STALE_ZERO_TTL_DAYS)
+        db::cleanup_stale_settings(
+            db_pool,
+            db::setting_key::STALE_ZERO_PREFIX,
+            STALE_ZERO_TTL_DAYS,
+        )
     })
     .await;
     let r5 = step("outbox_media_lost", || {
-        db::cleanup_stale_settings(db_pool, "outbox_media_lost:", OUTBOX_MEDIA_LOST_TTL_DAYS)
+        db::cleanup_stale_settings(
+            db_pool,
+            db::setting_key::OUTBOX_MEDIA_LOST_PREFIX,
+            OUTBOX_MEDIA_LOST_TTL_DAYS,
+        )
     })
     .await;
     let r6 = step("sent_messages", || {
