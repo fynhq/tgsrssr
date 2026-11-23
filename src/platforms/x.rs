@@ -1315,22 +1315,7 @@ fn tweet_text_to_html(text: &str) -> String {
             .find(|(_, c)| !c.is_ascii())
             .map(|(i, _)| i)
             .unwrap_or(raw.len());
-        let mut url = &raw[..ascii_len];
-        loop {
-            let before = url;
-            while url.ends_with(['.', ',', ';', '!', '?']) {
-                url = &url[..url.len() - 1];
-            }
-            for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
-                while url.ends_with(close) && url.matches(close).count() > url.matches(open).count()
-                {
-                    url = &url[..url.len() - close.len_utf8()];
-                }
-            }
-            if url.len() == before.len() {
-                break;
-            }
-        }
+        let url = crate::htmltext::trim_url_tail(&raw[..ascii_len]);
         out.push_str(&format!(
             "<a href=\"{}\">{}</a>",
             crate::htmltext::escape_attr(url),

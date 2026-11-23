@@ -108,6 +108,32 @@ pub fn truncate_text(s: &str, max_units: usize) -> String {
     format!("{}…", take_utf16_prefix(s, max_units.saturating_sub(1)))
 }
 
+// One owner for the trailing-punctuation rule when a bare URL is cut out of prose.
+pub fn trim_url_tail(raw: &str) -> &str {
+    fn count(s: &str, needle: char) -> usize {
+        s.chars().filter(|c| *c == needle).count()
+    }
+    let mut end = raw.len();
+    loop {
+        let s = &raw[..end];
+        let Some(last) = s.chars().next_back() else {
+            break;
+        };
+        let trim = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '&' => true,
+            ')' => count(s, ')') > count(s, '('),
+            ']' => count(s, ']') > count(s, '['),
+            '}' => count(s, '}') > count(s, '{'),
+            _ => false,
+        };
+        if !trim {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    &raw[..end]
+}
+
 // Truncation is visible-length based: keep anchors clickable, close an open <a>, drop empty links, and never split an entity.
 pub fn truncate_html_keep_links(html: &str, max_visible: usize) -> (String, bool) {
     let mut out = String::with_capacity(html.len().min(256));

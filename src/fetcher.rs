@@ -5,7 +5,7 @@ use anyhow::Context;
 use feed_rs::model::Entry;
 use url::Url;
 
-use crate::htmltext::{truncate_text, unescape_html, RE_TAG};
+use crate::htmltext::{trim_url_tail, truncate_text, unescape_html, RE_TAG};
 use crate::i18n::{self, Lang};
 use crate::state::AppState;
 
@@ -77,31 +77,6 @@ const BARE_URL_FILE_EXT: &[&str] = &[
     "sqlite",
 ];
 
-fn trim_bare_url_tail(raw: &str) -> &str {
-    fn count(s: &str, needle: char) -> usize {
-        s.chars().filter(|c| *c == needle).count()
-    }
-    let mut end = raw.len();
-    loop {
-        let s = &raw[..end];
-        let Some(last) = s.chars().next_back() else {
-            break;
-        };
-        let trim = match last {
-            '.' | ',' | ';' | ':' | '!' | '&' => true,
-            ')' => count(s, ')') > count(s, '('),
-            ']' => count(s, ']') > count(s, '['),
-            '}' => count(s, '}') > count(s, '{'),
-            _ => false,
-        };
-        if !trim {
-            break;
-        }
-        end -= last.len_utf8();
-    }
-    &raw[..end]
-}
-
 fn bare_url_can_start(text: &str, start: usize) -> bool {
     match text[..start].chars().next_back() {
         Some(c) => !(c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '.' | '/' | '-')),
@@ -142,7 +117,7 @@ fn linkify_bare_urls(text: &str, links: &mut Vec<(String, String)>) -> String {
             continue;
         }
         let raw = m.as_str();
-        let trimmed = trim_bare_url_tail(raw);
+        let trimmed = trim_url_tail(raw);
         if trimmed.is_empty() {
             continue;
         }
