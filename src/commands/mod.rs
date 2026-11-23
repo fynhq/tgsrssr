@@ -1171,8 +1171,7 @@ pub async fn handle_find(
     let target: Option<(String, i64)> = if !link.is_empty() {
         match parse_tg_message_link(link) {
             Some((chat_ref, message_id)) => {
-                if let Ok(bare) = chat_ref.parse::<i64>() {
-                    let cid = format!("-100{}", bare);
+                if let Some(cid) = normalize_chat_id(&chat_ref) {
                     match db::can_manage_chat(&state.db, user_id, &cid).await {
                         Ok(true) => {}
                         Ok(false) => {
@@ -1654,6 +1653,14 @@ fn resolve_target_input(args: &str) -> Option<String> {
     (!args.is_empty()).then(|| args.to_string())
 }
 
+// t.me/c links carry a positive bare id that omits the -100 channel prefix.
+fn normalize_chat_id(input: &str) -> Option<String> {
+    match input.parse::<i64>() {
+        Ok(v) if v > 0 => Some(format!("-100{}", v)),
+        _ => None,
+    }
+}
+
 async fn resolve_chat_id(
     state: &AppState,
     input: &str,
@@ -1662,11 +1669,7 @@ async fn resolve_chat_id(
 ) -> anyhow::Result<String> {
     let input = input.trim();
 
-    let normalized: String = if input.parse::<i64>().map(|v| v > 0).unwrap_or(false) {
-        format!("-100{}", input)
-    } else {
-        input.to_string()
-    };
+    let normalized = normalize_chat_id(input).unwrap_or_else(|| input.to_string());
     if normalized.parse::<i64>().is_ok() {
         let owned = db::can_manage_chat(&state.db, user_id, &normalized).await?;
         if !owned {

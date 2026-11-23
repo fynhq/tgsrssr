@@ -202,7 +202,7 @@ pub(crate) async fn render_cookies_panel(
             }
         };
         buttons.push(vec![InlineKeyboardButton::callback(
-            format!("{}（{}）", p.label, status),
+            i18n::fill(i18n::t(lang, "name_detail"), &[p.label, status]),
             wire::cookies(p.id),
         )]);
     }
@@ -273,10 +273,9 @@ pub(crate) async fn render_channel_list(
             None => "?".to_string(),
         };
         row.push(InlineKeyboardButton::callback(
-            format!(
-                "{}（{}）",
-                crate::htmltext::truncate_text(&title, 32),
-                cnt_label
+            i18n::fill(
+                i18n::t(lang, "name_detail"),
+                &[&crate::htmltext::truncate_text(&title, 32), &cnt_label],
             ),
             wire::channel(&chat.chat_id, 0, page),
         ));
