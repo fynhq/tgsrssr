@@ -65,6 +65,7 @@ TREE_ALLOW = {
     "src/commands/mod.rs": {"cjk"},
     "src/db.rs": {"cjk"},
     "src/fetcher.rs": {"cjk"},
+    "src/htmltable.rs": {"cjk"},
     "src/htmltext.rs": {"cjk"},
     "src/main.rs": {"cjk"},
     "src/media.rs": {"cjk"},
