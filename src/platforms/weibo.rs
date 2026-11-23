@@ -387,7 +387,7 @@ async fn get_weibo_json(
             ("User-Agent", ua.to_string()),
             ("Accept", "application/json, text/plain, */*".to_string()),
         ],
-        5,
+        crate::httpfollow::MAX_REDIRECTS,
     )
     .await
     {
@@ -784,17 +784,17 @@ fn mblog_to_entry(
             .as_str()
             .map(|s| s.to_string())
             .or_else(|| rt["user"]["id"].as_u64().map(|v| v.to_string()))
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
         let rt_user_html = match rt_uid {
             Some(rt_uid) if !rt_bid.is_empty() => format!(
                 "<a href=\"https://weibo.com/{}/{}\">@{}</a>",
-                rt_uid,
+                crate::htmltext::escape_attr(&rt_uid),
                 crate::htmltext::escape_attr(rt_bid),
                 crate::htmltext::escape_html(rt_user)
             ),
             Some(rt_uid) => format!(
                 "<a href=\"https://weibo.com/u/{}\">@{}</a>",
-                rt_uid,
+                crate::htmltext::escape_attr(&rt_uid),
                 crate::htmltext::escape_html(rt_user)
             ),
             None => format!("@{}", crate::htmltext::escape_html(rt_user)),
@@ -804,10 +804,12 @@ fn mblog_to_entry(
         ));
         let rt_is_markdown = rt["md_render_mark"].as_i64() == Some(1)
             || rt["style_config"]["md_render_mark"].as_i64() == Some(1);
+        // Both branches must yield Telegram-safe HTML: the whole entry body is marked
+        // prerendered when the outer post is markdown, so nothing sanitizes it later.
         let rt_text = if rt_is_markdown {
-            crate::fetcher::html_to_telegram_html(&rt_text)
+            render_weibo_inline(&rt_text)
         } else {
-            rt_text
+            crate::fetcher::html_to_telegram_html(&rt_text)
         };
         let mut rt_body = rt_text.clone();
         append_weibo_media(&mut rt_body, rt, &rt_mid);
@@ -1029,20 +1031,45 @@ fn render_md_inline(text: &str) -> String {
     s
 }
 
+fn extract_md_anchors(text: &str) -> (String, Vec<String>) {
+    let mut anchors: Vec<String> = Vec::new();
+    let text = RE_MD_ANCHOR
+        .replace_all(text, |caps: &regex::Captures| {
+            let idx = anchors.len();
+            anchors.push(crate::fetcher::html_to_telegram_html(&caps[0]));
+            format!("\u{FFFC}{}\u{FFFC}", idx)
+        })
+        .to_string();
+    (text, anchors)
+}
+
+fn restore_md_anchors(text: &str, anchors: &[String]) -> String {
+    let mut out = text.to_string();
+    for (i, anchor) in anchors.iter().enumerate() {
+        out = out.replace(&format!("\u{FFFC}{}\u{FFFC}", i), anchor);
+    }
+    out
+}
+
+// Inline rules only: retweet text is nested inside a blockquote, so no block constructs.
+fn render_weibo_inline(text: &str) -> String {
+    let text = crate::fetcher::RE_BR.replace_all(text, "\n").to_string();
+    let (text, anchors) = extract_md_anchors(&text);
+    let rendered = text
+        .split('\n')
+        .map(|line| render_md_inline(line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    restore_md_anchors(&rendered, &anchors).trim().to_string()
+}
+
 fn render_weibo_markdown(text: &str) -> String {
     let mut text = text.to_string();
     text.retain(|c| c != '\u{FFFC}' && c != '\u{FFFE}');
 
     let text = crate::fetcher::RE_BR.replace_all(&text, "\n").to_string();
 
-    let mut anchors: Vec<String> = Vec::new();
-    let text = RE_MD_ANCHOR
-        .replace_all(&text, |caps: &regex::Captures| {
-            let idx = anchors.len();
-            anchors.push(crate::fetcher::html_to_telegram_html(&caps[0]));
-            format!("\u{FFFC}{}\u{FFFC}", idx)
-        })
-        .to_string();
+    let (text, anchors) = extract_md_anchors(&text);
 
     let mut out_lines: Vec<String> = Vec::new();
     let mut bq_lines: Vec<String> = Vec::new();
@@ -1154,11 +1181,7 @@ fn render_weibo_markdown(text: &str) -> String {
     }
     flush_bq(&mut out_lines, &mut bq_lines);
 
-    let mut result = out_lines.join("\n");
-    for (i, anchor) in anchors.iter().enumerate() {
-        let token = format!("\u{FFFC}{}\u{FFFC}", i);
-        result = result.replace(&token, anchor);
-    }
+    let result = restore_md_anchors(&out_lines.join("\n"), &anchors);
 
     let result = crate::fetcher::RE_BLANK_LINES
         .replace_all(&result, "\n\n")
@@ -1982,5 +2005,31 @@ mod tests {
         let out = render_weibo_markdown(input);
         assert!(out.contains("# comment"), "out: {}", out);
         assert!(!out.contains("<b>comment</b>"), "out: {}", out);
+    }
+
+    #[test]
+    fn inline_md_renders_without_block_constructs() {
+        let out =
+            render_weibo_inline("**bold** `code` [label](https://example.com)\n> not a quote");
+        assert!(out.contains("<b>bold</b>"), "out: {}", out);
+        assert!(out.contains("<code>code</code>"), "out: {}", out);
+        assert!(
+            out.contains("<a href=\"https://example.com\">label</a>"),
+            "out: {}",
+            out
+        );
+        assert!(!out.contains("<blockquote>"), "out: {}", out);
+        assert!(!out.contains("<pre>"), "out: {}", out);
+    }
+
+    #[test]
+    fn inline_md_escapes_raw_tags_and_unsafe_anchors() {
+        let out = render_weibo_inline(
+            "<span class=\"surl-text\">x</span> <a href=\"javascript:alert(1)\">bad</a> &nbsp;y",
+        );
+        assert!(!out.contains("<span"), "out: {}", out);
+        assert!(!out.contains("javascript:"), "out: {}", out);
+        assert!(out.contains("bad"), "out: {}", out);
+        assert!(out.contains("y"), "out: {}", out);
     }
 }
