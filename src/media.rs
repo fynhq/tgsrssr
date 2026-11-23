@@ -61,6 +61,7 @@ pub const MAX_VIDEO_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_MEDIA_PER_ENTRY: usize = 30;
 const MAX_MEDIA_BYTES_PER_ENTRY: u64 = 200 * 1024 * 1024;
 const MIN_MEDIA_FREE_BYTES: u64 = 1024 * 1024;
+const MAX_THUMB_BYTES: u64 = 190 * 1024;
 const MEDIA_BUDGET_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct MediaBudget {
@@ -1046,7 +1047,6 @@ pub async fn prepare_entry_media(
         }
     }
 
-    const MAX_THUMB_BYTES: u64 = 190 * 1024;
     let max_thumbs = (MAX_MEDIA_PER_ENTRY as u64).saturating_add(1);
     let mut thumb_reservation = state
         .media_budget
@@ -1279,7 +1279,14 @@ async fn download_one(
     let (width, height) = if *kind == MediaKind::Image {
         match imagesize::size(&path) {
             Ok(dim) => (dim.width as u32, dim.height as u32),
-            Err(_) => (0, 0),
+            Err(e) => {
+                warn!(
+                    file = %path.file_name().unwrap_or_default().to_string_lossy(),
+                    error = %e,
+                    "image probe failed; dimension-based photo/document rules and thumbnails are skipped"
+                );
+                (0, 0)
+            }
         }
     } else {
         (0, 0)
@@ -1414,7 +1421,6 @@ async fn grab_thumb(
     thumb: &std::path::Path,
     input_format: &str,
 ) -> bool {
-    const MAX_THUMB_BYTES: u64 = 190 * 1024;
     const ATTEMPTS: [(&str, &str); 2] = [
         ("scale=320:320:force_original_aspect_ratio=decrease", "4"),
         ("scale=256:256:force_original_aspect_ratio=decrease", "8"),
