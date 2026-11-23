@@ -279,6 +279,28 @@ impl AppState {
         }
     }
 
+    pub async fn check_api_target(&self, url: &str) -> anyhow::Result<()> {
+        use crate::ssrf::SsrfOutcome;
+        match crate::ssrf::ssrf_check_literal(url) {
+            SsrfOutcome::Private => {
+                anyhow::bail!("blocked: private/loopback address: {}", url)
+            }
+            SsrfOutcome::InvalidUrl => anyhow::bail!("invalid platform URL: {}", url),
+            SsrfOutcome::Allowed | SsrfOutcome::LookupFailed => {}
+        }
+        if self.is_routed_via_proxy(url) {
+            return Ok(());
+        }
+        match crate::ssrf::ssrf_check(url).await {
+            SsrfOutcome::Private => {
+                anyhow::bail!("blocked: private/loopback address: {}", url)
+            }
+            SsrfOutcome::LookupFailed => anyhow::bail!("dns resolve failed: {}", url),
+            SsrfOutcome::InvalidUrl => anyhow::bail!("invalid platform URL: {}", url),
+            SsrfOutcome::Allowed => Ok(()),
+        }
+    }
+
     pub fn media_client_for_url_trusted(&self, url: &str, allow_trusted: bool) -> &reqwest::Client {
         self.media_route_for_url_trusted(url, allow_trusted).0
     }

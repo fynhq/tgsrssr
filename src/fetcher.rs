@@ -310,10 +310,12 @@ pub async fn fetch_feed(
     let resp = crate::httpfollow::get_follow_redirects(
         state,
         feed_url,
-        opts.allow_trusted_private,
-        None,
+        crate::httpfollow::HopPolicy::Trusted {
+            allow: opts.allow_trusted_private,
+            origin: None,
+        },
         "feed",
-        crate::httpfollow::MAX_REDIRECTS,
+        crate::httpfollow::RedirectPolicy::Follow(crate::httpfollow::MAX_REDIRECTS),
         |client, url, _hop| {
             let mut req = client.get(url).header(
                 "Accept",

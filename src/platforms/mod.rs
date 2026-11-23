@@ -252,71 +252,30 @@ pub(crate) async fn api_get(
     headers: &[(&str, String)],
     max_redirects: u32,
 ) -> anyhow::Result<reqwest::Response> {
-    use anyhow::Context as _;
-
     let initial_authority = api_authority(url);
-    let mut cur_url = url.to_string();
-    let mut hops = 0u32;
-    loop {
-        match crate::ssrf::ssrf_check_literal(&cur_url) {
-            crate::ssrf::SsrfOutcome::Private => {
-                anyhow::bail!("blocked: private/loopback address: {}", cur_url);
-            }
-            crate::ssrf::SsrfOutcome::InvalidUrl => {
-                anyhow::bail!("invalid platform URL: {}", cur_url);
-            }
-            _ => {}
-        }
-        if !state.is_routed_via_proxy(&cur_url) {
-            match crate::ssrf::ssrf_check(&cur_url).await {
-                crate::ssrf::SsrfOutcome::Private => {
-                    anyhow::bail!("blocked: private/loopback address: {}", cur_url);
+    let redirects = if max_redirects == 0 {
+        crate::httpfollow::RedirectPolicy::Return
+    } else {
+        crate::httpfollow::RedirectPolicy::Follow(max_redirects)
+    };
+    crate::httpfollow::get_follow_redirects(
+        state,
+        url,
+        crate::httpfollow::HopPolicy::Api,
+        "platform",
+        redirects,
+        |client, cur_url, _hop| {
+            let same_authority = api_authority(cur_url) == initial_authority;
+            let mut req = client.get(cur_url);
+            for (name, value) in headers {
+                if same_authority || !is_sensitive_header(name) {
+                    req = req.header(*name, value);
                 }
-                crate::ssrf::SsrfOutcome::LookupFailed => {
-                    anyhow::bail!("dns resolve failed: {}", cur_url);
-                }
-                crate::ssrf::SsrfOutcome::InvalidUrl => {
-                    anyhow::bail!("invalid platform URL: {}", cur_url);
-                }
-                crate::ssrf::SsrfOutcome::Allowed => {}
             }
-        }
-
-        let client = state.media_client_for_url(&cur_url);
-        let same_authority = api_authority(&cur_url) == initial_authority;
-        let mut req = client.get(&cur_url);
-        for (name, value) in headers {
-            if !same_authority && is_sensitive_header(name) {
-                continue;
-            }
-            req = req.header(*name, value);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("platform request failed: {}", cur_url))?;
-
-        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-            return Ok(resp);
-        }
-        if resp.status().is_redirection() && max_redirects > 0 {
-            hops += 1;
-            if hops > max_redirects {
-                anyhow::bail!("too many redirects (>{}): {}", max_redirects, url);
-            }
-            let loc = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| anyhow::anyhow!("redirect without Location header"))?;
-            let next = url::Url::parse(&cur_url)
-                .and_then(|base| base.join(loc))
-                .map_err(|e| anyhow::anyhow!("bad redirect Location: {}", e))?;
-            cur_url = next.to_string();
-            continue;
-        }
-        return Ok(resp);
-    }
+            req
+        },
+    )
+    .await
 }
 
 pub fn platform_for_url(url: &str) -> Option<&'static PlatformDef> {

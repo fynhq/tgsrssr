@@ -1141,10 +1141,12 @@ async fn download_one(
             let mut resp = crate::httpfollow::get_follow_redirects(
                 state,
                 url,
-                allow_trusted_private,
-                trusted_origin,
+                crate::httpfollow::HopPolicy::Trusted {
+                    allow: allow_trusted_private,
+                    origin: trusted_origin,
+                },
                 "media",
-                crate::httpfollow::MAX_REDIRECTS,
+                crate::httpfollow::RedirectPolicy::Follow(crate::httpfollow::MAX_REDIRECTS),
                 |client, cur_url, _hop| {
                     let mut req = client
                         .get(cur_url)

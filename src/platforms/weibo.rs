@@ -1523,10 +1523,12 @@ pub(crate) async fn enrich_video_url(
     let Ok(resp) = crate::httpfollow::get_follow_redirects(
         state,
         &api,
-        false,
-        None,
+        crate::httpfollow::HopPolicy::Trusted {
+            allow: false,
+            origin: None,
+        },
         "weibo",
-        crate::httpfollow::MAX_REDIRECTS,
+        crate::httpfollow::RedirectPolicy::Follow(crate::httpfollow::MAX_REDIRECTS),
         |client, cur_url, hop| {
             let mut req = client
                 .get(cur_url)
@@ -1609,10 +1611,12 @@ async fn fetch_visitor_cookie(state: &AppState) -> Option<String> {
     let resp = crate::httpfollow::get_follow_redirects(
         state,
         gen_url,
-        false,
-        None,
+        crate::httpfollow::HopPolicy::Trusted {
+            allow: false,
+            origin: None,
+        },
         "weibo",
-        crate::httpfollow::MAX_REDIRECTS,
+        crate::httpfollow::RedirectPolicy::Follow(crate::httpfollow::MAX_REDIRECTS),
         |client, cur_url, _hop| {
             client
                 .post(cur_url)
@@ -1658,10 +1662,12 @@ async fn fetch_visitor_cookie(state: &AppState) -> Option<String> {
     let resp2 = crate::httpfollow::get_follow_redirects(
         state,
         &incarnate_url,
-        false,
-        None,
+        crate::httpfollow::HopPolicy::Trusted {
+            allow: false,
+            origin: None,
+        },
         "weibo",
-        crate::httpfollow::MAX_REDIRECTS,
+        crate::httpfollow::RedirectPolicy::Follow(crate::httpfollow::MAX_REDIRECTS),
         |client, cur_url, _hop| client.get(cur_url).header("Referer", "https://weibo.com/"),
     )
     .await
@@ -1710,10 +1716,12 @@ async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -
     let resp = crate::httpfollow::get_follow_redirects(
         state,
         &api,
-        false,
-        None,
+        crate::httpfollow::HopPolicy::Trusted {
+            allow: false,
+            origin: None,
+        },
         "weibo",
-        crate::httpfollow::MAX_REDIRECTS,
+        crate::httpfollow::RedirectPolicy::Follow(crate::httpfollow::MAX_REDIRECTS),
         |client, cur_url, hop| {
             let mut req = client
                 .get(cur_url)
