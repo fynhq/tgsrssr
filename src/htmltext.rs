@@ -351,6 +351,54 @@ pub fn strip_html_keep_links(s: &str, max: usize) -> String {
     }
 }
 
+pub fn merge_email_mention_anchors(html: &str) -> String {
+    static RE_EMAIL_SPLIT_ANCHOR: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)(?P<local>[a-z0-9._%+\-]+)<a\b[^>]*>\s*(?P<at>@[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?)*)\s*</a>(?P<rest>(?:\.[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?)*)"#,
+        )
+        .unwrap()
+    });
+    RE_EMAIL_SPLIT_ANCHOR
+        .replace_all(html, |caps: &regex::Captures| {
+            let email = format!("{}{}{}", &caps["local"], &caps["at"], &caps["rest"]);
+            if is_plausible_email(&email) {
+                escape_html(&email)
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .into_owned()
+}
+
+fn is_plausible_email(email: &str) -> bool {
+    let Some((local, domain)) = email.rsplit_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || local.len() > 64
+        || email.len() > 254
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+    {
+        return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    {
+        return false;
+    }
+    let tld = labels.last().copied().unwrap_or_default();
+    tld.len() >= 2 && (tld.chars().all(|c| c.is_ascii_alphabetic()) || tld.starts_with("xn--"))
+}
+
 pub fn unescape_html(s: &str) -> String {
     static RE_ENTITY_NUM: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"&#(\d+);").unwrap());
@@ -1073,6 +1121,41 @@ mod tests {
         assert!(!is_safe_href("javascript:alert(1)"));
         assert!(!is_safe_href("data:text/html,x"));
         assert!(!is_safe_href("/relative"));
+    }
+
+    #[test]
+    fn merge_email_mention_anchors_restores_split_email() {
+        let html = r#"发送至：user<a href='https://m.weibo.cn/n/example'>@example</a>.com。"#;
+        assert_eq!(
+            merge_email_mention_anchors(html),
+            "发送至：user@example.com。"
+        );
+    }
+
+    #[test]
+    fn merge_email_mention_anchors_keeps_legit_mentions() {
+        let html = r#"关注<a href="https://m.weibo.cn/n/example">@example</a>获取更新"#;
+        assert_eq!(merge_email_mention_anchors(html), html);
+        let spaced = r#"联系 <a href="https://m.weibo.cn/n/example">@example</a>"#;
+        assert_eq!(merge_email_mention_anchors(spaced), spaced);
+    }
+
+    #[test]
+    fn merge_email_mention_anchors_requires_valid_email() {
+        let no_dot = r#"user<a href="https://m.weibo.cn/n/example">@example</a>后续"#;
+        assert_eq!(merge_email_mention_anchors(no_dot), no_dot);
+        let bad_tld = r#"user<a href="https://m.weibo.cn/example">@example</a>.1"#;
+        assert_eq!(merge_email_mention_anchors(bad_tld), bad_tld);
+    }
+
+    #[test]
+    fn merge_email_mention_anchors_handles_full_domain_and_multiple() {
+        let html = r#"a.b+tag<a href="https://weibo.com/n/x">@example.com</a>
+c<a href="https://weibo.com/n/y">@example.org</a>"#;
+        let out = merge_email_mention_anchors(html);
+        assert!(out.contains("a.b+tag@example.com"), "out: {out}");
+        assert!(out.contains("c@example.org"), "out: {out}");
+        assert!(!out.contains("<a "), "out: {out}");
     }
 
     #[test]

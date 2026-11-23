@@ -540,6 +540,7 @@ pub(crate) fn entry_body_html_from_source_with_mode(
     } else {
         html_to_telegram_html_with(html, table_mode)
     };
+    let tg = crate::htmltext::merge_email_mention_anchors(&tg);
 
     let visible = crate::htmltext::decode_entities(&strip_tags(&tg));
     if visible.chars().count() <= max {
@@ -1232,6 +1233,38 @@ mod tests {
         );
         assert!(!out.contains("img.example.com"), "img leaked: {}", out);
         assert!(!out.contains("v.example.com"), "video leaked: {}", out);
+    }
+
+    #[test]
+    fn entry_body_html_merges_email_mention_anchor() {
+        let body = r#"发送至：user<a href="https://m.weibo.cn/n/example">@example</a>.com。"#;
+        let entry = entry_with_body_html(body);
+        let out = entry_body_html(&entry, 100_000, None);
+        assert_eq!(out, "发送至：user@example.com。");
+    }
+
+    #[test]
+    fn entry_body_html_prerendered_merges_email_mention_anchor() {
+        let body = r#"发送至：user<a href="https://m.weibo.cn/n/example">@example</a>.com。"#;
+        let entry = entry_with_body_html(body);
+        let meta = crate::entrymeta::EntryMeta {
+            prerendered_html: true,
+            poll: None,
+            retweet_images: Vec::new(),
+        };
+        let out = entry_body_html(&entry, 100_000, Some(&meta));
+        assert_eq!(out, "发送至：user@example.com。");
+    }
+
+    #[test]
+    fn entry_body_html_keeps_legit_weibo_mention() {
+        let body = r#"关注<a href="https://m.weibo.cn/n/example">@example</a>获取更新"#;
+        let entry = entry_with_body_html(body);
+        let out = entry_body_html(&entry, 100_000, None);
+        assert!(
+            out.contains(r#"<a href="https://m.weibo.cn/n/example">@example</a>"#),
+            "out: {out}"
+        );
     }
 
     #[test]
