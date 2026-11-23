@@ -232,17 +232,10 @@ fn parse_args<'a>(op: CallbackOp, args: &[&'a str]) -> CallbackArgs<'a> {
             chlist_page: page(3),
             ..CallbackArgs::default()
         },
-        CallbackOp::UnsubPage | CallbackOp::UnsubAllAsk => CallbackArgs {
+        CallbackOp::UnsubPage | CallbackOp::UnsubAllAsk | CallbackOp::UnsubAll => CallbackArgs {
             id: at(0),
             page: page(1),
             ch_page: page(2),
-            chlist_page: page(3),
-            ..CallbackArgs::default()
-        },
-        CallbackOp::UnsubAll => CallbackArgs {
-            id: at(0),
-            ch_page: page(1),
-            page: page(2),
             chlist_page: page(3),
             ..CallbackArgs::default()
         },
@@ -340,9 +333,10 @@ mod tests {
             ("cancelop", CallbackOp::CancelOp, GuardTarget::None),
             ("page", CallbackOp::Page, GuardTarget::None),
         ] {
-            let raw = format!("c|{raw}");
-            let parsed = CallbackData::parse(&raw).expect(&raw);
+            let full = format!("c|{raw}");
+            let parsed = CallbackData::parse(&full).expect(&full);
             assert_eq!(parsed.op, op);
+            assert_eq!(op.as_str(), raw, "{raw}");
             assert_eq!(parsed.op.guard_target(), target, "{raw}");
         }
     }
@@ -364,15 +358,15 @@ mod tests {
     }
 
     #[test]
-    fn reversed_unsub_all_pages_keep_their_names() {
+    fn unsub_all_shares_the_page_order_of_unsub_all_ask() {
         let ask = CallbackData::parse("c|unsuballask|-100123|2|3|4").expect("valid");
         assert_eq!(ask.args.page, 2);
         assert_eq!(ask.args.ch_page, 3);
         assert_eq!(ask.args.chlist_page, 4);
 
-        let all = CallbackData::parse("c|unsuball|-100123|3|2|4").expect("valid");
-        assert_eq!(all.args.ch_page, 3);
+        let all = CallbackData::parse("c|unsuball|-100123|2|3|4").expect("valid");
         assert_eq!(all.args.page, 2);
+        assert_eq!(all.args.ch_page, 3);
         assert_eq!(all.args.chlist_page, 4);
     }
 

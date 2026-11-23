@@ -1,23 +1,32 @@
 pub(crate) use super::data::CallbackOp;
 
 pub(crate) fn channel(chat_id: &str, ch_page: usize, chlist_page: usize) -> String {
-    format!("c|ch|{chat_id}|{ch_page}|{chlist_page}")
+    format!(
+        "{}|{chat_id}|{ch_page}|{chlist_page}",
+        op_prefix(CallbackOp::Channel)
+    )
 }
 
 pub(crate) fn channel_list(page: usize) -> String {
-    format!("c|chlist|{page}")
+    format!("{}|{page}", op_prefix(CallbackOp::ChannelList))
 }
 
 pub(crate) fn language(code: &str) -> String {
-    format!("c|lang|{code}")
+    format!("{}|{code}", op_prefix(CallbackOp::Language))
 }
 
 pub(crate) fn unsub(sub_id: i64, page: usize, ch_page: usize, chlist_page: usize) -> String {
-    format!("c|unsub|{sub_id}|{page}|{ch_page}|{chlist_page}")
+    format!(
+        "{}|{sub_id}|{page}|{ch_page}|{chlist_page}",
+        op_prefix(CallbackOp::Unsub)
+    )
 }
 
 pub(crate) fn unsub_page(chat_id: &str, page: usize, ch_page: usize, chlist_page: usize) -> String {
-    format!("c|unsubpg|{chat_id}|{page}|{ch_page}|{chlist_page}")
+    format!(
+        "{}|{chat_id}|{page}|{ch_page}|{chlist_page}",
+        op_prefix(CallbackOp::UnsubPage)
+    )
 }
 
 pub(crate) fn unsub_all_ask(
@@ -26,19 +35,31 @@ pub(crate) fn unsub_all_ask(
     ch_page: usize,
     chlist_page: usize,
 ) -> String {
-    format!("c|unsuballask|{chat_id}|{page}|{ch_page}|{chlist_page}")
+    format!(
+        "{}|{chat_id}|{page}|{ch_page}|{chlist_page}",
+        op_prefix(CallbackOp::UnsubAllAsk)
+    )
 }
 
-pub(crate) fn unsub_all(chat_id: &str, ch_page: usize, page: usize, chlist_page: usize) -> String {
-    format!("c|unsuball|{chat_id}|{ch_page}|{page}|{chlist_page}")
+pub(crate) fn unsub_all(chat_id: &str, page: usize, ch_page: usize, chlist_page: usize) -> String {
+    format!(
+        "{}|{chat_id}|{page}|{ch_page}|{chlist_page}",
+        op_prefix(CallbackOp::UnsubAll)
+    )
 }
 
 pub(crate) fn resume_all(chat_id: &str, chlist_page: usize, ch_page: usize) -> String {
-    format!("c|resumeall|{chat_id}|{chlist_page}|{ch_page}")
+    format!(
+        "{}|{chat_id}|{chlist_page}|{ch_page}",
+        op_prefix(CallbackOp::ResumeAll)
+    )
 }
 
 pub(crate) fn config(chat_id: &str, ch_page: usize, chlist_page: usize) -> String {
-    format!("c|cfg|{chat_id}|{ch_page}|{chlist_page}")
+    format!(
+        "{}|{chat_id}|{ch_page}|{chlist_page}",
+        op_prefix(CallbackOp::Config)
+    )
 }
 
 pub(crate) fn config_page(
@@ -78,7 +99,10 @@ pub(crate) fn config_value(
 }
 
 pub(crate) fn source(sub_id: i64, ch_page: usize, chlist_page: usize) -> String {
-    format!("c|src|{sub_id}|{ch_page}|{chlist_page}")
+    format!(
+        "{}|{sub_id}|{ch_page}|{chlist_page}",
+        op_prefix(CallbackOp::Source)
+    )
 }
 
 pub(crate) fn source_action(
@@ -122,7 +146,7 @@ pub(crate) fn source_value(
 }
 
 pub(crate) fn cookies(platform: &str) -> String {
-    format!("c|ck|{platform}")
+    format!("{}|{platform}", op_prefix(CallbackOp::Cookies))
 }
 
 pub(crate) fn value_callback(
@@ -149,12 +173,12 @@ pub(crate) fn value_callback(
     }
 }
 
-pub(crate) fn cancelop() -> &'static str {
-    "c|cancelop"
+pub(crate) fn cancelop() -> String {
+    op_prefix(CallbackOp::CancelOp)
 }
 
-pub(crate) fn page() -> &'static str {
-    "c|page"
+pub(crate) fn page() -> String {
+    op_prefix(CallbackOp::Page)
 }
 
 pub(crate) fn op_prefix(op: CallbackOp) -> String {
@@ -175,7 +199,7 @@ mod tests {
             (CallbackOp::Unsub, unsub(7, 1, 2, 3)),
             (CallbackOp::UnsubPage, unsub_page("-1001", 1, 2, 3)),
             (CallbackOp::UnsubAllAsk, unsub_all_ask("-1001", 1, 2, 3)),
-            (CallbackOp::UnsubAll, unsub_all("-1001", 2, 1, 3)),
+            (CallbackOp::UnsubAll, unsub_all("-1001", 1, 2, 3)),
             (CallbackOp::ResumeAll, resume_all("-1001", 3, 2)),
             (CallbackOp::Config, config("-1001", 2, 3)),
             (

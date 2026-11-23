@@ -192,7 +192,7 @@ pub(super) async fn render_unsub_all_confirm(
     let kb = InlineKeyboardMarkup::new(vec![vec![
         InlineKeyboardButton::callback(
             i18n::t(lang, "unsuball_confirm_btn"),
-            wire::unsub_all(chat_id, ch_page, page, chlist_page),
+            wire::unsub_all(chat_id, page, ch_page, chlist_page),
         ),
         InlineKeyboardButton::callback(
             i18n::t(lang, "back"),

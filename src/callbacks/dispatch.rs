@@ -19,6 +19,169 @@ pub(super) fn is_config_op(op: CallbackOp) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+enum ChatFlag {
+    LinkPreview,
+    CaptionAboveMedia,
+}
+
+impl ChatFlag {
+    fn column(self) -> &'static str {
+        match self {
+            Self::LinkPreview => "link_preview",
+            Self::CaptionAboveMedia => "caption_above_media",
+        }
+    }
+
+    fn current(self, cfg: &db::ChatConfigRow) -> i64 {
+        match self {
+            Self::LinkPreview => cfg.link_preview,
+            Self::CaptionAboveMedia => cfg.caption_above_media,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FeedFlag {
+    CaptionAboveMedia,
+    LinkPreview,
+}
+
+impl FeedFlag {
+    fn column(self) -> &'static str {
+        match self {
+            Self::CaptionAboveMedia => "caption_above_media",
+            Self::LinkPreview => "link_preview",
+        }
+    }
+
+    fn current(self, cfg: &db::EffectiveConfig) -> bool {
+        match self {
+            Self::CaptionAboveMedia => cfg.caption_above_media,
+            Self::LinkPreview => cfg.link_preview,
+        }
+    }
+
+    fn channel_default(self, cfg: &db::ChatConfigRow) -> bool {
+        match self {
+            Self::CaptionAboveMedia => cfg.caption_above_media != 0,
+            Self::LinkPreview => cfg.link_preview != 0,
+        }
+    }
+}
+
+async fn toggle_chat_flag(ctx: &CallbackCtx<'_>, cid: &str, flag: ChatFlag) -> ResponseResult<()> {
+    let bot = ctx.bot;
+    let state = ctx.state;
+    let lang = ctx.lang;
+    let ch_page = ctx.args.ch_page;
+    let chlist_page = ctx.args.chlist_page;
+    let cfg = match load_chat_config_checked(&state.db, cid).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(chat = %cid, error = %e, column = flag.column(), "chat flag toggle aborted: config read failed");
+            bot.answer_callback_query(ctx.qid.clone())
+                .text(i18n::t(lang, "op_failed_retry"))
+                .await
+                .ok();
+            return Ok(());
+        }
+    };
+    let next = if flag.current(&cfg) != 0 { "0" } else { "1" };
+    match db::set_chat_config_field(&state.db, cid, flag.column(), next).await {
+        Ok(_) => {
+            render_settings_page(
+                bot,
+                PageTarget::Edit(ctx.q),
+                cid,
+                state,
+                ch_page,
+                chlist_page,
+                lang,
+            )
+            .await?;
+        }
+        Err(e) => {
+            bot.answer_callback_query(ctx.qid.clone())
+                .text(toast_text(
+                    i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)),
+                ))
+                .await
+                .ok();
+        }
+    }
+    Ok(())
+}
+
+async fn toggle_feed_flag(ctx: &CallbackCtx<'_>, id: i64, flag: FeedFlag) -> ResponseResult<()> {
+    let bot = ctx.bot;
+    let state = ctx.state;
+    let lang = ctx.lang;
+    let qid = ctx.qid.clone();
+    let ch_page = ctx.args.ch_page;
+    let chlist_page = ctx.args.chlist_page;
+    let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await else {
+        return Ok(());
+    };
+    // A transient DB read error must abort a toggle; toggling from the default persists a wrong override.
+    let (cfg, chat_cfg) = match (
+        db::get_effective_config(&state.db, &sub.chat_id, &sub.feed_url).await,
+        load_chat_config_checked(&state.db, &sub.chat_id).await,
+    ) {
+        (Ok(cfg), Ok(chat_cfg)) => (cfg, chat_cfg),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!(sub_id = id, error = %e, column = flag.column(), "feed flag toggle aborted: config read failed");
+            bot.answer_callback_query(qid.clone())
+                .text(i18n::t(lang, "op_failed_retry"))
+                .await
+                .ok();
+            return Ok(());
+        }
+    };
+    let next = if flag.current(&cfg) { "0" } else { "1" };
+    let channel_default = if flag.channel_default(&chat_cfg) {
+        "1"
+    } else {
+        "0"
+    };
+    let value: Option<&str> = if next == channel_default {
+        None
+    } else {
+        Some(next)
+    };
+    match db::set_feed_config_field(&state.db, &sub.chat_id, &sub.feed_url, flag.column(), value)
+        .await
+    {
+        Ok(_) => {
+            info!(
+                sub_id = id,
+                column = flag.column(),
+                value = next,
+                "feed flag toggled"
+            );
+            render_feed_page(
+                bot,
+                PageTarget::Edit(ctx.q),
+                id,
+                state,
+                ch_page,
+                chlist_page,
+                lang,
+            )
+            .await?;
+        }
+        Err(e) => {
+            bot.answer_callback_query(qid.clone())
+                .text(toast_text(
+                    i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)),
+                ))
+                .await
+                .ok();
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
     let bot = ctx.bot;
     let q = ctx.q;
@@ -94,86 +257,12 @@ pub(super) async fn config(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
         }
         CallbackOp::ConfigLinkPreview => {
             if let Some(cid) = args.id {
-                let ch_page = args.ch_page;
-                let chlist_page = args.chlist_page;
-                let cfg = match load_chat_config_checked(&state.db, cid).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(chat = %cid, error = %e, "cfglp: config read failed, toggle aborted");
-                        bot.answer_callback_query(qid.clone())
-                            .text(i18n::t(lang, "op_failed_retry"))
-                            .await
-                            .ok();
-                        return Ok(());
-                    }
-                };
-                let next = if cfg.link_preview != 0 { "0" } else { "1" };
-                match db::set_chat_config_field(&state.db, cid, "link_preview", next).await {
-                    Ok(_) => {
-                        render_settings_page(
-                            bot,
-                            PageTarget::Edit(q),
-                            cid,
-                            state,
-                            ch_page,
-                            chlist_page,
-                            lang,
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        bot.answer_callback_query(qid.clone())
-                            .text(toast_text(
-                                i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)),
-                            ))
-                            .await
-                            .ok();
-                    }
-                }
+                return toggle_chat_flag(ctx, cid, ChatFlag::LinkPreview).await;
             }
         }
         CallbackOp::ConfigCaption => {
             if let Some(cid) = args.id {
-                let ch_page = args.ch_page;
-                let chlist_page = args.chlist_page;
-                let cfg = match load_chat_config_checked(&state.db, cid).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(chat = %cid, error = %e, "cfgcp: config read failed, toggle aborted");
-                        bot.answer_callback_query(qid.clone())
-                            .text(i18n::t(lang, "op_failed_retry"))
-                            .await
-                            .ok();
-                        return Ok(());
-                    }
-                };
-                let next = if cfg.caption_above_media != 0 {
-                    "0"
-                } else {
-                    "1"
-                };
-                match db::set_chat_config_field(&state.db, cid, "caption_above_media", next).await {
-                    Ok(_) => {
-                        render_settings_page(
-                            bot,
-                            PageTarget::Edit(q),
-                            cid,
-                            state,
-                            ch_page,
-                            chlist_page,
-                            lang,
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        bot.answer_callback_query(qid.clone())
-                            .text(toast_text(
-                                i18n::t(lang, "set_failed").replace("{:#}", &format!("{:#}", e)),
-                            ))
-                            .await
-                            .ok();
-                    }
-                }
+                return toggle_chat_flag(ctx, cid, ChatFlag::CaptionAboveMedia).await;
             }
         }
         CallbackOp::ResumeAll => {
@@ -442,137 +531,12 @@ pub(super) async fn source(ctx: &CallbackCtx<'_>) -> ResponseResult<()> {
         }
         CallbackOp::SourceCaption => {
             if let Some(id) = args.sub_id() {
-                let ch_page = args.ch_page;
-                let chlist_page = args.chlist_page;
-                if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
-                    let (cfg, chat_cfg) = match (
-                        db::get_effective_config(&state.db, &sub.chat_id, &sub.feed_url).await,
-                        load_chat_config_checked(&state.db, &sub.chat_id).await,
-                    ) {
-                        (Ok(cfg), Ok(chat_cfg)) => (cfg, chat_cfg),
-                        (Err(e), _) | (_, Err(e)) => {
-                            tracing::warn!(sub_id = id, error = %e, "srcfcp: config read failed, toggle aborted");
-                            bot.answer_callback_query(qid.clone())
-                                .text(i18n::t(lang, "op_failed_retry"))
-                                .await
-                                .ok();
-                            return Ok(());
-                        }
-                    };
-                    let next = if cfg.caption_above_media { "0" } else { "1" };
-                    let channel_default = if chat_cfg.caption_above_media != 0 {
-                        "1"
-                    } else {
-                        "0"
-                    };
-                    let value: Option<&str> = if next == channel_default {
-                        None
-                    } else {
-                        Some(next)
-                    };
-                    match db::set_feed_config_field(
-                        &state.db,
-                        &sub.chat_id,
-                        &sub.feed_url,
-                        "caption_above_media",
-                        value,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            info!(
-                                sub_id = id,
-                                caption_above_media = next,
-                                "feed caption position toggled"
-                            );
-                            render_feed_page(
-                                bot,
-                                PageTarget::Edit(q),
-                                id,
-                                state,
-                                ch_page,
-                                chlist_page,
-                                lang,
-                            )
-                            .await?;
-                        }
-                        Err(e) => {
-                            bot.answer_callback_query(qid.clone())
-                                .text(toast_text(
-                                    i18n::t(lang, "set_failed")
-                                        .replace("{:#}", &format!("{:#}", e)),
-                                ))
-                                .await
-                                .ok();
-                        }
-                    }
-                }
+                return toggle_feed_flag(ctx, id, FeedFlag::CaptionAboveMedia).await;
             }
         }
         CallbackOp::SourceLinkPreview => {
             if let Some(id) = args.sub_id() {
-                let ch_page = args.ch_page;
-                let chlist_page = args.chlist_page;
-                if let Some(sub) = fetch_sub_or_toast(state, bot, qid.clone(), id, lang).await {
-                    // A transient DB read error must abort a toggle; toggling from the default persists a wrong override.
-                    let (cfg, chat_cfg) = match (
-                        db::get_effective_config(&state.db, &sub.chat_id, &sub.feed_url).await,
-                        load_chat_config_checked(&state.db, &sub.chat_id).await,
-                    ) {
-                        (Ok(cfg), Ok(chat_cfg)) => (cfg, chat_cfg),
-                        (Err(e), _) | (_, Err(e)) => {
-                            tracing::warn!(sub_id = id, error = %e, "srcflp: config read failed, toggle aborted");
-                            bot.answer_callback_query(qid.clone())
-                                .text(i18n::t(lang, "op_failed_retry"))
-                                .await
-                                .ok();
-                            return Ok(());
-                        }
-                    };
-                    let next = if cfg.link_preview { "0" } else { "1" };
-                    let channel_default = if chat_cfg.link_preview != 0 { "1" } else { "0" };
-                    let value: Option<&str> = if next == channel_default {
-                        None
-                    } else {
-                        Some(next)
-                    };
-                    match db::set_feed_config_field(
-                        &state.db,
-                        &sub.chat_id,
-                        &sub.feed_url,
-                        "link_preview",
-                        value,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            info!(
-                                sub_id = id,
-                                link_preview = next,
-                                "feed link preview toggled"
-                            );
-                            render_feed_page(
-                                bot,
-                                PageTarget::Edit(q),
-                                id,
-                                state,
-                                ch_page,
-                                chlist_page,
-                                lang,
-                            )
-                            .await?;
-                        }
-                        Err(e) => {
-                            bot.answer_callback_query(qid.clone())
-                                .text(toast_text(
-                                    i18n::t(lang, "set_failed")
-                                        .replace("{:#}", &format!("{:#}", e)),
-                                ))
-                                .await
-                                .ok();
-                        }
-                    }
-                }
+                return toggle_feed_flag(ctx, id, FeedFlag::LinkPreview).await;
             }
         }
         CallbackOp::SourceFilter => {
