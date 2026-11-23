@@ -24,8 +24,9 @@ pub use crate::htmltext::{
 mod render;
 pub use render::{channel_header_text, channel_sub_counts};
 use render::{
-    format_caption, format_entry_parts, plan_text_chunks, rich_html, rich_media_html,
-    should_try_rich_media, should_try_rich_text, standard_text_len,
+    format_caption, format_caption_with_mode, format_entry_parts, format_entry_parts_with_mode,
+    plan_text_chunks, rich_html, rich_media_html, should_try_rich_media, should_try_rich_text,
+    standard_text_len,
 };
 
 const SAFE_LIMIT: usize = 4096;
@@ -205,7 +206,16 @@ pub async fn send_text_only(
     );
     let mut rich_msg: Option<Message> = None;
     if opts.allow_rich && !crate::richmsg::is_unsupported() && should_try_rich_text(text_len) {
-        match try_send_rich_text(bot, chat_id, &body, &footer).await {
+        let (rich_body, rich_footer) = format_entry_parts_with_mode(
+            entry,
+            feed_title,
+            author,
+            opts,
+            meta,
+            fetcher::TableMode::Rich,
+        )
+        .unwrap_or_else(|| (body.clone(), footer.clone()));
+        match try_send_rich_text(bot, chat_id, &rich_body, &rich_footer).await {
             Ok(m) => {
                 tracing::info!(
                     chat_id = chat_id,
@@ -1039,11 +1049,19 @@ pub async fn send_entry_with_media(
         && !crate::richmsg::is_unsupported()
         && should_try_rich_media(full_text_len, rich_media_count)
     {
+        let rich_caption = format_caption_with_mode(
+            entry,
+            feed_title,
+            author,
+            opts,
+            meta,
+            fetcher::TableMode::Rich,
+        );
         match try_send_rich_media(
             bot,
             db,
             chat_id,
-            &full_caption,
+            &rich_caption,
             caption_above,
             &album_media,
             &rich_docs,
@@ -1989,6 +2007,40 @@ mod tests {
             "https://example.com/post".to_string(),
             None,
         )
+    }
+
+    #[test]
+    fn rich_mode_renders_native_table_without_changing_standard_render() {
+        let body = concat!(
+            "<p>正文</p>",
+            "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>"
+        );
+        let entry = rss_entry_with_body(body);
+        let opts = RenderOpts {
+            mode: ContentMode::TitleContent,
+            source: SourceDisplay::None,
+            link_preview: false,
+            lang: Lang::Zh,
+            allow_rich: true,
+        };
+
+        let (standard, _) = format_entry_parts(&entry, "feed", None, opts, None).unwrap();
+        assert!(!standard.contains("<table"), "standard: {standard}");
+
+        let (rich, _) = format_entry_parts_with_mode(
+            &entry,
+            "feed",
+            None,
+            opts,
+            None,
+            crate::fetcher::TableMode::Rich,
+        )
+        .unwrap();
+        assert!(rich.contains("<table bordered>"), "rich: {rich}");
+        assert!(
+            !should_try_rich_text(standard_text_len(&rich, "")),
+            "short table must not trigger rich"
+        );
     }
 
     #[test]

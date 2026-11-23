@@ -47,6 +47,8 @@ pub static RE_BLOCK_CLOSE: LazyLock<regex::Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+static RE_HTML_COMMENT: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?is)<!--.*?-->").unwrap());
 static RE_BLOCKQUOTE_OPEN: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)<blockquote\b[^>]*>").unwrap());
 static RE_BLOCKQUOTE_CLOSE: LazyLock<regex::Regex> =
@@ -54,6 +56,11 @@ static RE_BLOCKQUOTE_CLOSE: LazyLock<regex::Regex> =
 static RE_ANCHOR: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"(?is)<a\b[^>]*?href\s*=\s*["']([^"']*)["'][^>]*>(.*?)</a>"#).unwrap()
 });
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableMode {
+    Flatten,
+    Rich,
+}
 const BARE_URL_CHARS: &str = r"A-Za-z0-9\-._~:/?#\[\]@!$&()*+,;=%";
 static RE_BARE_URL: LazyLock<regex::Regex> = LazyLock::new(|| {
     let pattern = format!(
@@ -481,7 +488,16 @@ pub fn entry_body_html(
     max: usize,
     meta: Option<&crate::entrymeta::EntryMeta>,
 ) -> String {
-    entry_body_html_from_source(entry_body_source(entry), max, meta)
+    entry_body_html_with_mode(entry, max, meta, TableMode::Flatten)
+}
+
+pub(crate) fn entry_body_html_with_mode(
+    entry: &Entry,
+    max: usize,
+    meta: Option<&crate::entrymeta::EntryMeta>,
+    table_mode: TableMode,
+) -> String {
+    entry_body_html_from_source_with_mode(entry_body_source(entry), max, meta, table_mode)
 }
 
 pub fn entry_body_source(entry: &Entry) -> &str {
@@ -504,6 +520,15 @@ pub(crate) fn entry_body_html_from_source(
     max: usize,
     meta: Option<&crate::entrymeta::EntryMeta>,
 ) -> String {
+    entry_body_html_from_source_with_mode(html, max, meta, TableMode::Flatten)
+}
+
+pub(crate) fn entry_body_html_from_source_with_mode(
+    html: &str,
+    max: usize,
+    meta: Option<&crate::entrymeta::EntryMeta>,
+    table_mode: TableMode,
+) -> String {
     let is_prerendered = meta.map(|m| m.prerendered_html).unwrap_or(false);
 
     let tg = if is_prerendered {
@@ -512,7 +537,7 @@ pub(crate) fn entry_body_html_from_source(
         let s = RE_SOURCE.replace_all(&s, "").to_string();
         collapse_blank_lines(&s)
     } else {
-        html_to_telegram_html(html)
+        html_to_telegram_html_with(html, table_mode)
     };
 
     let visible = crate::htmltext::decode_entities(&strip_tags(&tg));
@@ -566,6 +591,10 @@ pub(crate) fn is_video_href(href: &str) -> bool {
 }
 
 pub fn html_to_telegram_html(html: &str) -> String {
+    html_to_telegram_html_with(html, TableMode::Flatten)
+}
+
+pub(crate) fn html_to_telegram_html_with(html: &str, table_mode: TableMode) -> String {
     use std::borrow::Cow;
 
     macro_rules! replace_cow {
@@ -588,6 +617,8 @@ pub fn html_to_telegram_html(html: &str) -> String {
         s = Cow::Owned(owned);
     }
 
+    replace_cow!(s, RE_HTML_COMMENT, "");
+    replace_cow!(s, RE_NON_RENDERED_BLOCK, "");
     replace_cow!(s, RE_VIDEO_BLOCK, "");
     replace_cow!(s, RE_IMG_ALT, |caps: &regex::Captures| {
         let alt = &caps[1];
@@ -600,12 +631,6 @@ pub fn html_to_telegram_html(html: &str) -> String {
     replace_cow!(s, RE_IMG, "");
     replace_cow!(s, RE_SOURCE, "");
     replace_cow!(s, RE_VIDEO_FALLBACK_TEXT, "");
-
-    replace_cow!(s, RE_BR, "\n");
-    replace_cow!(s, RE_BLOCK_CLOSE, "\n");
-    if s.contains("</br>") {
-        s = Cow::Owned(s.replace("</br>", "\n"));
-    }
 
     replace_cow!(s, RE_BLOCKQUOTE_OPEN, "\u{FFFE}BQO\u{FFFE}");
     replace_cow!(s, RE_BLOCKQUOTE_CLOSE, "\u{FFFE}BQC\u{FFFE}");
@@ -621,7 +646,10 @@ pub fn html_to_telegram_html(html: &str) -> String {
             last = whole.end();
             continue;
         }
-        let text = crate::htmltext::decode_entities(&strip_tags(&caps[2]));
+        let mut inner = caps[2].replace("</br>", "\n");
+        inner = RE_BR.replace_all(&inner, "\n").into_owned();
+        inner = RE_BLOCK_CLOSE.replace_all(&inner, "\n").into_owned();
+        let text = crate::htmltext::decode_entities(&strip_tags(&inner));
         let text = text.trim().to_string();
         let idx = links.len();
         links.push((href, text));
@@ -633,10 +661,50 @@ pub fn html_to_telegram_html(html: &str) -> String {
     let mut buf: Cow<'_, str> = Cow::Owned(buf);
     replace_cow!(buf, RE_WEIBO_VIDEO_CARD_TEXT, "");
 
+    let mut tables: Vec<String> = Vec::new();
+    if table_mode == TableMode::Rich {
+        let (protected, rich_tables) = crate::htmltable::protect_rich_tables(&buf);
+        buf = Cow::Owned(protected);
+        tables = rich_tables
+            .into_iter()
+            .map(|table| resolve_link_tokens(&table, &links))
+            .collect();
+    }
+
+    replace_cow!(buf, RE_BR, "\n");
+    replace_cow!(buf, RE_BLOCK_CLOSE, "\n");
+    if buf.contains("</br>") {
+        buf = Cow::Owned(buf.replace("</br>", "\n"));
+    }
+
     let plain = crate::htmltext::decode_entities(&strip_tags(&buf));
     let plain = linkify_bare_urls(&plain, &mut links);
     let mut out = crate::htmltext::escape_html(&collapse_blank_lines(&plain));
+    out = resolve_link_tokens(&out, &links);
 
+    if out.contains("\u{FFFE}BQO\u{FFFE}") {
+        out = out.replace("\u{FFFE}BQO\u{FFFE}", "<blockquote expandable>");
+    }
+    if out.contains("\u{FFFE}BQC\u{FFFE}") {
+        out = out.replace("\u{FFFE}BQC\u{FFFE}", "</blockquote>");
+    }
+
+    let mut out: Cow<'_, str> = Cow::Owned(out);
+    replace_cow!(out, RE_LINE_INDENT, "");
+    replace_cow!(out, RE_MULTI_SPACE, " ");
+
+    let mut out = collapse_blank_lines(&out);
+    for (idx, table) in tables.iter().enumerate() {
+        let token = format!("\u{FFFE}TBL{}\u{FFFE}", idx);
+        if out.contains(&token) {
+            out = out.replace(&token, table);
+        }
+    }
+    out.trim().to_string()
+}
+
+fn resolve_link_tokens(html: &str, links: &[(String, String)]) -> String {
+    let mut out = html.to_string();
     for (i, (href, text)) in links.iter().enumerate() {
         let token = format!("\u{FFFC}{}\u{FFFC}", i);
         if !out.contains(&token) {
@@ -656,20 +724,7 @@ pub fn html_to_telegram_html(html: &str) -> String {
         };
         out = out.replace(&token, &replacement);
     }
-
-    if out.contains("\u{FFFE}BQO\u{FFFE}") {
-        out = out.replace("\u{FFFE}BQO\u{FFFE}", "<blockquote expandable>");
-    }
-    if out.contains("\u{FFFE}BQC\u{FFFE}") {
-        out = out.replace("\u{FFFE}BQC\u{FFFE}", "</blockquote>");
-    }
-
-    let mut out: Cow<'_, str> = Cow::Owned(out);
-    replace_cow!(out, RE_LINE_INDENT, "");
-    replace_cow!(out, RE_MULTI_SPACE, " ");
-
-    let out = collapse_blank_lines(&out);
-    out.trim().to_string()
+    out
 }
 
 #[cfg(test)]
@@ -791,6 +846,90 @@ mod tests {
         assert_eq!(title, "Head Body");
         let cells = html_to_plain("<table><tr><td>A</td><td>B</td></tr></table>");
         assert_eq!(cells, "A B");
+    }
+
+    #[test]
+    fn standard_mode_flattens_table_cells() {
+        let out = html_to_telegram_html("<table><tr><td>A</td><td>B</td></tr></table>");
+        assert_eq!(out, "A\nB");
+        assert!(!out.contains("<table"), "table leaked: {out}");
+    }
+
+    #[test]
+    fn rich_mode_preserves_table_with_safe_links_and_entities() {
+        let html = concat!(
+            "<p>before</p>",
+            r#"<table><tr><th>名称</th><th>链接</th></tr>"#,
+            r#"<tr><td>甲&amp;乙</td><td><a href="https://example.com/x?a=1&amp;b=2">详情</a></td></tr>"#,
+            "</table><p>after</p>"
+        );
+        let rich = html_to_telegram_html_with(html, TableMode::Rich);
+        assert!(rich.contains("<table bordered>"), "rich: {rich}");
+        assert!(rich.contains("<th>名称</th>"), "rich: {rich}");
+        assert!(rich.contains("<td>甲&amp;乙</td>"), "rich: {rich}");
+        assert!(
+            rich.contains(r#"<a href="https://example.com/x?a=1&amp;b=2">详情</a>"#),
+            "rich: {rich}"
+        );
+        assert!(
+            rich.contains("before") && rich.contains("after"),
+            "rich: {rich}"
+        );
+        assert!(!rich.contains("TBL"), "placeholder leaked: {rich}");
+    }
+
+    #[test]
+    fn rich_mode_rejects_wide_or_layout_tables() {
+        let cells = "<td>x</td>".repeat(21);
+        let wide = format!("<table><tr>{cells}</tr><tr>{cells}</tr></table>");
+        let rich = html_to_telegram_html_with(&wide, TableMode::Rich);
+        assert!(!rich.contains("<table"), "wide table kept: {rich}");
+        assert!(rich.contains('x'), "wide table content lost: {rich}");
+
+        let layout = concat!(
+            "<table><tr><td><ul><li>a</li></ul></td><td>b</td></tr>",
+            "<tr><td><ul><li>c</li></ul></td><td>d</td></tr></table>"
+        );
+        let rich = html_to_telegram_html_with(layout, TableMode::Rich);
+        assert!(!rich.contains("<table"), "layout table kept: {rich}");
+        assert!(
+            rich.contains('a') && rich.contains('d'),
+            "layout lost: {rich}"
+        );
+    }
+
+    #[test]
+    fn rich_mode_drops_unsafe_table_links() {
+        let html = concat!(
+            r#"<table><tr><th>A</th><th>B</th></tr><tr>"#,
+            r#"<td><a href="javascript:alert(1)">x</a></td><td>y</td></tr></table>"#
+        );
+        let rich = html_to_telegram_html_with(html, TableMode::Rich);
+        assert!(!rich.contains("javascript:"), "unsafe href kept: {rich}");
+        assert!(rich.contains("<td>x</td>"), "link text lost: {rich}");
+    }
+
+    #[test]
+    fn commented_table_is_not_rendered() {
+        let html = concat!(
+            "<!-- <table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table> -->",
+            "<!-- <style> --><p>ok</p>"
+        );
+        let rich = html_to_telegram_html_with(html, TableMode::Rich);
+        assert_eq!(rich, "ok");
+    }
+
+    #[test]
+    fn rich_mode_keeps_table_inside_blockquote() {
+        let html = concat!(
+            "<blockquote><p>quote</p>",
+            "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>",
+            "</blockquote>"
+        );
+        let rich = html_to_telegram_html_with(html, TableMode::Rich);
+        assert!(rich.contains("<table bordered>"), "rich: {rich}");
+        assert!(rich.contains("<blockquote expandable>"), "rich: {rich}");
+        assert!(rich.contains("quote"), "rich: {rich}");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use feed_rs::model::Entry;
 
 use crate::db;
-use crate::fetcher;
+use crate::fetcher::{self, TableMode};
 use crate::htmltext::{
     escape_attr, escape_html, format_chat_id_html, format_chat_title_html, split_html,
     take_utf16_prefix, truncate_html_keep_links, utf16_len, visible_len,
@@ -355,7 +355,19 @@ pub(super) fn format_entry_parts(
     opts: RenderOpts,
     meta: Option<&crate::entrymeta::EntryMeta>,
 ) -> Option<(String, String)> {
-    render_parts(entry, feed_title, author, opts, meta).map(|r| (r.parts.join("\n\n"), r.footer))
+    format_entry_parts_with_mode(entry, feed_title, author, opts, meta, TableMode::Flatten)
+}
+
+pub(super) fn format_entry_parts_with_mode(
+    entry: &Entry,
+    feed_title: &str,
+    author: Option<&str>,
+    opts: RenderOpts,
+    meta: Option<&crate::entrymeta::EntryMeta>,
+    table_mode: TableMode,
+) -> Option<(String, String)> {
+    render_parts(entry, feed_title, author, opts, meta, table_mode)
+        .map(|r| (r.parts.join("\n\n"), r.footer))
 }
 
 struct RenderedParts {
@@ -369,6 +381,7 @@ fn render_parts(
     author: Option<&str>,
     opts: RenderOpts,
     meta: Option<&crate::entrymeta::EntryMeta>,
+    table_mode: TableMode,
 ) -> Option<RenderedParts> {
     let title = fetcher::entry_title(entry, opts.lang);
     let link = fetcher::entry_link(entry);
@@ -396,14 +409,14 @@ fn render_parts(
         }
         ContentMode::TitleContent => {
             parts.push(head(true));
-            let body = fetcher::entry_body_html(entry, 100_000, meta);
+            let body = fetcher::entry_body_html_with_mode(entry, 100_000, meta, table_mode);
             if visible_len(&body) > 0 {
                 parts.push(body);
             }
         }
         ContentMode::TitleOnly => parts.push(head(false)),
         ContentMode::ContentOnly => {
-            let body = fetcher::entry_body_html(entry, 100_000, meta);
+            let body = fetcher::entry_body_html_with_mode(entry, 100_000, meta, table_mode);
             if visible_len(&body) == 0 {
                 parts.push(head(false));
             } else {
@@ -424,7 +437,18 @@ pub(super) fn format_caption(
     opts: RenderOpts,
     meta: Option<&crate::entrymeta::EntryMeta>,
 ) -> String {
-    let Some(rendered) = render_parts(entry, feed_title, author, opts, meta) else {
+    format_caption_with_mode(entry, feed_title, author, opts, meta, TableMode::Flatten)
+}
+
+pub(super) fn format_caption_with_mode(
+    entry: &Entry,
+    feed_title: &str,
+    author: Option<&str>,
+    opts: RenderOpts,
+    meta: Option<&crate::entrymeta::EntryMeta>,
+    table_mode: TableMode,
+) -> String {
+    let Some(rendered) = render_parts(entry, feed_title, author, opts, meta, table_mode) else {
         return source_line(entry, feed_title, author, opts.source);
     };
     let mut parts = rendered.parts;
@@ -466,4 +490,20 @@ pub(super) fn plan_text_chunks(html_text: &str, footer: &str) -> (String, Vec<St
         }
     }
     (footer, chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rich_html_keeps_table_markup_compact() {
+        let table =
+            "<table bordered><tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td></tr></table>";
+        let out = rich_html(&format!("before\n{table}\nafter"), "", "", true);
+        assert!(out.contains(table), "out: {out}");
+        assert!(!out.contains("<td><br>"), "out: {out}");
+        assert!(!out.contains("</td><br>"), "out: {out}");
+        assert!(!out.contains("<br><table"), "out: {out}");
+    }
 }

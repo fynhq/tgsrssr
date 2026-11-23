@@ -10,6 +10,7 @@ mod errors;
 mod fetcher;
 mod fsutil;
 mod htmlentities;
+mod htmltable;
 mod htmltext;
 mod httpfollow;
 mod i18n;
