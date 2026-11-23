@@ -1,7 +1,7 @@
 use teloxide::prelude::*;
-use tracing::warn;
+use tracing::{error, warn};
 
-use crate::db;
+use crate::db::{self, Db};
 use crate::i18n::{self, Lang};
 use crate::notify::{
     notify_download_failed, notify_oversized_videos, notify_owner_html, push_line,
@@ -154,23 +154,50 @@ impl SendSuccessCtx<'_> {
         &self,
         outcome: &push::SendOutcome,
         mark_log: &'static str,
-    ) {
-        if let Some(mid) = outcome.delivered_message_id {
-            db::record_sent_message(
-                &self.state.db,
-                self.chat_id,
-                mid,
-                self.feed_url,
-                self.entry_id,
-                outcome.entry_link.as_deref(),
-            )
-            .await
-            .ok();
-        }
-        if let Err(e) =
-            db::mark_entry_sent(&self.state.db, self.chat_id, self.feed_url, self.entry_id).await
-        {
-            warn!(feed = %self.feed_url, entry_id = %self.entry_id, error = %e, "{}", mark_log);
+    ) -> bool {
+        record_and_mark_sent(
+            &self.state.db,
+            self.chat_id,
+            self.feed_url,
+            self.entry_id,
+            outcome,
+            mark_log,
+        )
+        .await
+    }
+}
+
+async fn record_and_mark_sent(
+    db_pool: &Db,
+    chat_id: &str,
+    feed_url: &str,
+    entry_id: &str,
+    outcome: &push::SendOutcome,
+    mark_log: &'static str,
+) -> bool {
+    if let Some(mid) = outcome.delivered_message_id {
+        db::record_sent_message(
+            db_pool,
+            chat_id,
+            mid,
+            feed_url,
+            entry_id,
+            outcome.entry_link.as_deref(),
+        )
+        .await
+        .ok();
+    }
+    match db::mark_entry_sent(db_pool, chat_id, feed_url, entry_id).await {
+        Ok(()) => true,
+        Err(e) => {
+            error!(
+                feed = %feed_url,
+                entry_id = %entry_id,
+                error = %e,
+                "{}",
+                mark_log
+            );
+            false
         }
     }
 }
@@ -216,7 +243,11 @@ pub(super) async fn apply_send_success(
                 .await;
             }
             SendSuccessEffect::RecordAndMarkSent => {
-                ctx.record_and_mark_sent(outcome, mark_log).await;
+                // Keep the outbox row when the dedup mark fails: a bounded retry beats an
+                // untracked entry the next fetch cycle could replay indefinitely.
+                if !ctx.record_and_mark_sent(outcome, mark_log).await {
+                    break;
+                }
             }
             SendSuccessEffect::DeleteOutboxRow => {
                 let Some(row_id) = extras.outbox_row_id else {
@@ -381,5 +412,34 @@ mod tests {
                 SendSuccessEffect::RecordAndMarkSent,
             ]
         );
+    }
+
+    async fn test_pool() -> Db {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn mark_failure_is_reported_to_the_caller() {
+        let db = test_pool().await;
+        sqlx::query("DROP TABLE sent_entries")
+            .execute(&db)
+            .await
+            .unwrap();
+        let marked = record_and_mark_sent(
+            &db,
+            "1",
+            "https://example.com/feed",
+            "e1",
+            &outcome(),
+            "test mark",
+        )
+        .await;
+        assert!(!marked);
     }
 }

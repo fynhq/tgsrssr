@@ -242,10 +242,17 @@ async fn run_fetch_cycle(state: &AppState, bot: &Bot) -> anyhow::Result<()> {
         let feed_url = sub.feed_url.clone();
         let chat_id = sub.chat_id.clone();
         match process_feed(state, bot, sub, cfg, &stats).await {
-            Ok(FeedStatus::Ok) => plat_ok += 1,
-            Ok(FeedStatus::Failed) => plat_fail += 1,
+            Ok(FeedStatus::Ok) => {
+                plat_ok += 1;
+                record_platform_outcome(&stats, &feed_url, true).await;
+            }
+            Ok(FeedStatus::Failed) => {
+                plat_fail += 1;
+                record_platform_outcome(&stats, &feed_url, false).await;
+            }
             Err(e) => {
                 plat_fail += 1;
+                record_platform_outcome(&stats, &feed_url, false).await;
                 error!(feed = %feed_url, chat_id = %chat_id, error = %e, "platform feed processing failed");
             }
         }
@@ -625,8 +632,7 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
                     return Ok(MediaGateAction::DeferContinue);
                 }
             };
-            let step =
-                policy::media_retry_step(true, true, Ok(stored), !notify_warnings.is_empty());
+            let step = policy::media_retry_step(true, true, stored, !notify_warnings.is_empty());
             match step {
                 policy::MediaRetryStep::Abandon { fail_count } => {
                     warn!(entry_id = %eid, feed = %cfg.feed_url, count = fail_count, "MediaOnly download retries exhausted, abandoning");
@@ -670,7 +676,12 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
                     }
                     return Ok(MediaGateAction::DeferContinue);
                 }
-                _ => {}
+                policy::MediaRetryStep::Proceed => {
+                    unreachable!("media-only retry step cannot proceed")
+                }
+                policy::MediaRetryStep::Degrade { .. } => {
+                    unreachable!("media-only retry step cannot degrade")
+                }
             }
         }
         if !has_download_warnings {
@@ -689,7 +700,7 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
                 return Ok(MediaGateAction::DeferContinue);
             }
         };
-        match policy::media_retry_step(false, true, Ok(stored), false) {
+        match policy::media_retry_step(false, true, stored, false) {
             policy::MediaRetryStep::Retry { fail_count, .. } => {
                 if let Err(e) =
                     db::set_setting(&state.db, &retry_key, &fail_count.to_string()).await
@@ -706,7 +717,12 @@ async fn media_gate(ctx: &MediaGateCtx<'_>) -> anyhow::Result<MediaGateAction> {
                 dl_retry_note =
                     i18n::t(lang, "notif_dl_retried").replacen("{}", &fail_count.to_string(), 1);
             }
-            _ => {}
+            policy::MediaRetryStep::Proceed => {
+                unreachable!("download failure path cannot proceed")
+            }
+            policy::MediaRetryStep::Abandon { .. } => {
+                unreachable!("non-media-only retry step cannot abandon")
+            }
         }
     }
 
@@ -729,7 +745,6 @@ async fn handle_fetch_failure(
     warn!(feed = %sub.feed_url, error = %err_msg, "fetch failed");
 
     if let Some(p) = platform_of_url(&sub.feed_url) {
-        stats.failed.lock().await.insert(p);
         stats.last_err.lock().await.insert(p, err_msg.clone());
     }
 
@@ -1144,10 +1159,6 @@ async fn process_feed(
             let notify_key = db::setting_key::auto_disable_notified(&sub.chat_id, &sub.feed_url);
             db::delete_setting(&state.db, &notify_key).await.ok();
 
-            if let Some(p) = platform_of_url(&sub.feed_url) {
-                stats.ok.lock().await.insert(p);
-            }
-
             if fr.not_modified {
                 return Ok(FeedStatus::Ok);
             }
@@ -1385,6 +1396,18 @@ async fn process_feed(
 
 fn platform_of_url(feed_url: &str) -> Option<&'static str> {
     crate::platforms::platform_for_url(feed_url).map(|p| p.id)
+}
+
+// One owner for the platform health sample: ok/failed both derive from the feed status.
+async fn record_platform_outcome(stats: &PlatRoundStats, feed_url: &str, ok: bool) {
+    let Some(p) = platform_of_url(feed_url) else {
+        return;
+    };
+    if ok {
+        stats.ok.lock().await.insert(p);
+    } else {
+        stats.failed.lock().await.insert(p);
+    }
 }
 
 fn marks_cookie_expired(error: &anyhow::Error, err_msg: &str) -> bool {

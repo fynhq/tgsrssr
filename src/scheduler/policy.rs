@@ -11,7 +11,6 @@ pub(super) enum FlowAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MediaRetryStep {
     Proceed,
-    ReadError,
     Retry { fail_count: i64, notify: bool },
     Abandon { fail_count: i64 },
     Degrade { fail_count: i64 },
@@ -20,13 +19,9 @@ pub(super) enum MediaRetryStep {
 pub(super) fn media_retry_step(
     media_only: bool,
     download_failed: bool,
-    stored: Result<i64, ()>,
+    stored: i64,
     notify_warnings: bool,
 ) -> MediaRetryStep {
-    let stored = match stored {
-        Ok(n) => n,
-        Err(()) => return MediaRetryStep::ReadError,
-    };
     if media_only {
         let fail_count = stored.saturating_add(1);
         if fail_count >= MEDIA_DL_MAX_RETRIES {
@@ -100,25 +95,25 @@ mod tests {
     #[test]
     fn media_only_counts_up_to_the_cap_then_abandons() {
         assert_eq!(
-            media_retry_step(true, true, Ok(0), true),
+            media_retry_step(true, true, 0, true),
             MediaRetryStep::Retry {
                 fail_count: 1,
                 notify: true
             }
         );
         assert_eq!(
-            media_retry_step(true, true, Ok(8), true),
+            media_retry_step(true, true, 8, true),
             MediaRetryStep::Retry {
                 fail_count: 9,
                 notify: true
             }
         );
         assert_eq!(
-            media_retry_step(true, true, Ok(9), false),
+            media_retry_step(true, true, 9, false),
             MediaRetryStep::Abandon { fail_count: 10 }
         );
         assert_eq!(
-            media_retry_step(true, true, Ok(i64::MAX), true),
+            media_retry_step(true, true, i64::MAX, true),
             MediaRetryStep::Abandon {
                 fail_count: i64::MAX
             }
@@ -128,21 +123,21 @@ mod tests {
     #[test]
     fn normal_mode_defers_then_degrades_on_the_third_failure() {
         assert_eq!(
-            media_retry_step(false, true, Ok(0), false),
+            media_retry_step(false, true, 0, false),
             MediaRetryStep::Retry {
                 fail_count: 1,
                 notify: false
             }
         );
         assert_eq!(
-            media_retry_step(false, true, Ok(1), true),
+            media_retry_step(false, true, 1, true),
             MediaRetryStep::Retry {
                 fail_count: 2,
                 notify: false
             }
         );
         assert_eq!(
-            media_retry_step(false, true, Ok(2), true),
+            media_retry_step(false, true, 2, true),
             MediaRetryStep::Degrade { fail_count: 3 }
         );
     }
@@ -150,24 +145,12 @@ mod tests {
     #[test]
     fn no_download_failure_proceeds_without_counting() {
         assert_eq!(
-            media_retry_step(false, false, Ok(0), false),
+            media_retry_step(false, false, 0, false),
             MediaRetryStep::Proceed
         );
         assert_eq!(
-            media_retry_step(false, false, Ok(5), true),
+            media_retry_step(false, false, 5, true),
             MediaRetryStep::Proceed
-        );
-    }
-
-    #[test]
-    fn counter_read_error_is_never_treated_as_zero() {
-        assert_eq!(
-            media_retry_step(true, true, Err(()), true),
-            MediaRetryStep::ReadError
-        );
-        assert_eq!(
-            media_retry_step(false, true, Err(()), false),
-            MediaRetryStep::ReadError
         );
     }
 
