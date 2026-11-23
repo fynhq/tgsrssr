@@ -211,19 +211,22 @@ async fn send_chunks(
 ) -> ResponseResult<()> {
     let mut first_msg: Option<teloxide::types::MessageId> = None;
     for (i, chunk) in chunks.iter().enumerate() {
-        let mut req = bot
-            .send_message(chat_id, chunk)
-            .parse_mode(ParseMode::Html)
-            .link_preview_options(no_preview());
-        if let Some(first) = first_msg {
-            req = req.reply_parameters(teloxide::types::ReplyParameters::new(first));
-        }
-        let m = req.await?;
-        if first_msg.is_none() {
-            first_msg = Some(m.id);
-        }
-        if i + 1 < chunks.len() {
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        match crate::push::send_chunk_with_retry(bot, chat_id.0, chunk, false, first_msg).await {
+            Ok(m) => {
+                if first_msg.is_none() {
+                    first_msg = Some(m.id);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    chat_id = chat_id.0,
+                    failed_chunk = i,
+                    total_chunks = chunks.len(),
+                    error = %format!("{:#}", e),
+                    "chunked reply failed; remaining chunks skipped"
+                );
+                break;
+            }
         }
     }
     Ok(())
@@ -296,34 +299,16 @@ async fn handle_list(
         })
         .collect();
 
-    const LIST_CHUNK_LIMIT: usize = 4000;
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = header;
+    let mut text = header;
     for line in lines {
-        let line = if push::utf16_len(&line) > LIST_CHUNK_LIMIT {
-            let (cut, truncated) = crate::htmltext::truncate_html_keep_links(
-                &line,
-                LIST_CHUNK_LIMIT.saturating_sub(1),
-            );
-            if truncated {
-                format!("{cut}…")
-            } else {
-                cut
-            }
-        } else {
-            line
-        };
-        let candidate = format!("{}{}", current, line);
-        if push::utf16_len(&candidate) <= LIST_CHUNK_LIMIT {
-            current = candidate;
-        } else {
-            chunks.push(std::mem::take(&mut current));
-            current = line;
-        }
+        text.push_str(&line);
     }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
+    let chunks = crate::htmltext::split_html(&text, push::CHUNK_LIMIT);
+    let chunks = if chunks.is_empty() {
+        vec![text]
+    } else {
+        chunks
+    };
 
     send_chunks(bot, msg.chat.id, &chunks).await?;
     Ok(())
@@ -588,7 +573,7 @@ async fn handle_sub(
     let text = format!("{}\n{}", header, results.join("\n"));
     let text = push::normalize_blockquote_fold(&text);
 
-    let chunks = crate::htmltext::split_html(&text, 4000);
+    let chunks = crate::htmltext::split_html(&text, push::CHUNK_LIMIT);
     let chunks = if chunks.is_empty() {
         vec![text]
     } else {

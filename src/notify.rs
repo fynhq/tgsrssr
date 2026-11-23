@@ -49,7 +49,7 @@ async fn send_message_with_pace_flood(
 
 pub(crate) async fn notify_user_html(bot: &Bot, user_id: i64, html_msg: &str) -> bool {
     let html_msg = push::normalize_blockquote_fold(html_msg);
-    const NOTIFY_MAX_VISIBLE: usize = 4000;
+    const NOTIFY_MAX_VISIBLE: usize = push::CHUNK_LIMIT;
     let html_msg = if push::visible_len(&html_msg) > NOTIFY_MAX_VISIBLE {
         let (cut, _) = crate::htmltext::truncate_html_keep_links(
             &html_msg,
