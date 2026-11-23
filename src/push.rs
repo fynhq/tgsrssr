@@ -30,6 +30,8 @@ use render::{
 };
 
 const SAFE_LIMIT: usize = 4096;
+// Leave headroom below SAFE_LIMIT for markup growth and the reply-chain overhead.
+pub(crate) const CHUNK_LIMIT: usize = 4000;
 const CAPTION_LIMIT: usize = 1024;
 const RICH_TEXT_MAX: usize = 32768;
 const RICH_MEDIA_MAX: usize = 50;
@@ -346,13 +348,20 @@ async fn rich_source_for_path(
     })
 }
 
+// One owner for the file_id cache key layout: <content hash>:<send mode>.
+const FILE_ID_DOC_MODE: &str = "doc";
+
+fn file_id_key(content_hash: &str, mode: &str) -> String {
+    format!("{}:{}", content_hash, mode)
+}
+
 async fn rich_source_for_item(
     db: &Db,
     item: &MediaItem,
     transport: &crate::media::MediaTransport,
     mode: &str,
 ) -> anyhow::Result<RichMediaSource> {
-    let key = format!("{}:{}", item.content_hash, mode);
+    let key = file_id_key(&item.content_hash, mode);
     if let Ok(Some(fid)) = db::get_cached_file_id(db, &key).await {
         return Ok(RichMediaSource::FileId(fid));
     }
@@ -360,7 +369,7 @@ async fn rich_source_for_item(
 }
 
 async fn rich_source_for_doc(db: &Db, item: &MediaItem) -> anyhow::Result<RichMediaSource> {
-    let key = format!("{}:doc", item.content_hash);
+    let key = file_id_key(&item.content_hash, FILE_ID_DOC_MODE);
     if let Ok(Some(fid)) = db::get_cached_file_id(db, &key).await {
         return Ok(RichMediaSource::FileId(fid));
     }
@@ -452,7 +461,7 @@ async fn try_send_rich_text(
     body: &str,
     footer: &str,
 ) -> anyhow::Result<Message> {
-    let html = normalize_blockquote_fold(&rich_html(body, footer, "", true));
+    let html = rich_html(body, footer, "", true);
     send_rich_once(bot, chat_id, html, Vec::new()).await
 }
 
@@ -492,7 +501,7 @@ async fn try_send_rich_media(
     }
 
     let media_html = rich_media_html(album_media, docs);
-    let html = normalize_blockquote_fold(&rich_html(text, "", &media_html, caption_above_media));
+    let html = rich_html(text, "", &media_html, caption_above_media);
     let media = build_rich_media_specs(db, album_media, docs, transport).await?;
     send_rich_once(bot, chat_id, html, media).await
 }
@@ -519,7 +528,7 @@ async fn resolve_input(
     use_cache: bool,
 ) -> anyhow::Result<InputFile> {
     if use_cache {
-        let key = format!("{}:{}", item.content_hash, mode);
+        let key = file_id_key(&item.content_hash, mode);
         if let Ok(Some(fid)) = db::get_cached_file_id(db, &key).await {
             return Ok(InputFile::file_id(teloxide::types::FileId(fid)));
         }
@@ -549,7 +558,7 @@ fn group_item_mode(m: &MediaItem) -> &'static str {
 
 async fn cache_file_id(db: &Db, item: &MediaItem, mode: &str, file_id: Option<String>) {
     if let Some(fid) = file_id {
-        let key = format!("{}:{}", item.content_hash, mode);
+        let key = file_id_key(&item.content_hash, mode);
         db::put_cached_file_id(db, &key, &fid).await.ok();
     }
 }
@@ -562,7 +571,7 @@ async fn invalidate_op_cache(db: &Db, op: &RichOp<'_>) {
         RichOp::Group(items) => items.iter().map(|m| (*m, group_item_mode(m))).collect(),
     };
     for (item, mode) in items {
-        let key = format!("{}:{}", item.content_hash, mode);
+        let key = file_id_key(&item.content_hash, mode);
         db::invalidate_cached_file_id(db, &key).await.ok();
     }
 }
@@ -667,6 +676,11 @@ fn plan_caption(full_caption: &str) -> CaptionPlan {
 
 fn doc_fallback_allowed(err_str: &str) -> bool {
     !crate::sendpolicy::is_ambiguous_send_error(err_str)
+}
+
+// A replay of the body is safe only when the first media op is known not to have been delivered.
+fn media_fallback_allowed(sent: usize, err_str: &str) -> bool {
+    sent > 0 || doc_fallback_allowed(err_str)
 }
 
 struct TailDelivery {
@@ -1152,14 +1166,27 @@ pub async fn send_entry_with_media(
                 tail.caption_delivered = true;
             }
             Err((sent, delivered, e)) => {
+                let err_str = error_chain_string(e.as_ref());
                 tracing::warn!(
                     chat_id = chat_id,
                     entry_id = %fetcher::entry_id(entry),
                     failed_op = sent,
                     total_ops = rich_ops.len(),
-                    error = %e,
+                    error = %err_str,
                     "media send failed, falling back to text"
                 );
+                if !media_fallback_allowed(sent, &err_str) {
+                    tracing::warn!(
+                        chat_id = chat_id,
+                        entry_id = %fetcher::entry_id(entry),
+                        "media send outcome uncertain; not falling back to text"
+                    );
+                    return Ok(SendOutcome {
+                        entry_link: fetcher::entry_link(entry),
+                        uncertain: true,
+                        ..SendOutcome::default()
+                    });
+                }
                 return fallback_after_main_media_failure(
                     bot,
                     db,
@@ -1281,7 +1308,7 @@ async fn send_doc_group(
         pace(chat_id).await;
         let keys: Vec<String> = chunk
             .iter()
-            .map(|d| format!("{}:doc", d.content_hash))
+            .map(|d| file_id_key(&d.content_hash, FILE_ID_DOC_MODE))
             .collect();
         let has_thumb = chunk.iter().any(|d| d.thumb_path.is_some());
         let msgs = send_with_full_retry(db, chat_id, &keys, has_thumb, |use_cache, use_thumbs| {
@@ -1386,7 +1413,7 @@ async fn send_doc_msg(
     pace(chat_id).await;
     let caption = normalize_blockquote_fold(caption);
     let caption = caption.as_str();
-    let key = format!("{}:doc", d.content_hash);
+    let key = file_id_key(&d.content_hash, FILE_ID_DOC_MODE);
     let m = send_with_full_retry(
         db,
         chat_id,
@@ -1861,7 +1888,7 @@ async fn send_single_html(
     }
 }
 
-async fn send_chunk_with_retry(
+pub(crate) async fn send_chunk_with_retry(
     bot: &Bot,
     chat_id: i64,
     text: &str,
@@ -1933,6 +1960,20 @@ mod tests {
         assert!(doc_fallback_allowed(
             "Telegram API error 400: Bad Request: chat not found"
         ));
+    }
+
+    #[test]
+    fn media_fallback_blocked_only_before_first_op() {
+        assert!(!media_fallback_allowed(0, "request timed out after 600s"));
+        assert!(!media_fallback_allowed(
+            0,
+            "Telegram API error 502: Bad Gateway"
+        ));
+        assert!(media_fallback_allowed(
+            0,
+            "Telegram API error 400: Bad Request: chat not found"
+        ));
+        assert!(media_fallback_allowed(1, "request timed out after 600s"));
     }
 
     #[test]

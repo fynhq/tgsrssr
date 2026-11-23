@@ -3,8 +3,9 @@ use feed_rs::model::Entry;
 use crate::db;
 use crate::fetcher::{self, TableMode};
 use crate::htmltext::{
-    escape_attr, escape_html, format_chat_id_html, format_chat_title_html, split_html,
-    take_utf16_prefix, truncate_html_keep_links, utf16_len, visible_len,
+    escape_attr, escape_html, format_chat_id_html, format_chat_title_html,
+    normalize_blockquote_fold, split_html, take_utf16_prefix, truncate_html_keep_links, utf16_len,
+    visible_len,
 };
 use crate::i18n::Lang;
 use crate::media::{MediaItem, MediaKind};
@@ -220,7 +221,8 @@ pub(super) fn rich_html(
         }
         text.push_str(footer);
     }
-    let text = preserve_rich_linebreaks(&text);
+    // Fold before newline conversion: the header rule scans for literal blank lines.
+    let text = preserve_rich_linebreaks(&normalize_blockquote_fold(&text));
 
     if media_html.is_empty() {
         return text;
@@ -505,5 +507,13 @@ mod tests {
         assert!(!out.contains("<td><br>"), "out: {out}");
         assert!(!out.contains("</td><br>"), "out: {out}");
         assert!(!out.contains("<br><table"), "out: {out}");
+    }
+
+    #[test]
+    fn rich_html_folds_short_blockquote_header_before_linebreaks() {
+        let body = format!("<blockquote>header\n\n{}</blockquote>", "x".repeat(300));
+        let out = rich_html(&body, "", "", true);
+        assert!(out.contains("header<br>x"), "out: {out}");
+        assert!(out.contains("<blockquote expandable>"), "out: {out}");
     }
 }
