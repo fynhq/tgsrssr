@@ -315,25 +315,28 @@ fn is_placeholder_image(url: &str) -> bool {
         .any(|prefix| file.starts_with(prefix))
 }
 
-fn is_weibo_host(host: &str) -> bool {
-    fn domain_or_subdomain(host: &str, domain: &str) -> bool {
-        host == domain || host.ends_with(&format!(".{}", domain))
-    }
-    domain_or_subdomain(host, "sinaimg.cn")
-        || domain_or_subdomain(host, "weibocdn.com")
-        || domain_or_subdomain(host, "weibo.com")
-        || domain_or_subdomain(host, "weibo.cn")
+fn media_enrich_for(url: &str) -> Option<&'static crate::platforms::MediaEnrich> {
+    crate::platforms::PLATFORMS
+        .iter()
+        .filter_map(|p| p.media_enrich)
+        .find(|e| (e.matches_url)(url))
 }
 
 fn referer_for(url: &str) -> Option<&'static str> {
-    let host = url::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-        .unwrap_or_default();
-    if is_weibo_host(&host) {
-        Some("https://weibo.com/")
-    } else {
-        None
+    media_enrich_for(url).and_then(|e| e.referer)
+}
+
+fn upgrade_image_url(url: &str) -> String {
+    match media_enrich_for(url) {
+        Some(e) => (e.upgrade_image_url)(url),
+        None => url.to_string(),
+    }
+}
+
+async fn enrich_video_url(state: &AppState, owner_mid: Option<&str>, url: &str) -> String {
+    match media_enrich_for(url) {
+        Some(e) => (e.enrich_video_url)(state, owner_mid, url).await,
+        None => url.to_string(),
     }
 }
 
@@ -345,252 +348,6 @@ fn media_accept(kind: MediaKind) -> &'static str {
         }
         MediaKind::Other => "*/*",
     }
-}
-
-fn upgrade_weibo_size(url: &str) -> String {
-    let Ok(mut u) = url::Url::parse(url) else {
-        return url.to_string();
-    };
-    let Some(host) = u.host_str().map(|h| h.to_lowercase()) else {
-        return url.to_string();
-    };
-    if !is_weibo_host(&host) {
-        return url.to_string();
-    }
-    let segs: Vec<String> = u
-        .path_segments()
-        .map(|s| s.map(str::to_string).collect())
-        .unwrap_or_default();
-    if segs.is_empty() {
-        return url.to_string();
-    }
-    if !is_weibo_size_seg(&segs[0]) {
-        return url.to_string();
-    }
-    let mut new_segs = segs.clone();
-    new_segs[0] = "large".to_string();
-    let new_path = format!("/{}", new_segs.join("/"));
-    u.set_path(&new_path);
-    u.to_string()
-}
-
-fn is_weibo_size_seg(seg: &str) -> bool {
-    const NAMED: [&str; 7] = [
-        "thumbnail",
-        "square",
-        "bmiddle",
-        "small",
-        "orj360",
-        "orj480",
-        "large",
-    ];
-    if NAMED.contains(&seg) {
-        return true;
-    }
-    let digits = seg
-        .strip_prefix("bmw")
-        .or_else(|| seg.strip_prefix("mw"))
-        .or_else(|| seg.strip_prefix("orj"));
-    matches!(digits, Some(d) if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
-}
-
-async fn upgrade_weibo_video_hd(state: &AppState, owner_mid: Option<&str>, url: &str) -> String {
-    let host = url::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-        .unwrap_or_default();
-    if !is_weibo_host(&host) {
-        return url.to_string();
-    }
-
-    let Some(mid) = owner_mid.filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_digit()))
-    else {
-        return url.to_string();
-    };
-    let mid = mid.to_string();
-
-    let user_cookies = state.get_cookie("weibo").await.unwrap_or_default();
-
-    if let Some(visitor) = weibo_visitor_cookie(state).await {
-        if let Some(hd) = weibo_hd_from_desktop_api(state, &mid, &visitor).await {
-            return hd;
-        }
-    }
-    if !user_cookies.is_empty() {
-        if let Some(hd) = weibo_hd_from_desktop_api(state, &mid, &user_cookies).await {
-            return hd;
-        }
-    }
-
-    let api = format!("https://m.weibo.cn/statuses/show?id={}", mid);
-    let Ok(resp) = crate::httpfollow::get_follow_redirects(
-        state,
-        &api,
-        false,
-        None,
-        "weibo",
-        crate::httpfollow::MAX_REDIRECTS,
-        |client, cur_url, hop| {
-            let mut req = client
-                .get(cur_url)
-                .header("Referer", "https://m.weibo.cn/")
-                .header("User-Agent", crate::state::MOBILE_BROWSER_UA)
-                .header("Accept", "application/json, text/plain, */*");
-            if !user_cookies.is_empty()
-                && (hop == 0 || crate::httpfollow::same_origin(cur_url, &api))
-            {
-                req = req.header("Cookie", user_cookies.as_str());
-            }
-            req
-        },
-    )
-    .await
-    else {
-        return url.to_string();
-    };
-    let Ok(json) = crate::fetcher::read_json_capped(resp, "weibo HD mobile API").await else {
-        return url.to_string();
-    };
-
-    let Some(urls) = json.pointer("/data/page_info/urls") else {
-        return url.to_string();
-    };
-    if let Some(v) = crate::platforms::weibo::best_video_url(urls) {
-        debug!(mid = %mid, url = %v, "weibo HD video resolved (mobile api)");
-        return v;
-    }
-    url.to_string()
-}
-
-pub(crate) async fn weibo_visitor_cookie(state: &AppState) -> Option<String> {
-    const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-    const NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-    {
-        let guard = state.weibo_visitor_cookie.lock().await;
-        if let Some((cookie, ts)) = guard.as_ref() {
-            let ttl = if cookie.is_empty() { NEGATIVE_TTL } else { TTL };
-            if ts.elapsed() < ttl {
-                return if cookie.is_empty() {
-                    None
-                } else {
-                    Some(cookie.clone())
-                };
-            }
-        }
-    }
-
-    let _handshake = state.weibo_visitor_cookie_fetch.lock().await;
-    {
-        let guard = state.weibo_visitor_cookie.lock().await;
-        if let Some((cookie, ts)) = guard.as_ref() {
-            let ttl = if cookie.is_empty() { NEGATIVE_TTL } else { TTL };
-            if ts.elapsed() < ttl {
-                return if cookie.is_empty() {
-                    None
-                } else {
-                    Some(cookie.clone())
-                };
-            }
-        }
-    }
-    let cookie = fetch_visitor_cookie(state).await;
-    {
-        let mut guard = state.weibo_visitor_cookie.lock().await;
-        *guard = Some((
-            cookie.clone().unwrap_or_default(),
-            std::time::Instant::now(),
-        ));
-    }
-    cookie
-}
-
-async fn fetch_visitor_cookie(state: &AppState) -> Option<String> {
-    let gen_url = "https://passport.weibo.com/visitor/genvisitor";
-    let fp = r#"{"os":"1","browser":"Chrome130,0,0,0","fonts":"undefined","screenInfo":"1920*1080*24","plugins":""}"#;
-    let body = format!("cb=gen_callback&fp={}", urlencoding(fp));
-    let resp = crate::httpfollow::get_follow_redirects(
-        state,
-        gen_url,
-        false,
-        None,
-        "weibo",
-        crate::httpfollow::MAX_REDIRECTS,
-        |client, cur_url, _hop| {
-            client
-                .post(cur_url)
-                .header("Referer", "https://weibo.com/")
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .body(body.clone())
-        },
-    )
-    .await
-    .ok()?;
-    let body = crate::fetcher::read_body_capped(resp, "weibo visitor genvisitor")
-        .await
-        .ok()?;
-    let text = String::from_utf8_lossy(&body).into_owned();
-
-    let json_str = text
-        .strip_prefix("gen_callback(")
-        .and_then(|s| s.strip_suffix(");"))
-        .or_else(|| {
-            text.strip_prefix("gen_callback(")
-                .and_then(|s| s.strip_suffix(")"))
-        })?;
-    let data: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    let tid = data.pointer("/data/tid").and_then(|v| v.as_str())?;
-    let new_tid = data
-        .pointer("/data/new_tid")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let confidence = data
-        .pointer("/data/confidence")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(100);
-
-    let w = if new_tid { 3 } else { 2 };
-    let incarnate_url = format!(
-        "https://passport.weibo.com/visitor/visitor?a=incarnate&t={}&w={}&c={:03}&gc=&cb=cross_domain&from=weibo&_rand=0.{}",
-        urlencoding(tid), w, confidence,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(123456789)
-    );
-    let resp2 = crate::httpfollow::get_follow_redirects(
-        state,
-        &incarnate_url,
-        false,
-        None,
-        "weibo",
-        crate::httpfollow::MAX_REDIRECTS,
-        |client, cur_url, _hop| client.get(cur_url).header("Referer", "https://weibo.com/"),
-    )
-    .await
-    .ok()?;
-
-    let mut sub = String::new();
-    let mut subp = String::new();
-    for value in resp2.headers().get_all("set-cookie") {
-        let Ok(s) = value.to_str() else { continue };
-        if let Some(v) = crate::htmltext::extract_cookie_value(s, "SUB") {
-            sub = v;
-        } else if let Some(v) = crate::htmltext::extract_cookie_value(s, "SUBP") {
-            subp = v;
-        }
-    }
-    if sub.is_empty() {
-        debug!("weibo visitor cookie: incarnate returned no SUB");
-        return None;
-    }
-    let cookie = if subp.is_empty() {
-        format!("SUB={}", sub)
-    } else {
-        format!("SUB={}; SUBP={}", sub, subp)
-    };
-    debug!("weibo visitor cookie obtained (fresh handshake)");
-    Some(cookie)
 }
 
 fn sniff_gif(path: &std::path::Path) -> bool {
@@ -781,89 +538,6 @@ fn looks_like_gif(mime: &str, url: &str) -> bool {
 
 fn single_mode_skips(kind: &MediaKind, mime: &str, url: &str) -> bool {
     *kind == MediaKind::Other || (*kind == MediaKind::Image && looks_like_gif(mime, url))
-}
-
-fn urlencoding(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push_str(&format!("%{:02X}", b));
-            }
-        }
-    }
-    out
-}
-
-async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -> Option<String> {
-    let api = format!("https://weibo.com/ajax/statuses/show?id={}", mid);
-    let resp = crate::httpfollow::get_follow_redirects(
-        state,
-        &api,
-        false,
-        None,
-        "weibo",
-        crate::httpfollow::MAX_REDIRECTS,
-        |client, cur_url, hop| {
-            let mut req = client
-                .get(cur_url)
-                .header("Referer", "https://weibo.com/")
-                .header("Accept", "application/json, text/plain, */*")
-                .header("X-Requested-With", "XMLHttpRequest");
-            if !cookies.is_empty() && (hop == 0 || crate::httpfollow::same_origin(cur_url, &api)) {
-                req = req.header("Cookie", cookies);
-            }
-            req
-        },
-    )
-    .await
-    .ok()?;
-    let json = crate::fetcher::read_json_capped(resp, "weibo HD playback API")
-        .await
-        .ok()?;
-
-    let list = json
-        .pointer("/page_info/media_info/playback_list")
-        .and_then(|v| v.as_array())?;
-
-    let mut best: Option<(i64, i64, &str)> = None;
-    for item in list {
-        let Some(pi) = item.get("play_info") else {
-            continue;
-        };
-        let vurl = pi.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        if vurl.is_empty() {
-            continue;
-        }
-        let label = pi.get("label").and_then(|v| v.as_str()).unwrap_or("");
-        if label.starts_with("scrubber") {
-            continue;
-        }
-        let w = pi.get("width").and_then(|v| v.as_i64()).unwrap_or(0);
-        let h = pi.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
-        let bitrate = pi.get("bitrate").and_then(|v| v.as_i64()).unwrap_or(0);
-        let pixels = w * h;
-        if pixels == 0 {
-            continue;
-        }
-        let better = match &best {
-            None => true,
-            Some((bp, bb, _)) => pixels > *bp || (pixels == *bp && bitrate > *bb),
-        };
-        if better {
-            best = Some((pixels, bitrate, vurl));
-        }
-    }
-
-    if let Some((pixels, bitrate, vurl)) = best {
-        debug!(mid = %mid, pixels = pixels, bitrate = bitrate, "weibo HD video resolved (desktop api)");
-        Some(vurl.to_string())
-    } else {
-        None
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1114,7 +788,7 @@ async fn download_cover_fallback(
         warn!(video_url = %raw_url, "no poster for failed video, entry stays text-only");
         return None;
     };
-    let cover_resolved = fetcher::resolve_url(state, &upgrade_weibo_size(&cover));
+    let cover_resolved = fetcher::resolve_url(state, &upgrade_image_url(&cover));
     match download_one(
         state,
         &cover_resolved,
@@ -1203,9 +877,9 @@ pub async fn prepare_entry_media(
             Err(_) => break,
         };
 
-        let mut url = upgrade_weibo_size(&raw_url);
+        let mut url = upgrade_image_url(&raw_url);
         if kind == MediaKind::Video {
-            url = upgrade_weibo_video_hd(state, owner_mid.as_deref(), &url).await;
+            url = enrich_video_url(state, owner_mid.as_deref(), &url).await;
         }
         let direct_url = url.clone();
         let url = fetcher::resolve_url(state, &url);
@@ -1923,15 +1597,6 @@ mod tests {
         let urls = extract_media_urls(&entry, None);
         assert_eq!(urls.len(), 1, "expected the video, got: {:?}", urls);
         assert!(urls[0].0.contains("weibocdn.com"), "got: {:?}", urls);
-    }
-
-    #[test]
-    fn weibo_host_match_is_domain_bounded() {
-        assert!(is_weibo_host("weibo.com"));
-        assert!(is_weibo_host("wx1.sinaimg.cn"));
-        assert!(is_weibo_host("f.video.weibocdn.com"));
-        assert!(!is_weibo_host("evilweibo.com"));
-        assert!(!is_weibo_host("notsinaimg.cn"));
     }
 
     #[test]

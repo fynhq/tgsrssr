@@ -152,6 +152,20 @@ pub type PlatformSelfSourceFn =
         &'a str,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<bool>> + Send + 'a>>;
 
+pub type PlatformMediaEnrichFn = for<'a> fn(
+    &'a AppState,
+    Option<&'a str>,
+    &'a str,
+) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+
+// Platform-specific media enrichment. `matches_url` keys on media/CDN hosts, not feed URLs.
+pub struct MediaEnrich {
+    pub matches_url: fn(&str) -> bool,
+    pub referer: Option<&'static str>,
+    pub upgrade_image_url: fn(&str) -> String,
+    pub enrich_video_url: PlatformMediaEnrichFn,
+}
+
 pub struct PlatformDef {
     pub id: &'static str,
     pub label: &'static str,
@@ -162,6 +176,7 @@ pub struct PlatformDef {
     pub canonical_url: fn(&str) -> Option<String>,
     pub fetch: PlatformFetchFn,
     pub self_source: Option<PlatformSelfSourceFn>,
+    pub media_enrich: Option<&'static MediaEnrich>,
 }
 
 pub const PLATFORMS: &[PlatformDef] = &[
@@ -177,6 +192,7 @@ pub const PLATFORMS: &[PlatformDef] = &[
         },
         fetch: |state, url, opts| Box::pin(weibo::fetch_by_url(state, url, opts)),
         self_source: None,
+        media_enrich: Some(&weibo::MEDIA_ENRICH),
     },
     PlatformDef {
         id: "x",
@@ -191,6 +207,7 @@ pub const PLATFORMS: &[PlatformDef] = &[
         },
         fetch: |state, url, opts| Box::pin(x::fetch_by_url(state, url, opts)),
         self_source: None,
+        media_enrich: None,
     },
     PlatformDef {
         id: "telegram",
@@ -207,6 +224,7 @@ pub const PLATFORMS: &[PlatformDef] = &[
         self_source: Some(|state, chat_id, url| {
             Box::pin(telegram::is_self_source(state, chat_id, url))
         }),
+        media_enrich: None,
     },
 ];
 
