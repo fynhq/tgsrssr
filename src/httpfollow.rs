@@ -4,6 +4,8 @@ use anyhow::Context;
 
 use crate::state::AppState;
 
+pub(crate) const MAX_REDIRECTS: u32 = 5;
+
 // The trusted-private-host bypass must not survive a redirect or embedded URL to another authority.
 pub(crate) fn same_origin(a: &str, b: &str) -> bool {
     let (Ok(ua), Ok(ub)) = (url::Url::parse(a), url::Url::parse(b)) else {

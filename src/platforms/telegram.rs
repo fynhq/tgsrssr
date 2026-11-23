@@ -170,7 +170,7 @@ pub async fn fetch_telegram_channel(
             state,
             &url,
             &[("Accept", "text/html,application/xhtml+xml".to_string())],
-            5,
+            crate::httpfollow::MAX_REDIRECTS,
         )
         .await
         {

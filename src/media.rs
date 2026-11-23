@@ -429,7 +429,7 @@ async fn upgrade_weibo_video_hd(state: &AppState, owner_mid: Option<&str>, url: 
         false,
         None,
         "weibo",
-        5,
+        crate::httpfollow::MAX_REDIRECTS,
         |client, cur_url, hop| {
             let mut req = client
                 .get(cur_url)
@@ -515,7 +515,7 @@ async fn fetch_visitor_cookie(state: &AppState) -> Option<String> {
         false,
         None,
         "weibo",
-        5,
+        crate::httpfollow::MAX_REDIRECTS,
         |client, cur_url, _hop| {
             client
                 .post(cur_url)
@@ -564,7 +564,7 @@ async fn fetch_visitor_cookie(state: &AppState) -> Option<String> {
         false,
         None,
         "weibo",
-        5,
+        crate::httpfollow::MAX_REDIRECTS,
         |client, cur_url, _hop| client.get(cur_url).header("Referer", "https://weibo.com/"),
     )
     .await
@@ -806,7 +806,7 @@ async fn weibo_hd_from_desktop_api(state: &AppState, mid: &str, cookies: &str) -
         false,
         None,
         "weibo",
-        5,
+        crate::httpfollow::MAX_REDIRECTS,
         |client, cur_url, hop| {
             let mut req = client
                 .get(cur_url)
@@ -1464,14 +1464,13 @@ async fn download_one(
         let tmp_path = outbound.join(format!(".tmp_{}", uuid::Uuid::new_v4()));
         let tmp = tmp_path.clone();
         result = async {
-            const MAX_REDIRECTS: u32 = 5;
             let mut resp = crate::httpfollow::get_follow_redirects(
                 state,
                 url,
                 allow_trusted_private,
                 trusted_origin,
                 "media",
-                MAX_REDIRECTS,
+                crate::httpfollow::MAX_REDIRECTS,
                 |client, cur_url, _hop| {
                     let mut req = client
                         .get(cur_url)

@@ -378,7 +378,7 @@ async fn fetch_query_ids(state: &AppState) -> anyhow::Result<HashMap<String, Str
         state,
         QUERY_ID_DOC_URL,
         &[("Accept", "application/json".to_string())],
-        5,
+        crate::httpfollow::MAX_REDIRECTS,
     )
     .await
     .context("query-ID document request failed")?;
@@ -497,7 +497,7 @@ async fn gql_request_once(
             ("Content-Type", "application/json".to_string()),
             ("Referer", "https://x.com/".to_string()),
         ],
-        5,
+        crate::httpfollow::MAX_REDIRECTS,
     )
     .await
     .with_context(|| format!("X GraphQL request failed: {}", path))?;

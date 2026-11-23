@@ -307,14 +307,13 @@ pub async fn fetch_feed(
         .context("fetch semaphore closed")?;
 
     // Redirects are followed manually; re-run the SSRF target policy on every hop.
-    const MAX_REDIRECTS: u32 = 5;
     let resp = crate::httpfollow::get_follow_redirects(
         state,
         feed_url,
         opts.allow_trusted_private,
         None,
         "feed",
-        MAX_REDIRECTS,
+        crate::httpfollow::MAX_REDIRECTS,
         |client, url, _hop| {
             let mut req = client.get(url).header(
                 "Accept",
