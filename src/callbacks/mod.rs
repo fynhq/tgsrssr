@@ -14,6 +14,7 @@ use crate::ui::{
     render_language_picker, PageTarget,
 };
 
+use crate::callback_protocol::GuardTarget;
 use settings::{
     load_chat_config_checked, render_feed_interval, render_feed_mode, render_feed_source,
     render_settings_interval, render_settings_mode, render_settings_page, render_settings_source,
@@ -22,9 +23,9 @@ use settings::{
 pub mod settings;
 pub mod unsub;
 
-mod data;
 mod dispatch;
-pub(crate) mod wire;
+
+pub(crate) use crate::callback_protocol::{data, wire};
 
 fn toast_text(text: String) -> String {
     const MAX: usize = 200;
@@ -35,13 +36,6 @@ fn toast_text(text: String) -> String {
         "{}…",
         crate::htmltext::take_utf16_prefix(&text, MAX.saturating_sub(1))
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GuardTarget {
-    Chat,
-    Sub,
-    None,
 }
 
 pub(super) struct CallbackCtx<'a> {

@@ -43,7 +43,7 @@ pub(crate) enum CallbackOp {
 }
 
 impl CallbackOp {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Channel => "ch",
             Self::ChannelList => "chlist",
@@ -84,7 +84,7 @@ impl CallbackOp {
         }
     }
 
-    pub(super) fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         Some(match raw {
             "ch" => Self::Channel,
             "chlist" => Self::ChannelList,
@@ -126,7 +126,7 @@ impl CallbackOp {
         })
     }
 
-    pub(super) fn guard_target(self) -> GuardTarget {
+    pub(crate) fn guard_target(self) -> GuardTarget {
         match self {
             Self::Channel
             | Self::Config
@@ -176,18 +176,18 @@ pub(crate) struct CallbackArgs<'a> {
 }
 
 impl CallbackArgs<'_> {
-    pub(super) fn sub_id(&self) -> Option<i64> {
+    pub(crate) fn sub_id(&self) -> Option<i64> {
         self.id?.parse().ok()
     }
 }
 
-pub(super) struct CallbackData<'a> {
+pub(crate) struct CallbackData<'a> {
     pub op: CallbackOp,
     pub args: CallbackArgs<'a>,
 }
 
 impl<'a> CallbackData<'a> {
-    pub(super) fn parse(raw: &'a str) -> Option<Self> {
+    pub(crate) fn parse(raw: &'a str) -> Option<Self> {
         if raw.len() > 64 {
             return None;
         }

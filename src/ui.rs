@@ -3,7 +3,7 @@ use teloxide::types::{
     CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode,
 };
 
-use crate::callbacks::wire;
+use crate::callback_protocol::wire;
 use crate::db;
 use crate::i18n::{self, Lang};
 use crate::push::{no_preview, ContentMode, SourceDisplay};

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod callback_protocol;
 mod callbacks;
 mod cleanup;
 mod commands;

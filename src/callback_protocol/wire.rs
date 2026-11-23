@@ -188,7 +188,7 @@ pub(crate) fn op_prefix(op: CallbackOp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::callbacks::data::CallbackData;
+    use crate::callback_protocol::data::CallbackData;
 
     #[test]
     fn constructors_round_trip_through_the_parser() {
