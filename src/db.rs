@@ -110,18 +110,15 @@ const EFFECTIVE_CONFIG_COLUMNS: &str =
      f.caption_above_media IS NOT NULL AS cp_overridden, \
      f.link_preview IS NOT NULL AS lp_overridden";
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChatRow {
     pub chat_id: String,
-    pub chat_type: String,
     pub title: Option<String>,
     pub username: Option<String>,
     pub added_by: Option<String>,
     pub enabled: i64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SubRow {
     pub id: i64,
@@ -131,19 +128,12 @@ pub struct SubRow {
     pub title_overridden: i64,
     pub original_title: Option<String>,
     pub active: i64,
-    pub error_count: i64,
-    pub last_fetch_at: Option<String>,
-    pub last_error: Option<String>,
     pub http_etag: Option<String>,
     pub http_last_modified: Option<String>,
-    pub auto_disabled: i64,
-    pub disabled_at: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChatConfigRow {
-    pub chat_id: String,
     pub interval_minutes: i64,
     pub content_mode: String,
     pub source_display: String,
@@ -151,7 +141,6 @@ pub struct ChatConfigRow {
     pub link_preview: i64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct EffectiveConfig {
     pub chat_id: String,

@@ -258,7 +258,7 @@ pub(super) async fn render_settings_source(
 pub(super) async fn load_chat_config(db: &crate::db::Db, chat_id: &str) -> db::ChatConfigRow {
     match load_chat_config_checked(db, chat_id).await {
         Ok(c) => c,
-        Err(_) => default_chat_config(chat_id.to_string()),
+        Err(_) => default_chat_config(),
     }
 }
 
@@ -270,14 +270,13 @@ pub(super) async fn load_chat_config_checked(
         Some(c) => Ok(c),
         None => {
             db::ensure_chat_config(db, chat_id).await.ok();
-            Ok(default_chat_config(chat_id.to_string()))
+            Ok(default_chat_config())
         }
     }
 }
 
-fn default_chat_config(chat_id: String) -> db::ChatConfigRow {
+fn default_chat_config() -> db::ChatConfigRow {
     db::ChatConfigRow {
-        chat_id,
         interval_minutes: db::DEFAULT_INTERVAL_MINUTES,
         content_mode: db::DEFAULT_CONTENT_MODE.to_string(),
         source_display: db::DEFAULT_SOURCE_DISPLAY.to_string(),

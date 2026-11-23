@@ -1,7 +1,6 @@
 use super::*;
 use sqlx::Row;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OutboxRow {
     pub id: i64,
@@ -18,9 +17,10 @@ pub struct OutboxRow {
     pub caption_above_media: bool,
     pub author: Option<String>,
     pub attempts: i64,
-    pub next_retry_at: i64,
     pub created_at: i64,
     pub first_attempt_at: Option<i64>,
+    // Read by the retry-bookkeeping tests only; the runtime keeps it in SQL.
+    #[allow(dead_code)]
     pub last_error: Option<String>,
 }
 
