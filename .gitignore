@@ -5,6 +5,8 @@
 # Local fast-rebuild helpers: kept on disk for local deployments, not published.
 /Dockerfile.base
 /Dockerfile.prebuilt
+# Local scratch directory (tooling/cache), never published.
+/.local/
 # compose.yaml holds secrets (token); see compose.example.yaml for the template
 compose.yaml
 *.db
