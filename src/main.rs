@@ -44,6 +44,9 @@ use state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // reqwest 0.13 uses rustls-no-provider; install ring before any client is built.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cfg = Config::from_env()?;
 
     let _log_guard = logging::init_logging(&cfg.log_dir)?;
@@ -586,6 +589,15 @@ mod tests {
         assert!(all_cmds.iter().any(|c| c.command == "/cookies"));
         assert!(all_cmds.iter().any(|c| c.command == "/loget"));
         assert_eq!(all_cmds.last().map(|c| c.command.as_str()), Some("/about"));
+    }
+
+    #[test]
+    fn rustls_provider_install_allows_reqwest_client_build() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("reqwest client builds with the installed provider");
     }
 
     #[test]

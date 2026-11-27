@@ -20,10 +20,11 @@ teloxide = { version = "0.17.0", default-features = false, features = [
 feed-rs = "3.0.0"
 
 # HTTP client
-# Note: reqwest 0.13 renamed "rustls-tls" to "rustls"
+# Note: reqwest 0.13 renamed "rustls-tls" to "rustls"; rustls-no-provider is
+# used so the ring provider can be shared with reqwest 0.12 (installed in main).
 reqwest = { version = "0.13.5", features = [
     "socks",
-    "rustls",
+    "rustls-no-provider",
     "stream",
 ], default-features = false }
 
@@ -36,8 +37,13 @@ reqwest_bot = { package = "reqwest", version = "0.12.28", default-features = fal
     "stream",
 ] }
 
+# Crypto provider for both rustls clients. reqwest 0.13 is built with
+# rustls-no-provider, so ring must be installed before any client is built.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
 # Database
-sqlx = { version = "0.9.1", features = [
+# Default features (any/json) are unused.
+sqlx = { version = "0.9.1", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
     "macros",
@@ -45,7 +51,19 @@ sqlx = { version = "0.9.1", features = [
 ] }
 
 # Async runtime
-tokio = { version = "1.53.3", features = ["full"] }
+# Explicit feature list instead of "full" to drop io-std.
+tokio = { version = "1.53.3", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "fs",
+    "sync",
+    "net",
+    "process",
+    "signal",
+    "io-util",
+    "parking_lot",
+] }
 tokio-cron-scheduler = "0.15.1"
 dptree = "0.5.1"
 
@@ -85,5 +103,7 @@ webpki-root-certs = "1.0.11"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true
